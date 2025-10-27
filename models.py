@@ -1,4 +1,4 @@
-# models.py (ПОЛНАЯ НОВАЯ ВЕРСИЯ ДЛЯ MULTI-TENANT)
+# models.py (ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ SUPER-ADMIN)
 
 from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey, func, Date, Boolean, Table, UniqueConstraint
 from sqlalchemy.orm import relationship
@@ -7,7 +7,6 @@ from sqlalchemy.ext.declarative import declarative_base
 Base = declarative_base()
 
 # --- СВЯЗУЮЩАЯ ТАБЛИЦА ДЛЯ СИСТЕМЫ ДОСТУПОВ ---
-# Остается без изменений, так как Role будет привязана к Company
 role_permissions_table = Table('role_permissions', Base.metadata,
     Column('role_id', Integer, ForeignKey('roles.id'), primary_key=True),
     Column('permission_id', Integer, ForeignKey('permissions.id'), primary_key=True)
@@ -18,13 +17,10 @@ role_permissions_table = Table('role_permissions', Base.metadata,
 class Company(Base):
     """
     Представляет "Арендатора" (Tenant) - отдельную карго-компанию.
-    Например: "Карго Экспрес Кара Балта", "ВИШКАРГО".
-    Это "владелец" всех остальных данных.
     """
     __tablename__ = 'companies'
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False) # Название компании
-    # Уникальный код для логина сотрудников (чтобы они не вводили полное имя)
     company_code = Column(String, unique=True, index=True, nullable=True) 
     is_active = Column(Boolean, default=True) # Контроль оплаты
     subscription_paid_until = Column(Date, nullable=True) # Контроль оплаты
@@ -46,21 +42,18 @@ class Company(Base):
 class Location(Base):
     """
     Представляет "Точку" или "Филиал" (Отделение)
-    Например: "Филиал в Бишкеке", "Филиал в Оше".
-    Принадлежит одной Компании.
     """
     __tablename__ = 'locations'
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False) # "Главный офис", "Склад 1"
     address = Column(String, nullable=True)
-    
-    # Связь с Компанией (Владельцем)
+
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="locations")
-    
-    # Сотрудники и смены на этом филиале
+
     employees = relationship("Employee", back_populates="location")
     shifts = relationship("Shift", back_populates="location")
+    orders = relationship("Order", back_populates="location")
 
 # --- ИЗМЕНЕННЫЕ МОДЕЛИ: КЛИЕНТЫ И ЗАКАЗЫ ---
 
@@ -68,13 +61,13 @@ class Client(Base):
     __tablename__ = 'clients'
     id = Column(Integer, primary_key=True, index=True)
     full_name = Column(String, nullable=False)
-    phone = Column(String, index=True, nullable=False) # Убираем global unique
+    phone = Column(String, index=True, nullable=False) 
     client_code_prefix = Column(String, default="KB")
-    client_code_num = Column(Integer, nullable=True) # Убираем global unique
-    telegram_chat_id = Column(String, unique=True, nullable=True) # Оставляем unique, т.к. 1 телеграм = 1 человек
+    client_code_num = Column(Integer, nullable=True) 
+    telegram_chat_id = Column(String, unique=True, nullable=True) 
     status = Column(String, default="Розница")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     orders = relationship("Order", back_populates="client")
 
     # НОВАЯ СВЯЗЬ: К какой компании принадлежит этот клиент
@@ -88,10 +81,12 @@ class Client(Base):
     )
 
 
+# models.py (Полностью заменяет класс Order)
+
 class Order(Base):
     __tablename__ = 'orders'
     id = Column(Integer, primary_key=True, index=True)
-    track_code = Column(String, index=True, nullable=False) # Трек-код может дублироваться у разных компаний
+    track_code = Column(String, index=True, nullable=False)
     status = Column(String, default="В обработке")
     purchase_type = Column(String, nullable=False)
     comment = Column(String, nullable=True)
@@ -106,58 +101,71 @@ class Order(Base):
     card_payment_type = Column(String, nullable=True)
     issued_at = Column(DateTime(timezone=True), nullable=True)
     reverted_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Поля для предварительного расчета
     calculated_weight_kg = Column(Float, nullable=True)
     calculated_price_per_kg_usd = Column(Float, nullable=True)
     calculated_exchange_rate_usd = Column(Float, nullable=True)
     calculated_final_cost_som = Column(Float, nullable=True)
-    
-    # Поля для выкупа
+
+    # Поля для "Двух чеков" (Выкуп)
     buyout_item_cost_cny = Column(Float, nullable=True)
     buyout_commission_percent = Column(Float, default=10.0)
     buyout_rate_for_client = Column(Float, nullable=True)
     buyout_actual_rate = Column(Float, nullable=True)
-    
-    # Связь с клиентом (остается)
+
+    # --- ИСПРАВЛЕННЫЕ И НОВЫЕ СВЯЗИ ---
+
+    # Связь с клиентом (Дубликаты убраны)
     client_id = Column(Integer, ForeignKey('clients.id'))
     client = relationship("Client", back_populates="orders")
-    
-    # Связь со сменой (остается)
-    shift_id = Column(Integer, ForeignKey('shifts.id'), nullable=True)
 
-    # НОВАЯ СВЯЗЬ: К какой компании принадлежит этот заказ (для быстрого поиска)
+    # Связь со сменой (nullable=True для расходов Владельца)
+    shift_id = Column(Integer, ForeignKey('shifts.id'), nullable=True) 
+    # (relationship к Shift не добавляем, чтобы не было цикла)
+
+    # Связь с Компанией (Multi-Tenant)
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="orders")
+    
+    # Связь с Филиалом (Multi-Location)
+    location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
+    location = relationship("Location", back_populates="orders") 
+    
+    # --- КОНЕЦ СВЯЗЕЙ ---
 
+    # Правило уникальности: Трек-код + Компания
+    __table_args__ = (
+        UniqueConstraint('track_code', 'company_id', name='_track_code_company_uc'),
+    )
 
 # --- ИЗМЕНЕННЫЕ МОДЕЛИ: ПЕРСОНАЛ И ДОСТУП ---
 
 class Role(Base):
     __tablename__ = 'roles'
     id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False) # Убираем global unique
-    
+    name = Column(String, nullable=False) 
+
     employees = relationship("Employee", back_populates="role")
     permissions = relationship("Permission", secondary=role_permissions_table, back_populates="roles")
-    
-    # НОВАЯ СВЯЗЬ: Роль принадлежит компании
-    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+
+    # --- ИСПРАВЛЕНИЕ: company_id МОЖЕТ БЫТЬ NULL (для роли Супер-Админа) ---
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=True, index=True)
     company = relationship("Company", back_populates="roles")
-    
-    # НОВОЕ ПРАВИЛО: Название роли уникально внутри компании
+
+    # Правило уникальности: Либо company_id=NULL, либо (name, company_id) уникальны
     __table_args__ = (UniqueConstraint('name', 'company_id', name='_role_name_company_uc'),)
 
 
 class Permission(Base):
     """
-    Разрешения - ГЛОБАЛЬНЫЕ. 
-    Мы (Супер-Админ) определяем, какие доступы ВООБЩЕ СУЩЕСТВУЮТ в системе.
-    А владелец компании уже "навешивает" их на свои роли.
+    Разрешения - ГЛОБАЛЬНЫЕ.
     """
     __tablename__ = 'permissions'
     id = Column(Integer, primary_key=True)
     codename = Column(String, unique=True, nullable=False)
     description = Column(String, nullable=False)
-    
+
     roles = relationship("Role", secondary=role_permissions_table, back_populates="permissions")
 
 
@@ -165,22 +173,22 @@ class Employee(Base):
     __tablename__ = 'employees'
     id = Column(Integer, primary_key=True)
     full_name = Column(String, nullable=False)
-    password = Column(String, nullable=False) # Пароль для входа
+    password = Column(String, nullable=False) 
     is_active = Column(Boolean, default=True)
-    
-    # ЯВЛЯЕТСЯ ЛИ СОТРУДНИК ВЛАДЕЛЬЦЕМ КОМПАНИИ (для управления филиалами и сотрудниками)
-    is_company_owner = Column(Boolean, default=False) 
-    
+
+    # Это поле теперь не нужно, мы будем проверять company_id is NULL
+    # is_company_owner = Column(Boolean, default=False) 
+
     role_id = Column(Integer, ForeignKey('roles.id'))
     role = relationship("Role", back_populates="employees")
     shifts = relationship("Shift", back_populates="employee")
-    
-    # НОВАЯ СВЯЗЬ: Сотрудник принадлежит компании
-    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+
+    # --- ИСПРАВЛЕНИЕ: company_id МОЖЕТ БЫТЬ NULL (для Супер-Админа) ---
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=True, index=True)
     company = relationship("Company", back_populates="employees")
-    
-    # НОВАЯ СВЯЗЬ: Сотрудник привязан к филиалу
-    location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
+
+    # --- ИСПРАВЛЕНИЕ: location_id МОЖЕТ БЫТЬ NULL (для Супер-Админа) ---
+    location_id = Column(Integer, ForeignKey('locations.id'), nullable=True, index=True)
     location = relationship("Location", back_populates="employees")
 
 # --- ИЗМЕНЕННЫЕ МОДЕЛИ: ФИНАНСЫ ---
@@ -194,16 +202,15 @@ class Shift(Base):
     closing_cash = Column(Float, nullable=True)
     exchange_rate_usd = Column(Float, nullable=False)
     price_per_kg_usd = Column(Float, nullable=False)
-    
+
     employee_id = Column(Integer, ForeignKey('employees.id'))
     employee = relationship("Employee", back_populates="shifts")
     expenses = relationship("Expense", back_populates="shift")
-    
-    # НОВАЯ СВЯЗЬ: Смена принадлежит компании
+
+    # Эти поля остаются nullable=False, т.к. смена не может быть "глобальной"
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="shifts")
-    
-    # НОВАЯ СВЯЗЬ: Смена открыта на филиале
+
     location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
     location = relationship("Location", back_populates="shifts")
 
@@ -211,16 +218,16 @@ class Shift(Base):
 class ExpenseType(Base):
     __tablename__ = 'expense_types'
     id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False) # Убираем global unique
+    name = Column(String, nullable=False) 
     expenses = relationship("Expense", back_populates="expense_type")
-    
-    # НОВАЯ СВЯЗЬ: Тип расхода принадлежит компании
+
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="expense_types")
-    
-    # НОВОЕ ПРАВИЛО: Название типа уникально внутри компании
+
     __table_args__ = (UniqueConstraint('name', 'company_id', name='_exp_type_name_company_uc'),)
 
+
+# models.py (Внутри класса Expense)
 
 class Expense(Base):
     __tablename__ = 'expenses'
@@ -228,14 +235,18 @@ class Expense(Base):
     amount = Column(Float, nullable=False)
     notes = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # --- ВОТ ЭТУ СТРОКУ НУЖНО ИЗМЕНИТЬ ---
+    # БЫЛО: shift_id = Column(Integer, ForeignKey('shifts.id'))
+    # СТАЛО:
+    shift_id = Column(Integer, ForeignKey('shifts.id'), nullable=True) # <-- Добавляем nullable=True
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     
-    shift_id = Column(Integer, ForeignKey('shifts.id'))
     shift = relationship("Shift", back_populates="expenses")
     
     expense_type_id = Column(Integer, ForeignKey('expense_types.id'))
     expense_type = relationship("ExpenseType", back_populates="expenses")
-    
-    # НОВАЯ СВЯЗЬ: Расход принадлежит компании
+
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="expenses")
 
@@ -245,12 +256,11 @@ class Expense(Base):
 class Setting(Base):
     __tablename__ = 'settings'
     id = Column(Integer, primary_key=True)
-    key = Column(String, nullable=False) # Убираем global unique
+    key = Column(String, nullable=False) 
     value = Column(String, nullable=True)
-    
-    # НОВАЯ СВЯЗЬ: Настройка принадлежит компании
-    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+
+    # --- ИСПРАВЛЕНИЕ: company_id МОЖЕТ БЫТЬ NULL (для Глобальных настроек) ---
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=True, index=True)
     company = relationship("Company", back_populates="settings")
-    
-    # НОВОЕ ПРАВИЛО: Ключ настройки уникален внутри компании
+
     __table_args__ = (UniqueConstraint('key', 'company_id', name='_setting_key_company_uc'),)
