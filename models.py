@@ -177,7 +177,7 @@ class Employee(Base):
     is_active = Column(Boolean, default=True)
 
     # Это поле теперь не нужно, мы будем проверять company_id is NULL
-    # is_company_owner = Column(Boolean, default=False) 
+    is_company_owner = Column(Boolean, default=False)
 
     role_id = Column(Integer, ForeignKey('roles.id'))
     role = relationship("Role", back_populates="employees")
