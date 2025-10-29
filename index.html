@@ -5719,6 +5719,15 @@ async function renderExpensesTab() {
                     <label for="expense-end-date" class="block text-sm font-medium text-gray-700">По</label>
                     <input type="date" id="expense-end-date" value="${today}" class="mt-1 p-2 border rounded-md">
                 </div>
+                ${(currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) ? `
+                <div>
+                    <label for="expense-location-filter" class="block text-sm font-medium text-gray-700">Филиал</label>
+                    <select id="expense-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
+                        <option value="">-- Все филиалы --</option>
+                        ${companyLocations.map(loc => `<option value="${loc.id}">${loc.name}</option>`).join('')}
+                    </select>
+                </div>
+                ` : ''}
                 <button id="filter-expenses-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Показать</button>
             </div>
             
@@ -5751,6 +5760,13 @@ async function renderExpensesTab() {
         const listDiv = document.getElementById('expenses-list');
         if (listDiv) listDiv.addEventListener('click', handleExpenseActions);
 
+        // ДОБАВИТЬ ЭТОТ СЛУШАТЕЛЬ:
+        const locationFilter = document.getElementById('expense-location-filter');
+        if (locationFilter) {
+            locationFilter.addEventListener('change', fetchAndRenderExpenses);
+            console.log("[Listener OK] Added change to #expense-location-filter");
+        }
+
         // Загружаем расходы за сегодня при первой загрузке (по умолчанию)
         await fetchAndRenderExpenses();
 
@@ -5763,7 +5779,7 @@ async function renderExpensesTab() {
 
 
 // --- Загрузка и отображение списка Расходов ---
-// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ fetchAndRenderExpenses)
+// index.html (ЗАМЕНИТЬ ЭТОЙ ФУНКЦИЕЙ СТАРУЮ fetchAndRenderExpenses)
 
 async function fetchAndRenderExpenses() {
     console.log("[Fetch] fetchAndRenderExpenses: Start");
@@ -5776,35 +5792,50 @@ async function fetchAndRenderExpenses() {
     showLoader(); 
 
     try {
-        // Запрос к эндпоинту /api/expenses (бэкенд теперь возвращает полные данные)
-        const expenses = await apiFetch(`/api/expenses?start_date=${startDate}&end_date=${endDate}`);
+        // --- ИСПРАВЛЕНИЕ: Собираем параметры, включая location_id ---
+        const params = new URLSearchParams({
+            start_date: startDate,
+            end_date: endDate
+        });
+
+        // Добавляем location_id, если он выбран Владельцем
+        // (Ищем фильтр expense-location-filter)
+        const locationSelect = document.getElementById('expense-location-filter');
+        if (locationSelect && locationSelect.value) { // (Этот select существует, только если роль = Владелец)
+            params.append('location_id', locationSelect.value);
+        }
+
+        const url = `/api/expenses?${params.toString()}`;
+        console.log("[Fetch Expenses] Requesting URL:", url);
+        // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+        // Запрос к эндпоинту /api/expenses
+        const expenses = await apiFetch(url);
 
         if (!expenses || expenses.length === 0) {
-            listDiv.innerHTML = '<p class="text-gray-500">Расходов за выбранный период не найдено.</p>';
+            listDiv.innerHTML = '<p class="text-gray-500">Расходов за выбранный период (и филиал) не найдено.</p>';
         } else {
             // Генерируем HTML
             listDiv.innerHTML = expenses.map(exp => {
-                
-                // --- ИСПРАВЛЕНИЕ: Безопасное получение имени ---
-                let employeeName = 'Общий (Владелец)'; // По умолчанию (если shift_id = NULL)
+
+                let employeeName = 'Общий (Владелец)'; 
                 if (exp.shift && exp.shift.employee && exp.shift.employee.full_name) {
-                    employeeName = exp.shift.employee.full_name; // Имя сотрудника из смены
+                    employeeName = exp.shift.employee.full_name; 
                 }
-                // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
                 // Проверка, может ли ТЕКУЩИЙ пользователь редактировать
-                const canEdit = (currentUser.role === 'Владелец') || // Владелец может всегда
-                                (exp.shift && exp.shift.end_time === null); // Сотрудник - только в активной смене
-                
+                const canEdit = (currentUser.role === 'Владелец') || 
+                                (exp.shift && exp.shift.end_time === null); 
+
                 // Проверка, может ли ТЕКУЩИЙ пользователь удалять
-                const canDelete = (currentUser.role === 'Владелец') && // Только Владелец
-                                (exp.shift === null || exp.shift.end_time === null); // И только если смена не закрыта (или это общий расход)
+                const canDelete = (currentUser.role === 'Владелец') && 
+                                (exp.shift === null || exp.shift.end_time === null); 
 
                 return `
                     <div class="p-3 bg-gray-50 rounded-md border flex flex-wrap justify-between items-center gap-2 expense-item"
                          data-notes="${(exp.notes || '').toLowerCase()}"
                          data-type="${(exp.expense_type?.name || '').toLowerCase()}">
-                        
+
                         <div class="flex-grow min-w-[200px]">
                             <p class="font-bold text-lg">${exp.expense_type?.name || 'Тип не указан'} — <span class="text-red-600">${exp.amount.toFixed(2)} сом</span></p>
                             <p class="text-sm text-gray-700">${exp.notes || 'Без примечания'}</p>
@@ -5812,7 +5843,7 @@ async function fetchAndRenderExpenses() {
                                 ${new Date(exp.created_at).toLocaleString()} | Сотрудник: ${employeeName}
                             </p>
                         </div>
-                        
+
                         <div class="flex-shrink-0 flex gap-2">
                             ${canEdit ? `
                             <button data-expense-json='${JSON.stringify(exp)}' 
@@ -5820,7 +5851,7 @@ async function fetchAndRenderExpenses() {
                                 Изменить
                             </button>
                             ` : ''}
-                            
+
                             ${canDelete ? `
                             <button data-expense-id="${exp.id}" 
                                     data-expense-name="${exp.expense_type?.name}"
@@ -5850,8 +5881,8 @@ function handleExpenseActions(e) {
     if (editBtn) {
         try {
             const expenseData = JSON.parse(editBtn.dataset.expenseJson);
-            // openExpenseModal(expenseData); // TODO: Создать openExpenseModal
-            alert(`Редактирование расхода: ${expenseData.id}. Открытие модального окна.`);
+            openExpenseModal(expenseData); // TODO: Создать openExpenseModal
+            // alert(`Редактирование расхода: ${expenseData.id}. Открытие модального окна.`);
         } catch (e) {
             console.error("Error parsing expense data:", e);
         }
@@ -6361,7 +6392,7 @@ async function fetchAndRenderSummaryReport() {
         } else {
             shiftsHtml += summary.shifts.map(shift => {
                 // Ищем имя филиала в кэше
-                const locationName = companyLocations.find(l => l.id === shift.location_id)?.name || 'Филиал ?';
+                const locationName = shift.location?.name || 'Филиал ?'; // Используем имя из ответа API
                 return `
                     <div class="p-2 border rounded-md hover:bg-gray-50 flex justify-between items-center text-sm">
                         <div>
