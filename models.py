@@ -28,6 +28,11 @@ class Company(Base):
     contact_phone = Column(String, nullable=True) # Телефон (для вас)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # --- ДОБАВИТЬ ЭТИ ПОЛЯ ---
+    telegram_bot_token = Column(String, nullable=True, unique=True) # Токен бота (должен быть уникальным)
+    telegram_bot_username = Column(String, nullable=True) # Имя пользователя бота (опционально)
+    # --- КОНЕЦ ДОБАВЛЕНИЯ --
+
     # Связи (кто принадлежит этой компании)
     locations = relationship("Location", back_populates="company")
     clients = relationship("Client", back_populates="company")
