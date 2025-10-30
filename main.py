@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import asyncio
 import telegram
+import httpx
+import traceback
 import re
 
 # === НАЧАЛО ИЗМЕНЕНИЯ ===
@@ -23,6 +25,119 @@ from models import (
     Base, Company, Location, Client, Order, Role, Permission, Employee,
     ExpenseType, Shift, Expense, Setting
 )
+# Импортируем Session и List для типизации
+from sqlalchemy.orm import Session
+from typing import List, Optional # Убедись, что List импортирован
+
+
+# --- Функция отправки уведомлений ---
+async def generate_and_send_notification(db: Session, client: Client, new_status: str, track_codes: List[str]):
+    """Отправляет уведомление клиенту в Telegram о смене статуса заказов, ИСПОЛЬЗУЯ ТОКЕН КОМПАНИИ."""
+    # --- Блок проверки chat_id и форматирования трек-кодов ---
+    if not client.telegram_chat_id:
+        print(f"INFO: У клиента {client.full_name} (ID: {client.id}) нет telegram_chat_id. Уведомление не отправлено.")
+        return # Выходим, если ID чата нет
+    track_codes_str = "\n".join([f"<code>{code}</code>" for code in track_codes])
+
+    # --- ИЗМЕНЕНИЕ: Получаем токен бота ИЗ КОМПАНИИ клиента ---
+    company_bot_token = None
+    if client.company_id:
+        # Загружаем токен из связанной компании
+        company = db.query(Company).filter(Company.id == client.company_id).first()
+        if company and company.telegram_bot_token:
+            company_bot_token = company.telegram_bot_token
+        else:
+            print(f"WARNING: Не найден токен Telegram-бота для компании ID {client.company_id}. Уведомление для клиента ID {client.id} не будет отправлено.")
+            return
+    else:
+        # Это не должно происходить для реальных клиентов, но на всякий случай
+        print(f"WARNING: У клиента ID {client.id} не указана компания. Уведомление не будет отправлено.")
+        return
+
+    # Если токен не найден, выходим
+    if not company_bot_token:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+    # --- Блок загрузки контактов и генерации ссылки на ЛК ---
+    # Загружаем адрес и телефон из настроек КОМПАНИИ (settings) в БД
+    address_setting = db.query(Setting).filter(Setting.key == 'bishkek_office_address', Setting.company_id == client.company_id).first()
+    phone_setting = db.query(Setting).filter(Setting.key == 'contact_phone', Setting.company_id == client.company_id).first()
+    # TODO: Добавить глобальные настройки для адреса/телефона по умолчанию, если нет настроек компании
+    address = address_setting.value if address_setting and address_setting.value else "Адрес офиса не указан"
+    phone = phone_setting.value if phone_setting and phone_setting.value else "Контактный телефон не указан"
+    # Генерируем ссылку на Личный Кабинет
+    secret_token = f"CLIENT-{client.id}-COMPANY-{client.company_id}-SECRET"
+    client_portal_base_url = os.getenv("CLIENT_PORTAL_URL", "http://ВАШ_ДОМЕН_ИЛИ_IP/lk.html") # Замени на реальный URL
+    lk_link = f"{client_portal_base_url}?token={secret_token}"
+    # --- Конец блока контактов и ЛК ---
+
+    # --- Формирование сообщения ---
+    message = f"Здравствуйте, <b>{client.full_name}</b>! 👋\n\n"
+    if new_status == "Готов к выдаче":
+        # Находим заказы в БД для расчета веса и суммы (фильтруем по ID клиента И трек-кодам)
+        orders_in_db = db.query(Order).filter(
+            Order.client_id == client.id,
+            Order.track_code.in_(track_codes),
+            Order.company_id == client.company_id # Добавляем фильтр по компании
+        ).all()
+        total_cost = 0
+        total_weight = 0
+        for order in orders_in_db:
+            # Используем РАССЧИТАННУЮ стоимость и вес
+            total_cost += order.calculated_final_cost_som or 0
+            total_weight += order.calculated_weight_kg or 0
+
+        cost_str = f"К оплате: <b>{total_cost:.2f} сом</b> 💰\n\n" if total_cost > 0 else ""
+        weight_str = f"Общий вес: <b>{total_weight:.3f} кг</b> ⚖️\n\n" if total_weight > 0 else ""
+
+        message += (
+            f"Ура! Заказы готовы к выдаче! 📦✨\n\n"
+            f"Трек-коды:\n{track_codes_str}\n\n"
+            f"Статус: ✅ <b>Готов к выдаче</b> ✅\n\n"
+            f"{weight_str}"
+            f"{cost_str}"
+            f"📍 <b>Забрать:</b> {address}\n"
+            f"📞 <b>Вопросы:</b> <code>{phone}</code>\n"
+            f"💻 <b>Личный кабинет:</b> <a href='{lk_link}'>Перейти</a>"
+        )
+    # --- Добавить elif для других статусов ("В пути", "На складе в КР" и т.д.), если нужны особые тексты ---
+    elif new_status == "В пути":
+        message += (
+            f"Ваши заказы уже в дороге! 🚚💨\n\n"
+            f"Статус отправлений:\n{track_codes_str}\n\n"
+            f"...изменился на: ➡️ <b>{new_status}</b>\n\n"
+            f"Ожидайте следующих обновлений! Следить за заказами можно в <a href='{lk_link}'>личном кабинете</a>."
+        )
+    elif new_status == "На складе в КР":
+        message += (
+            f"Отличные новости! 🎉 Ваши заказы прибыли на наш склад в Кыргызстане!\n\n"
+            f"Статус посылок:\n{track_codes_str}\n\n"
+            f"...изменился на: 🇰🇬 <b>{new_status}</b>\n\n"
+            f"Скоро они будут готовы к выдаче! Мы сообщим 😉\n"
+            f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
+        )
+    # --- Конец elif ---
+    else: # Стандартное уведомление для всех остальных статусов
+        message += (
+            f"Обновление по вашим заказам! 📄\n\n"
+            f"Новый статус для:\n{track_codes_str}\n\n"
+            f"➡️ <b>{new_status}</b>\n\n"
+            f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
+        )
+    # --- Конец формирования сообщения ---
+
+    # --- Отправка сообщения (ИСПОЛЬЗУЕМ ТОКЕН КОМПАНИИ) ---
+    try:
+        # Используем company_bot_token, полученный ранее из данных компании
+        bot = telegram.Bot(token=company_bot_token)
+        await bot.send_message(chat_id=client.telegram_chat_id, text=message, parse_mode='HTML')
+        print(f"INFO: Уведомление успешно отправлено клиенту {client.full_name} (ID: {client.id}, Company: {client.company_id}) о статусе '{new_status}'.")
+    except Exception as e:
+        print(f"ERROR: Ошибка при отправке Telegram сообщения клиенту ID {client.id} (ChatID: {client.telegram_chat_id}, Company: {client.company_id}) через токен компании: {e}")
+
+# Определяем статусы ЗДЕСЬ, в глобальной области видимости, ПОСЛЕ импортов
+ORDER_STATUSES = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче", "Выдан"]
 
 # --- 1. НАСТРОЙКА ---
 load_dotenv()
@@ -31,7 +146,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Не найден ключ DATABASE_URL в файле .env")
 
-engine = create_engine(DATABASE_URL)
+# Добавляем параметры для управления пулом соединений
+engine = create_engine(
+    DATABASE_URL,
+    pool_recycle=1800, # Переподключаться каждые 30 минут (1800 секунд)
+    pool_pre_ping=True # Проверять соединение перед использованием
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI(title="Cargo CRM API - Multi-Tenant")
 
@@ -128,6 +248,8 @@ class CompanyBase(BaseModel):
     company_code: str = Field(..., pattern=r'^[A-Z0-9_]{3,15}$')
     contact_person: Optional[str] = None
     contact_phone: Optional[str] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_bot_username: Optional[str] = None
 class CompanyCreate(CompanyBase):
     subscription_paid_until: date
     owner_full_name: str
@@ -138,6 +260,8 @@ class CompanyUpdate(BaseModel):
     contact_phone: Optional[str] = None
     is_active: Optional[bool] = None
     subscription_paid_until: Optional[date] = None
+    telegram_bot_token: Optional[str] = None # Позволяем обновлять
+    telegram_bot_username: Optional[str] = None # Позволяем обновлять
 class CompanyOut(CompanyBase):
     id: int
     is_active: bool
@@ -322,6 +446,7 @@ class EmployeeSmallOut(BaseModel):
 # Вспомогательная модель для информации о смене в ExpenseOut
 class ShiftInfoOut(BaseModel):
     employee: EmployeeSmallOut
+    end_time: Optional[datetime] = None
     class Config:
         orm_mode = True
 
@@ -380,6 +505,11 @@ class SummaryReportResponse(BaseModel):
         orm_mode = True
         # (Если используете Pydantic V2, замените на: from_attributes = True)
 # --- КОНЕЦ МОДЕЛЕЙ ДЛЯ ОТЧЕТОВ ---
+
+# main.py (ДОБАВИТЬ ЭТУ МОДЕЛЬ)
+class SettingUpdate(BaseModel):
+    key: str
+    value: Optional[str] # Разрешаем устанавливать null (или пустую строку)
 
 # --- 4. ЭНДПОИНТЫ АУТЕНТИФИКАЦИИ ---
 
@@ -517,84 +647,180 @@ def login(payload: LoginPayload, db: Session = Depends(get_db)):
 
 # --- 5. ЭНДПОИНТЫ: SUPER-ADMIN ---
 
-@app.get("/api/superadmin/companies", tags=["Super-Admin"], response_model=List[CompanyOut])
+@app.get("/api/superadmin/companies", tags=["Super-Admin"])
 def get_all_companies(
-    employee: Employee = Depends(get_super_admin),  
+    employee: Employee = Depends(get_super_admin),
     db: Session = Depends(get_db)
 ):
-    companies = db.query(Company).order_by(Company.name).all()
-    return companies
+    """Получает список всех компаний (для Super-Admin)."""
+    try:
+        companies_orm = db.query(Company).order_by(Company.name).all()
 
+        # --- ДОБАВЛЕНО: Явное преобразование в список словарей ---
+        # Это более надежный способ вернуть данные, если response_model вызывает проблемы
+        companies_list = []
+        for company in companies_orm:
+            companies_list.append({
+                "id": company.id,
+                "name": company.name,
+                "company_code": company.company_code,
+                "is_active": company.is_active,
+                "subscription_paid_until": company.subscription_paid_until.isoformat() if company.subscription_paid_until else None, # Форматируем дату
+                "contact_person": company.contact_person,
+                "contact_phone": company.contact_phone,
+                "created_at": company.created_at.isoformat(), # Форматируем дату-время
+                "telegram_bot_token": company.telegram_bot_token,
+                "telegram_bot_username": company.telegram_bot_username
+            })
+        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+        # Возвращаем преобразованный список
+        return companies_list
+
+    except Exception as e:
+        # Логируем ошибку на сервере для диагностики
+        import traceback
+        print(f"!!! Ошибка в get_all_companies:\n{traceback.format_exc()}")
+        # Возвращаем ошибку 500
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при получении списка компаний: {e}")
+# --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+# --- Обновить эндпоинт создания компании ---
 @app.post("/api/superadmin/companies", tags=["Super-Admin"], response_model=CompanyOut)
 def create_company(
-    payload: CompanyCreate,  
-    employee: Employee = Depends(get_super_admin),  
+    payload: CompanyCreate, # Модель теперь содержит поля для бота
+    employee: Employee = Depends(get_super_admin),
     db: Session = Depends(get_db)
 ):
+    """Создает новую компанию, включая данные для ее Telegram-бота."""
+    # Проверка корректности кода компании
     if not re.match(r'^[A-Z0-9_]{3,15}$', payload.company_code):
          raise HTTPException(status_code=400, detail="Код компании некорректен. 3-15 знаков, только A-Z, 0-9, _")
+    # Проверка уникальности названия
     if db.query(Company).filter(Company.name == payload.name).first():
         raise HTTPException(status_code=400, detail="Компания с таким названием уже существует.")
+    # Проверка уникальности кода
     if db.query(Company).filter(Company.company_code == payload.company_code).first():
         raise HTTPException(status_code=400, detail="Компания с таким кодом уже существует.")
+    # ДОБАВЛЕНО: Проверка уникальности токена бота, если он указан
+    if payload.telegram_bot_token and db.query(Company).filter(Company.telegram_bot_token == payload.telegram_bot_token).first():
+        raise HTTPException(status_code=400, detail="Компания с таким Telegram Bot Token уже существует.")
 
-    db.begin_nested() # Начинаем транзакцию
+    db.begin_nested() # Начинаем транзакцию для атомарности
     try:
+        # Создаем объект Company, включая данные бота
         new_company = Company(
             name=payload.name, company_code=payload.company_code,
             contact_person=payload.contact_person, contact_phone=payload.contact_phone,
-            subscription_paid_until=payload.subscription_paid_until, is_active=True
+            subscription_paid_until=payload.subscription_paid_until, is_active=True,
+            # ДОБАВЛЕНО: Сохраняем данные бота
+            telegram_bot_token=payload.telegram_bot_token, # Может быть None
+            telegram_bot_username=payload.telegram_bot_username # Может быть None
         )
         db.add(new_company)
-        db.flush() # Получаем ID
+        db.flush() # Получаем ID новой компании
 
+        # Создаем главный филиал
         main_location = Location(name="Главный филиал", address="Не указан", company_id=new_company.id)
         db.add(main_location)
-        db.flush() # Получаем ID
+        db.flush() # Получаем ID филиала
 
+        # Находим все права, кроме управления компаниями, и создаем роль "Владелец"
         owner_permissions = db.query(Permission).filter(
             Permission.codename.notin_(['manage_companies', 'impersonate_company'])
         ).all()
         owner_role = Role(name="Владелец", company_id=new_company.id, permissions=owner_permissions)
         db.add(owner_role)
-        db.flush() # Получаем ID
+        db.flush() # Получаем ID роли
 
+        # Создаем сотрудника-владельца
         owner_employee = Employee(
             full_name=payload.owner_full_name, password=payload.owner_password,
             is_active=True, role_id=owner_role.id,
-            company_id=new_company.id, location_id=main_location.id
+            company_id=new_company.id, location_id=main_location.id # Привязываем к компании и филиалу
         )
         db.add(owner_employee)
-        
+
+        # Создаем типы расходов по умолчанию для компании
         default_expense_types = ["Хоз. нужды", "Зарплата", "Аванс", "Аренда", "Прочие расходы"]
         for exp_type_name in default_expense_types:
             db.add(ExpenseType(name=exp_type_name, company_id=new_company.id))
-        
-        db.commit() # Применяем все изменения
-        db.refresh(new_company)
+
+        # Добавляем базовые настройки (адрес, телефон) для компании
+        db.add(Setting(key='bishkek_office_address', value='Адрес не указан', company_id=new_company.id))
+        db.add(Setting(key='contact_phone', value='Телефон не указан', company_id=new_company.id))
+
+        db.commit() # Применяем все изменения транзакции
+        db.refresh(new_company) # Обновляем объект из БД для возврата
+        print(f"INFO: Компания '{new_company.name}' (ID: {new_company.id}) успешно создана.")
         return new_company
-        
+
     except Exception as e:
-        db.rollback() # Откатываем все, если была ошибка
-        raise HTTPException(status_code=500, detail=f"Ошибка при создании компании: {e}")
+        db.rollback() # Откатываем все изменения в случае ошибки
+        import traceback
+        print(f"!!! Ошибка при создании компании:\n{traceback.format_exc()}") # Логируем полную ошибку
+        # Возвращаем общую ошибку сервера
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при создании компании: {e}")
 
 
+# --- Обновить эндпоинт редактирования компании ---
 @app.patch("/api/superadmin/companies/{company_id}", tags=["Super-Admin"], response_model=CompanyOut)
 def update_company(
-    company_id: int,  
-    payload: CompanyUpdate,  
-    employee: Employee = Depends(get_super_admin),  
+    company_id: int,
+    payload: CompanyUpdate, # Модель теперь содержит поля для бота
+    employee: Employee = Depends(get_super_admin),
     db: Session = Depends(get_db)
 ):
+    """Обновляет данные компании, включая данные ее Telegram-бота."""
+    # Находим компанию по ID
     company = db.query(Company).filter(Company.id == company_id).first()
+    # Если компания не найдена, возвращаем ошибку 404
     if not company:
         raise HTTPException(status_code=404, detail="Компания не найдена.")
+
+    # Получаем данные для обновления из payload, исключая неустановленные поля
     update_data = payload.dict(exclude_unset=True)
+    print(f"INFO: Обновление компании ID {company_id}. Получены данные: {update_data}")
+
+    # ДОБАВЛЕНО: Проверка уникальности токена бота при ИЗМЕНЕНИИ
+    # Проверяем, есть ли поле токена в данных для обновления
+    # И отличается ли новый токен от текущего токена компании
+    if 'telegram_bot_token' in update_data and update_data['telegram_bot_token'] != company.telegram_bot_token:
+        new_token = update_data['telegram_bot_token']
+        # Если новый токен не пустой (т.е. не удаление токена)
+        if new_token:
+            # Ищем ДРУГУЮ компанию с таким же токеном
+            existing_company_with_token = db.query(Company).filter(
+                Company.telegram_bot_token == new_token,
+                Company.id != company_id # Исключаем текущую компанию из поиска
+            ).first()
+            # Если найдена другая компания с таким токеном, возвращаем ошибку
+            if existing_company_with_token:
+                raise HTTPException(status_code=400, detail="Другая компания уже использует этот Telegram Bot Token.")
+        else:
+             # Если новый токен пустой или null, это означает удаление токена
+             update_data['telegram_bot_token'] = None # Явно устанавливаем None для записи в БД
+
+    # Применяем обновления к объекту компании
     for key, value in update_data.items():
-        setattr(company, key, value)
-    db.commit()
-    db.refresh(company)
-    return company
+        # Отдельно обрабатываем удаление токена (если пришло '' или null)
+        if key == 'telegram_bot_token' and not value:
+             setattr(company, key, None)
+             print(f"INFO: Поле {key} установлено в None.")
+        else:
+             setattr(company, key, value)
+             print(f"INFO: Поле {key} обновлено на {value}.")
+
+    try:
+        db.commit() # Сохраняем изменения в БД
+        db.refresh(company) # Обновляем объект из БД
+        print(f"INFO: Компания ID {company_id} успешно обновлена.")
+        return company # Возвращаем обновленные данные
+    except Exception as e:
+        db.rollback() # Откатываем изменения при ошибке
+        import traceback
+        print(f"!!! Ошибка при обновлении компании ID {company_id}:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при обновлении компании: {e}")
 
 @app.delete("/api/superadmin/companies/{company_id}", tags=["Super-Admin"], status_code=status.HTTP_204_NO_CONTENT)
 def delete_company(
@@ -650,17 +876,75 @@ def delete_company(
     return None
 
 # --- 6. ЭНДПОИНТЫ: ВЛАДЕЛЕЦ КОМПАНИИ (Управление персоналом) ---
-# (Мы "включаем" их обратно, но с проверкой прав)
+# main.py (ИСПРАВЛЕННАЯ ВЕРСИЯ get_locations)
 
-@app.get("/api/locations", tags=["Персонал (Владелец)"], response_model=List[LocationOut])
+@app.get("/api/locations", tags=["Персонал (Владелец)", "Telegram Bot"], response_model=List[LocationOut])
 def get_locations(
-    mployee: Employee = Depends(get_current_company_employee),
-    employee: Employee = Depends(get_company_owner),
+    # --- ИЗМЕНЕНИЕ: Делаем заголовок НЕОБЯЗАТЕЛЬНЫМ ---
+    x_employee_id: Optional[str] = Header(None),
+    # --- ИЗМЕНЕНИЕ: Делаем query параметр НЕОБЯЗАТЕЛЬНЫМ ---
+    company_id_query: Optional[int] = Query(None, alias="company_id"),
     db: Session = Depends(get_db)
 ):
-    """Получает ВСЕ филиалы ТЕКУЩЕЙ компании."""
-    # Этот код правильный. Проблема ВНЕ этой функции.
-    locations = db.query(Location).filter(Location.company_id == employee.company_id).all()
+    """
+    Получает ВСЕ филиалы компании.
+    Определяет компанию либо по X-Employee-ID (для админки),
+    либо по query параметру company_id (для бота/ЛК).
+    """
+    target_company_id: Optional[int] = None
+    employee: Optional[Employee] = None
+
+    print(f"[Get Locations] Запрос филиалов. Header: {x_employee_id}, Query Param: {company_id_query}")
+
+    # --- Сценарий 1: Запрос из Админки (есть заголовок) ---
+    if x_employee_id:
+        try:
+            employee_id_int = int(x_employee_id)
+            # Пытаемся найти активного сотрудника
+            employee = db.query(Employee).options(joinedload(Employee.role)).filter(
+                Employee.id == employee_id_int,
+                Employee.is_active == True
+            ).first()
+            if employee and employee.company_id:
+                # Если сотрудник найден и принадлежит компании, берем ID его компании
+                target_company_id = employee.company_id
+                print(f"[Get Locations] Запрос от сотрудника ID={employee.id}, Компания ID={target_company_id}")
+            elif employee:
+                 # Сотрудник найден, но без company_id (SuperAdmin?) - ему филиалы не нужны
+                 print(f"[Get Locations] Запрос от сотрудника без компании (ID={employee.id}). Возвращаем пустой список.")
+                 return [] # Возвращаем пустой список для SuperAdmin
+            else:
+                 # Сотрудник по ID не найден или не активен
+                 print(f"[Get Locations] Сотрудник по X-Employee-ID={x_employee_id} не найден/не активен.")
+                 # Не возвращаем ошибку 401 сразу, даем шанс второму сценарию (для бота)
+
+        except ValueError:
+            print(f"[Get Locations] Неверный формат X-Employee-ID: {x_employee_id}")
+            # Не возвращаем ошибку, даем шанс второму сценарию
+
+    # --- Сценарий 2: Запрос от Бота/ЛК (company_id в query) ---
+    # Проверяем, если компания еще не определена И передан company_id_query
+    if target_company_id is None and company_id_query is not None:
+        # Проверяем, существует ли компания с таким ID
+        company_check = db.query(Company.id).filter(Company.id == company_id_query).first()
+        if company_check:
+            target_company_id = company_id_query
+            print(f"[Get Locations] Запрос для компании ID={target_company_id} (из query параметра).")
+        else:
+            # Если компания из query параметра не найдена
+            print(f"!!! [Get Locations] Компания ID={company_id_query} из query параметра не найдена.")
+            # Возвращаем ошибку 404
+            raise HTTPException(status_code=404, detail=f"Компания с ID {company_id_query} не найдена.")
+
+    # --- Если компанию так и не удалось определить ---
+    if target_company_id is None:
+        print("!!! [Get Locations] Не удалось определить компанию ни по заголовку, ни по параметру.")
+        # Возвращаем ошибку 401/400, т.к. непонятно, чьи филиалы запрашиваются
+        raise HTTPException(status_code=400, detail="Не удалось определить компанию для запроса филиалов (отсутствует X-Employee-ID или company_id).")
+
+    # --- Запрос филиалов для найденной компании ---
+    locations = db.query(Location).filter(Location.company_id == target_company_id).order_by(Location.name).all()
+    print(f"INFO: Запрос филиалов для компании ID {target_company_id}. Найдено: {len(locations)}")
     return locations
 
 @app.post("/api/locations", tags=["Персонал (Владелец)"], response_model=LocationOut)
@@ -678,6 +962,51 @@ def create_location(
     db.commit()
     db.refresh(new_location)
     return new_location
+
+# --- ДОБАВИТЬ ЭТУ НОВУЮ ФУНКЦИЮ ---
+@app.patch("/api/locations/{location_id}", tags=["Персонал (Владелец)"], response_model=LocationOut)
+def update_location(
+    location_id: int,
+    payload: LocationUpdate, # Используем модель LocationUpdate для частичного обновления
+    employee: Employee = Depends(get_company_owner), # Только Владелец может менять
+    db: Session = Depends(get_db)
+):
+    """Обновляет данные филиала ТЕКУЩЕЙ компании."""
+    # 1. Находим филиал по ID и проверяем, принадлежит ли он компании текущего Владельца
+    location_to_update = db.query(Location).filter(
+        Location.id == location_id,
+        Location.company_id == employee.company_id
+    ).first()
+
+    # 2. Если филиал не найден, возвращаем ошибку 404
+    if not location_to_update:
+        raise HTTPException(status_code=404, detail="Филиал не найден в вашей компании.")
+
+    # 3. Получаем данные для обновления из payload, исключая неустановленные (None)
+    update_data = payload.dict(exclude_unset=True)
+    print(f"INFO: Обновление филиала ID {location_id}. Получены данные: {update_data}")
+
+    # 4. Проверяем, есть ли что обновлять
+    if not update_data:
+         raise HTTPException(status_code=400, detail="Не переданы данные для обновления.")
+
+    # 5. Применяем обновления к объекту филиала
+    for key, value in update_data.items():
+        setattr(location_to_update, key, value)
+        print(f"INFO: Поле {key} обновлено на {value}.")
+
+    # 6. Сохраняем изменения в БД
+    try:
+        db.commit() # Сохраняем
+        db.refresh(location_to_update) # Обновляем объект из БД
+        print(f"INFO: Филиал ID {location_id} успешно обновлен.")
+        return location_to_update # Возвращаем обновленные данные
+    except Exception as e:
+        db.rollback() # Откатываем при ошибке
+        import traceback
+        print(f"!!! Ошибка при обновлении филиала ID {location_id}:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при обновлении филиала: {e}")
+# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
 
 @app.get("/api/employees", tags=["Персонал (Владелец)"], response_model=List[EmployeeOut])
 def get_employees(
@@ -925,10 +1254,11 @@ class ClientUpdate(BaseModel):
 class ClientOut(ClientBase):
     id: int
     company_id: int
-    telegram_chat_id: Optional[str] # Чтобы видеть, привязан ли телеграм
+    telegram_chat_id: Optional[str]
     created_at: datetime
     class Config:
-        orm_mode = True
+        # ЗАМЕНИТЬ orm_mode на from_attributes
+        from_attributes = True
 
 class BulkClientItem(BaseModel):
     full_name: str
@@ -937,6 +1267,12 @@ class BulkClientItem(BaseModel):
 
 class GenerateLKLinkResponse(BaseModel):
     link: str
+
+# --- НОВЫЕ Модели для идентификации пользователя Ботом ---
+class BotIdentifyPayload(BaseModel):
+    company_id: int
+    telegram_chat_id: str
+    phone_number: Optional[str] = None
 
 # --- Эндпоинты для Клиентов ---
 
@@ -1164,110 +1500,154 @@ def bulk_import_clients(
     db: Session = Depends(get_db)
 ):
     """Массовый импорт клиентов из списка (например, из Excel) для ТЕКУЩЕЙ компании."""
+    print(f"[Import Clients] Начало импорта для компании ID: {employee.company_id}. Получено строк: {len(clients_data)}") # Лог начала
     created_count = 0
     errors = []
     warnings = []
 
     # Получаем ВСЕХ существующих клиентов ЭТОЙ компании для быстрой проверки дубликатов
-    existing_clients_in_company = db.query(Client).filter(Client.company_id == employee.company_id).all()
-    existing_phones = {c.phone: c for c in existing_clients_in_company}
-    existing_codes = {c.client_code_num: c for c in existing_clients_in_company if c.client_code_num is not None}
-    
-    for item in clients_data:
-        # Валидация базовых полей
-        if not item.full_name or not item.phone:
-            errors.append(f"Пропущена строка: Отсутствует ФИО или Телефон.")
-            continue
-
-        # Убираем лишние символы из телефона
-        cleaned_phone = re.sub(r'\D', '', item.phone) # Удаляем всё, кроме цифр
-        if not cleaned_phone:
-             errors.append(f"Пропущен клиент '{item.full_name}': Некорректный номер телефона '{item.phone}'.")
-             continue
-
-        # Проверка на дубликат телефона ВНУТРИ компании
-        if cleaned_phone in existing_phones:
-            warnings.append(f"Клиент '{item.full_name}' с телефоном {cleaned_phone} уже существует в вашей компании (пропущен).")
-            continue
-
-        new_client = Client(
-            full_name=item.full_name,
-            phone=cleaned_phone,
-            company_id=employee.company_id # Привязываем к компании
-        )
-
-        # --- ИСПРАВЛЕННЫЙ БЛОК ОБРАБОТКИ КОДА ---
-        parsed_prefix = None # Изначально префикс не определен
-        parsed_num = None    # Изначально номер не определен
-
-        # Обработка кода клиента из файла (ТОЛЬКО если он ЕСТЬ)
-        if item.client_code:
-            code_str = str(item.client_code).strip()
-            if code_str: # Проверяем, что строка не пустая после удаления пробелов
-                # Пытаемся извлечь префикс (буквы) и номер (цифры)
-                match_prefix = re.match(r'^([a-zA-Z]+)', code_str)
-                match_num = re.search(r'(\d+)$', code_str)
-
-                temp_prefix = "KB" # Префикс по умолчанию, если не найден
-                if match_prefix:
-                    temp_prefix = match_prefix.group(1).upper()
-
-                if match_num:
-                    try:
-                        num_val = int(match_num.group(1))
-                        # Проверка на дубликат кода ВНУТРИ компании
-                        if num_val in existing_codes:
-                            warnings.append(f"Код '{num_val}' для клиента '{item.full_name}' уже занят и будет проигнорирован (останется пустым).")
-                            # Не присваиваем код, оставляем parsed_num = None
-                        else:
-                            parsed_num = num_val # Код уникален, сохраняем его
-                            parsed_prefix = temp_prefix # Сохраняем префикс (найденный или KB)
-                            existing_codes.add(parsed_num) # Добавляем в сет для проверки следующих строк
-                    except ValueError:
-                         warnings.append(f"Не удалось распознать номер кода в '{code_str}' для клиента '{item.full_name}'. Код будет проигнорирован (останется пустым).")
-                else:
-                     warnings.append(f"Не удалось найти номер в коде '{code_str}' для клиента '{item.full_name}'. Код будет проигнорирован (останется пустым).")
-            else:
-                # Если item.client_code был, но состоял из пробелов
-                 warnings.append(f"Пустая строка в колонке client_code для клиента '{item.full_name}'. Код не будет присвоен.")
-        
-        # Присваиваем ТОЛЬКО РАСПАРСЕННЫЕ значения (или None, если не было/не распознано)
-        # Авто-генерация здесь БОЛЬШЕ НЕ ПРОИСХОДИТ
-        new_client.client_code_prefix = parsed_prefix
-        new_client.client_code_num = parsed_num
-        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ОБРАБОТКИ КОДА ---
-
-        db.add(new_client)
-        existing_phones.add(cleaned_phone) # Добавляем телефон в сет для проверки следующих
-        created_count += 1
-
-        # Периодически сбрасываем сессию, чтобы избежать накопления объектов в памяти
-        if created_count % 100 == 0:
-            try:
-                db.flush()
-            except Exception as e_flush:
-                 db.rollback()
-                 errors.append(f"Ошибка при промежуточной записи (клиент ~{created_count}): {e_flush}")
-                 # Прерываем импорт при серьезной ошибке записи
-                 break
-
-    # Финальный коммит
     try:
-        db.commit()
-    except Exception as e_commit:
-        db.rollback()
-        # Если была ошибка на финальном коммите, возможно, часть данных не записалась
-        errors.append(f"Критическая ошибка при финальной записи: {e_commit}. Возможно, часть клиентов не была импортирована.")
-        # Обнуляем счетчик, так как не уверены, что всё записалось
-        created_count = 0
+        existing_clients_in_company = db.query(Client).filter(Client.company_id == employee.company_id).all()
+        existing_phones = {c.phone for c in existing_clients_in_company} # Используем set для быстрой проверки
+        existing_codes = {c.client_code_num for c in existing_clients_in_company if c.client_code_num is not None} # Используем set
+        print(f"[Import Clients] Загружено {len(existing_phones)} существующих телефонов и {len(existing_codes)} кодов.") # Лог загрузки
+    except Exception as e_load:
+        print(f"!!! [Import Clients] КРИТИЧЕСКАЯ ОШИБКА при загрузке существующих клиентов: {e_load}")
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при подготовке к импорту: {e_load}")
 
-    return {
+    # --- Начало основного цикла импорта ---
+    for index, item in enumerate(clients_data): # Добавляем index для логирования
+        print(f"\n[Import Clients] Обработка строки {index + 1}: {item.dict()}") # Лог обработки строки
+        try: # Оборачиваем обработку КАЖДОЙ строки в try...except
+            # Валидация базовых полей
+            if not item.full_name or not item.phone:
+                errors.append(f"Строка {index + 1}: Пропущена - Отсутствует ФИО или Телефон.")
+                print(f"[Import Clients] Строка {index + 1}: Пропущена (нет ФИО/Телефона).") # Лог пропуска
+                continue # Переходим к следующей строке
+
+            # Убираем лишние символы из телефона
+            cleaned_phone = re.sub(r'\D', '', str(item.phone)) # Удаляем всё, кроме цифр
+            if not cleaned_phone:
+                 errors.append(f"Строка {index + 1} ('{item.full_name}'): Пропущена - Некорректный номер телефона '{item.phone}'.")
+                 print(f"[Import Clients] Строка {index + 1}: Пропущена (некорректный телефон).") # Лог пропуска
+                 continue
+
+            # Проверка на дубликат телефона ВНУТРИ компании (в загруженных и уже добавленных в этом импорте)
+            if cleaned_phone in existing_phones:
+                warnings.append(f"Строка {index + 1} ('{item.full_name}'): Клиент с телефоном {cleaned_phone} уже существует (пропущен).")
+                print(f"[Import Clients] Строка {index + 1}: Пропущена (дубликат телефона {cleaned_phone}).") # Лог пропуска
+                continue
+
+            # Создаем объект клиента (пока без кода)
+            new_client = Client(
+                full_name=item.full_name,
+                phone=cleaned_phone,
+                company_id=employee.company_id # Привязываем к компании
+            )
+            print(f"[Import Clients] Строка {index + 1}: Объект Client создан для '{item.full_name}' / {cleaned_phone}.") # Лог создания объекта
+
+            # --- Обработка кода клиента ---
+            parsed_prefix = None
+            parsed_num = None
+            if item.client_code:
+                code_str = str(item.client_code).strip()
+                print(f"[Import Clients] Строка {index + 1}: Обработка кода '{code_str}'.") # Лог обработки кода
+                if code_str:
+                    match_prefix = re.match(r'^([a-zA-Z]+)', code_str)
+                    match_num = re.search(r'(\d+)$', code_str)
+                    temp_prefix = "KB" # Префикс по умолчанию
+                    if match_prefix: temp_prefix = match_prefix.group(1).upper()
+
+                    if match_num:
+                        try:
+                            num_val = int(match_num.group(1))
+                            # Проверка на дубликат кода ВНУТРИ компании (в загруженных и уже добавленных)
+                            if num_val in existing_codes:
+                                warnings.append(f"Строка {index + 1} ('{item.full_name}'): Код '{num_val}' уже занят и будет проигнорирован.")
+                                print(f"[Import Clients] Строка {index + 1}: Код {num_val} проигнорирован (дубликат).") # Лог
+                            else:
+                                parsed_num = num_val # Код уникален
+                                parsed_prefix = temp_prefix # Используем найденный или KB
+                                print(f"[Import Clients] Строка {index + 1}: Код {parsed_prefix}{parsed_num} распознан.") # Лог
+                        except ValueError:
+                             warnings.append(f"Строка {index + 1} ('{item.full_name}'): Не удалось распознать номер в коде '{code_str}'. Код проигнорирован.")
+                             print(f"[Import Clients] Строка {index + 1}: Ошибка ValueError при парсинге номера кода '{code_str}'.") # Лог
+                    else:
+                         warnings.append(f"Строка {index + 1} ('{item.full_name}'): Не найден номер в коде '{code_str}'. Код проигнорирован.")
+                         print(f"[Import Clients] Строка {index + 1}: Номер не найден в коде '{code_str}'.") # Лог
+                else:
+                     warnings.append(f"Строка {index + 1} ('{item.full_name}'): Пустая строка в client_code. Код не присвоен.")
+                     print(f"[Import Clients] Строка {index + 1}: Пустой client_code.") # Лог
+            else:
+                 print(f"[Import Clients] Строка {index + 1}: Код клиента не указан.") # Лог отсутствия кода
+
+            # Присваиваем распознанный код (или None)
+            new_client.client_code_prefix = parsed_prefix
+            new_client.client_code_num = parsed_num
+            # --- Конец обработки кода ---
+
+            # Добавляем нового клиента в сессию SQLAlchemy
+            db.add(new_client)
+            print(f"[Import Clients] Строка {index + 1}: db.add(new_client) выполнен.") # Лог добавления в сессию
+
+            # Обновляем множества для проверки следующих строк В ЭТОМ ЖЕ ИМПОРТЕ
+            existing_phones.add(cleaned_phone)
+            if parsed_num is not None:
+                 existing_codes.add(parsed_num)
+
+            created_count += 1 # Увеличиваем счетчик успешно обработанных (но еще не сохраненных)
+
+            # Периодически сбрасываем сессию (flush), чтобы проверить возможные ошибки на уровне БД раньше
+            if created_count % 100 == 0:
+                print(f"[Import Clients] Выполнение промежуточного db.flush() после {created_count} клиентов...") # Лог flush
+                try:
+                    db.flush() # Отправляет команды INSERT/UPDATE в БД, но не завершает транзакцию
+                    print(f"[Import Clients] Промежуточный db.flush() успешен.") # Лог успеха flush
+                except Exception as e_flush:
+                     db.rollback() # Откатываем ВСЮ транзакцию при ошибке flush
+                     print(f"!!! [Import Clients] КРИТИЧЕСКАЯ ОШИБКА при промежуточном db.flush() на строке ~{index + 1}: {e_flush}") # Лог ошибки flush
+                     print(traceback.format_exc()) # Печатаем traceback ошибки
+                     errors.append(f"Критическая ошибка базы данных при записи блока ~{created_count}: {e_flush}")
+                     # Прерываем импорт при серьезной ошибке записи
+                     break # Выходим из цикла for
+
+        except Exception as e_row: # Ловим ЛЮБУЮ другую ошибку при обработке строки
+             print(f"!!! [Import Clients] НЕОЖИДАННАЯ ОШИБКА при обработке строки {index + 1}: {e_row}") # Лог неожиданной ошибки
+             print(traceback.format_exc()) # Печатаем traceback ошибки
+             errors.append(f"Строка {index + 1}: Неожиданная ошибка обработки - {e_row}")
+             # Решаем, прерывать ли импорт (можно continue, если ошибка не критична)
+             # continue # Пока пропустим строку и попробуем продолжить
+             # Или прервать, если ошибка серьезная:
+             # break
+
+    # --- Конец основного цикла импорта ---
+
+    # Финальный коммит (если цикл не был прерван ошибкой flush)
+    if not errors or "Критическая ошибка базы данных" not in " ".join(errors): # Проверяем, не было ли критической ошибки
+        print(f"\n[Import Clients] Попытка выполнить финальный db.commit() для {created_count} клиентов...") # Лог финального commit
+        try:
+            db.commit() # Завершает транзакцию, делая изменения постоянными
+            print(f"[Import Clients] Финальный db.commit() успешен.") # Лог успеха commit
+        except Exception as e_commit:
+            db.rollback() # Откатываем транзакцию при ошибке commit
+            print(f"!!! [Import Clients] КРИТИЧЕСКАЯ ОШИБКА при финальном db.commit(): {e_commit}") # Лог ошибки commit
+            print(traceback.format_exc()) # Печатаем traceback ошибки
+            # Если была ошибка на финальном коммите, возможно, часть данных не записалась
+            errors.append(f"Критическая ошибка при финальной записи: {e_commit}. Возможно, часть клиентов не была импортирована.")
+            # Обнуляем счетчик, так как не уверены, что всё записалось
+            created_count = 0
+            print(f"[Import Clients] Счетчик created_count сброшен из-за ошибки commit.") # Лог сброса счетчика
+
+    # Формируем и возвращаем результат
+    result = {
         "status": "ok",
         "message": "Импорт завершен.",
         "created_clients": created_count,
         "errors": errors,
         "warnings": warnings
     }
+    print(f"[Import Clients] Завершение импорта. Результат: {result}") # Лог результата
+    return result
 
 # === КОНЕЦ НОВОГО КОДА (ИМПОРТ КЛИЕНТОВ) ===
 # === КОНЕЦ НОВОГО КОДА (КЛИЕНТЫ) ===
@@ -1296,10 +1676,17 @@ class OrderBase(BaseModel):
     calculated_exchange_rate_usd: Optional[float] = None
     calculated_final_cost_som: Optional[float] = None
 
-# Модель для создания заказа (требуем ID клиента)
+# Модель для создания заказа (требуем ID клиента, компании, филиала)
 class OrderCreate(OrderBase):
     client_id: int
-    location_id: Optional[int] = None
+    company_id: int # ДОБАВЛЕНО: ID компании, к которой относится заказ
+    location_id: int # ДОБАВЛЕНО: ID филиала, к которому относится заказ
+    # purchase_type уже есть в OrderBase
+    # track_code уже есть в OrderBase
+    # comment уже есть в OrderBase
+    # party_date уже есть в OrderBase
+    # Поля выкупа уже есть в OrderBase
+# --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
 # Модель для обновления заказа
 class OrderUpdate(BaseModel):
@@ -1367,12 +1754,12 @@ class BulkActionPayload(BaseModel):
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
     order_id: int
-    weight_kg: float
+    weight_kg: float = Field(..., gt=0)
 class CalculatePayload(BaseModel):
-    orders: List[CalculateOrderItem]
-    price_per_kg_usd: float
-    exchange_rate_usd: float
-    new_status: Optional[str] = None # Возможность сразу сменить статус
+    orders: List[CalculateOrderItem] # Список заказов с их весом
+    price_per_kg_usd: float = Field(..., gt=0)
+    exchange_rate_usd: float = Field(..., gt=0)
+    new_status: Optional[str] = None # Новый статус (опционально)
 
 # Используется для выдачи
 class IssueOrderItem(BaseModel):
@@ -1388,165 +1775,204 @@ class IssuePayload(BaseModel):
 
 # --- Эндпоинты для Заказов ---
 
-# main.py (Полностью заменяет get_orders)
+# main.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ функцию get_orders ЕЩЕ РАЗ)
 
-@app.get("/api/orders", tags=["Заказы (Владелец)"], response_model=List[OrderOut])
+@app.get("/api/orders", tags=["Заказы (Владелец)", "Telegram Bot"], response_model=List[OrderOut])
 def get_orders(
-    employee: Employee = Depends(get_current_active_employee), # Используем общую зависимость
-    db: Session = Depends(get_db),
+    # --- ИЗМЕНЕНИЕ: Убираем зависимость от employee ---
+    # employee: Optional[Employee] = Depends(get_current_active_employee, use_cache=False),
+    # --- ИЗМЕНЕНИЕ: Делаем company_id обязательным ---
+    company_id: int = Query(...), # ID компании (от админки или бота)
+    # --- ИЗМЕНЕНИЕ: Делаем client_id необязательным (для админки) ---
+    client_id: Optional[int] = Query(None), # ID клиента (от бота или фильтр в админке)
+    # --- Остальные параметры фильтрации ---
     party_dates: Optional[List[date]] = Query(None),
     statuses: Optional[List[str]] = Query(None),
-    client_id: Optional[int] = Query(None),
-    # --- НОВЫЙ ПАРАМЕТР: Фильтр по филиалу ---
-    location_id: Optional[int] = Query(None) 
+    location_id: Optional[int] = Query(None),
+    # --- ДОБАВЛЕНО: Пытаемся получить сотрудника из заголовка, НО НЕ ТРЕБУЕМ ---
+    x_employee_id: Optional[str] = Header(None), # Получаем заголовок, если он есть
+    db: Session = Depends(get_db)
 ):
     """
-    Получает список заказов компании с возможностью фильтрации.
-    - Владелец: Может фильтровать по location_id или видеть все.
-    - Сотрудник: Всегда видит только заказы своего филиала.
+    Получает список заказов компании с фильтрацией.
+    Использует company_id. Если передан X-Employee-ID, применяет фильтры для сотрудника/владельца.
+    Если передан client_id (от бота), фильтрует по клиенту.
     """
-    if employee.company_id is None:
-         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
+    print(f"[Get Orders] Запрос для Company ID={company_id}. Employee Header: {x_employee_id}. Client ID: {client_id}")
+
+    # --- Проверка компании ---
+    company = db.query(Company.id).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
 
     query = db.query(Order).options(joinedload(Order.client)).filter(
-        Order.company_id == employee.company_id 
+        Order.company_id == company_id
     )
 
-    # --- НОВАЯ ЛОГИКА ФИЛЬТРАЦИИ ПО ФИЛИАЛУ ---
-    if employee.role.name == 'Владелец':
-        # Владелец: фильтруем по location_id, ЕСЛИ он передан
-        if location_id is not None:
-            # Проверяем, что филиал принадлежит компании (на всякий случай)
-            loc_check = db.query(Location).filter(Location.id == location_id, Location.company_id == employee.company_id).first()
-            if not loc_check:
-                 raise HTTPException(status_code=404, detail="Указанный филиал не найден в вашей компании.")
-            query = query.filter(Order.location_id == location_id)
-            print(f"[Заказы] Владелец ID={employee.id} фильтрует по филиалу ID={location_id}")
-        else:
-            print(f"[Заказы] Владелец ID={employee.id} просматривает заказы ВСЕХ филиалов.")
-            # Если location_id не передан, Владелец видит все
-            pass 
-    else:
-        # ОБЫЧНЫЙ СОТРУДНИК: Всегда фильтруем по его location_id
-        if employee.location_id is None:
-             # Если у сотрудника нет филиала, он не должен видеть заказы
-             print(f"[Заказы][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
-             return [] # Возвращаем пустой список
-        query = query.filter(Order.location_id == employee.location_id)
-        print(f"[Заказы] Сотрудник ID={employee.id} просматривает заказы своего филиала ID={employee.location_id}")
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+    employee: Optional[Employee] = None
+    target_location_id: Optional[int] = None
 
-    # Фильтры по дате и статусу (остаются без изменений)
+    # --- Попытка определить сотрудника из админки ---
+    if x_employee_id:
+        try:
+            employee_id_int = int(x_employee_id)
+            employee = db.query(Employee).options(joinedload(Employee.role)).filter(
+                Employee.id == employee_id_int,
+                Employee.company_id == company_id, # Проверяем принадлежность компании
+                Employee.is_active == True
+            ).first()
+        except ValueError:
+            employee = None # Неверный формат заголовка
+        if employee:
+             print(f"[Get Orders] Запрос идентифицирован как от сотрудника ID={employee.id} (Роль: {employee.role.name})")
+             # Логика фильтрации по филиалу для админки
+             if employee.role.name == 'Владелец':
+                 if location_id is not None:
+                     loc_check = db.query(Location.id).filter(Location.id == location_id, Location.company_id == company_id).first()
+                     if not loc_check: raise HTTPException(status_code=404, detail="Указанный филиал не найден.")
+                     target_location_id = location_id
+                     print(f"[Get Orders] Владелец фильтрует по филиалу ID={target_location_id}")
+                 else:
+                     print(f"[Get Orders] Владелец видит все филиалы.")
+                     target_location_id = None
+             else: # Обычный сотрудник админки
+                 target_location_id = employee.location_id
+                 if target_location_id is None:
+                      print(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
+                      return []
+                 print(f"[Get Orders] Сотрудник видит свой филиал ID={target_location_id}")
+        else:
+             print("[Get Orders] Заголовок X-Employee-ID передан, но сотрудник не найден/не активен.")
+             # Можно вернуть ошибку 401, если заголовок был, но невалидный
+             # raise HTTPException(status_code=401, detail="Неверный или неактивный X-Employee-ID.")
+             # Пока просто игнорируем, как будто запроса из админки не было
+
+    # --- Фильтрация по client_id (применяется всегда, если передан) ---
+    if client_id is not None:
+        client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
+        if not client_check:
+            raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
+        query = query.filter(Order.client_id == client_id)
+        print(f"[Get Orders] Применен фильтр по Client ID={client_id}")
+
+    # --- Применяем остальные фильтры ---
+    # Фильтр по филиалу (если он был определен для админки)
+    if target_location_id is not None:
+        query = query.filter(Order.location_id == target_location_id)
+
+    # Фильтры по дате
     if party_dates:
         query = query.filter(Order.party_date.in_(party_dates))
-        
+
+    # Фильтр по статусам
     statuses_to_filter = statuses
-    if not statuses_to_filter:
+    # Если статусы не переданы И это запрос из админки (employee определен),
+    # то по умолчанию скрываем "Выданные"
+    if not statuses_to_filter and employee:
         statuses_to_filter = [s for s in ORDER_STATUSES if s != "Выдан"]
+    # Применяем фильтр по статусам, если он есть
     if statuses_to_filter:
         query = query.filter(Order.status.in_(statuses_to_filter))
 
-    # Фильтр по клиенту (остается без изменений)
-    if client_id is not None:
-        client_check = db.query(Client).filter(Client.id == client_id, Client.company_id == employee.company_id).first()
-        if not client_check:
-             raise HTTPException(status_code=404, detail="Клиент не найден в вашей компании.")
-        query = query.filter(Order.client_id == client_id)
+    # --- КОНЕЦ ОБЩИХ ФИЛЬТРОВ ---
 
-    # Сортировка (остается без изменений)
+    # Сортировка и выполнение запроса
     orders = query.order_by(Order.party_date.desc().nullslast(), Order.id.desc()).all()
+    print(f"[Get Orders] Найдено заказов: {len(orders)}")
     return orders
 
-@app.post("/api/orders", tags=["Заказы (Владелец)"], response_model=OrderOut)
+@app.post("/api/orders", tags=["Заказы (Владелец)", "Telegram Bot"], response_model=OrderOut)
 def create_order(
-    payload: OrderCreate,
-    employee: Employee = Depends(get_current_active_employee), # Используем общую зависимость
+    payload: OrderCreate, # Модель теперь содержит company_id и location_id
+    # Убираем зависимость от employee, т.к. может вызываться ботом
+    # employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
-    """Создает новый заказ для клиента ТЕКУЩЕЙ компании, привязывая его к филиалу."""
-    if employee.company_id is None: # SuperAdmin не может
-        raise HTTPException(status_code=403, detail="Действие недоступно.")
+    """
+    Создает новый заказ для клиента УКАЗАННОЙ компании, привязывая его к филиалу.
+    Может вызываться из админ-панели (Владелец/Сотрудник) или Ботом.
+    """
+    print(f"[Create Order API] Получен payload: {payload.dict()}")
 
-    # 1. Проверяем клиента
+    # --- Шаг 1: Проверка компании, клиента и филиала ---
+    company = db.query(Company).filter(Company.id == payload.company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Компания с ID {payload.company_id} не найдена.")
+
     client = db.query(Client).filter(
         Client.id == payload.client_id,
-        Client.company_id == employee.company_id
+        Client.company_id == payload.company_id # Убеждаемся, что клиент из той же компании
     ).first()
     if not client:
-        raise HTTPException(status_code=404, detail="Клиент не найден в вашей компании.")
+        raise HTTPException(status_code=404, detail=f"Клиент ID {payload.client_id} не найден в компании ID {payload.company_id}.")
 
-    # 2. Проверка дубликата трек-кода
-    if not payload.track_code.startswith("PENDING-"):
+    location = db.query(Location).filter(
+        Location.id == payload.location_id,
+        Location.company_id == payload.company_id # Убеждаемся, что филиал из той же компании
+    ).first()
+    if not location:
+        raise HTTPException(status_code=404, detail=f"Филиал ID {payload.location_id} не найден в компании ID {payload.company_id}.")
+    print(f"[Create Order API] Проверки пройдены для компании {company.name}, клиента {client.full_name}, филиала {location.name}.")
+
+    # --- Шаг 2: Проверка дубликата трек-кода ---
+    # Генерируем временный трек-код, если он не передан и тип Выкуп
+    track_code_to_save = payload.track_code
+    if not track_code_to_save and payload.purchase_type == "Выкуп":
+         timestamp = int(datetime.now().timestamp() * 1000)
+         track_code_to_save = f"PENDING-{timestamp}"
+         print(f"[Create Order API] Сгенерирован временный трек-код: {track_code_to_save}")
+    # Если трек-код все еще пуст (не Выкуп), это ошибка
+    if not track_code_to_save:
+         raise HTTPException(status_code=400, detail="Трек-код обязателен для типа 'Доставка'.")
+
+    # Проверяем уникальность трек-кода (если он не PENDING) ВНУТРИ КОМПАНИИ
+    if not track_code_to_save.startswith("PENDING-"):
          existing_order = db.query(Order).filter(
-              Order.track_code == payload.track_code,
-              Order.company_id == employee.company_id
+              Order.track_code == track_code_to_save,
+              Order.company_id == payload.company_id # Проверка внутри компании
          ).first()
          if existing_order:
-              raise HTTPException(status_code=400, detail=f"Заказ с трек-кодом '{payload.track_code}' уже существует в вашей компании.")
+              raise HTTPException(status_code=400, detail=f"Заказ с трек-кодом '{track_code_to_save}' уже существует в компании {company.name}.")
 
-    # 3. Определение location_id для заказа
-    order_location_id = None
-    if employee.role.name == 'Владелец':
-        # Владелец: Используем location_id из payload ИЛИ его собственный location_id
-        if payload.location_id:
-            # Проверяем, что указанный филиал принадлежит компании
-            loc_check = db.query(Location).filter(Location.id == payload.location_id, Location.company_id == employee.company_id).first()
-            if not loc_check:
-                raise HTTPException(status_code=404, detail="Указанный филиал не найден в вашей компании.")
-            order_location_id = payload.location_id
-            print(f"[Create Order] Владелец ID={employee.id} выбрал филиал ID={order_location_id}")
-        elif employee.location_id:
-             order_location_id = employee.location_id # Используем основной филиал Владельца
-             print(f"[Create Order] Владелец ID={employee.id} использует свой филиал ID={order_location_id}")
-        else:
-             # Если у Владельца нет location_id и он не выбрал филиал, ищем первый филиал компании
-             first_location = db.query(Location).filter(Location.company_id == employee.company_id).first()
-             if not first_location:
-                  raise HTTPException(status_code=400, detail="Не найден ни один филиал для привязки заказа.")
-             order_location_id = first_location.id
-             print(f"[Create Order] Владелец ID={employee.id} не привязан к филиалу, используется первый найденный: ID={order_location_id}")
-    else:
-        # Обычный сотрудник: Всегда используем его location_id
-        if not employee.location_id:
-            raise HTTPException(status_code=400, detail="Ошибка: Ваш профиль не привязан к филиалу.")
-        order_location_id = employee.location_id
-        print(f"[Create Order] Сотрудник ID={employee.id} использует свой филиал ID={order_location_id}")
-        
-    # 4. Установка статуса и даты партии
+    # --- Шаг 3: Определение статуса и даты партии ---
     order_status = "Ожидает выкупа" if payload.purchase_type == "Выкуп" else "В обработке"
+    # Используем дату из payload или сегодняшнюю
     order_party_date = payload.party_date if payload.party_date else date.today()
 
-    # 5. Создание объекта Order
+    # --- Шаг 4: Создание объекта Order ---
     new_order = Order(
         client_id=payload.client_id,
-        track_code=payload.track_code,
+        track_code=track_code_to_save, # Используем проверенный/сгенерированный код
         status=order_status,
         purchase_type=payload.purchase_type,
         comment=payload.comment,
         party_date=order_party_date,
+        # Поля выкупа из payload (OrderBase)
         buyout_item_cost_cny=payload.buyout_item_cost_cny,
         buyout_commission_percent=payload.buyout_commission_percent,
         buyout_rate_for_client=payload.buyout_rate_for_client,
         buyout_actual_rate=payload.buyout_actual_rate,
-        # Привязка к компании и филиалу
-        company_id=employee.company_id, 
-        location_id=order_location_id # <-- ПРИВЯЗКА К ФИЛИАЛУ
+        # Привязка к компании и филиалу из payload
+        company_id=payload.company_id,
+        location_id=payload.location_id
     )
-    
-    # 6. Сохранение в БД
+    print(f"[Create Order API] Объект Order создан для сохранения.")
+
+    # --- Шаг 5: Сохранение в БД ---
     try:
         db.add(new_order)
-        db.commit()
-        db.refresh(new_order)
-        db.refresh(new_order, attribute_names=['client']) # Загружаем клиента для ответа
-        print(f"[Create Order] Заказ ID={new_order.id} успешно создан для филиала ID={order_location_id}")
-        return new_order
+        db.commit() # Сохраняем заказ
+        db.refresh(new_order) # Обновляем объект из БД (чтобы получить ID и т.д.)
+        # Принудительно загружаем связанные данные клиента для ответа
+        db.refresh(new_order, attribute_names=['client'])
+        print(f"[Create Order API] Заказ ID={new_order.id} успешно создан для филиала ID={new_order.location_id}")
+        return new_order # Возвращаем созданный заказ
     except Exception as e:
-        db.rollback()
+        db.rollback() # Откатываем транзакцию при ошибке
         import traceback
         print(f"!!! Ошибка БД при создании заказа:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных при создании заказа: {e}")
-
+# --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
 # main.py (Полностью заменяет функцию update_order)
 
@@ -2265,41 +2691,90 @@ def get_expenses(
     start_date: date, # Обязательный параметр начала периода
     end_date: date,   # Обязательный параметр конца периода
     employee: Employee = Depends(get_current_active_employee), # Любой сотрудник компании
+    # ДОБАВЛЕН ЭТОТ ПАРАМЕТР:
+    location_id: Optional[int] = Query(None), # <-- Добавляем фильтр по филиалу
     db: Session = Depends(get_db)
 ):
-    """Получает список расходов ТЕКУЩЕЙ компании за указанный период."""
+    """Получает список расходов ТЕКУЩЕЙ компании за указанный период с фильтрацией по филиалу."""
     # === ИСПРАВЛЕНИЕ КРИТИЧЕСКОЙ ОШИБКИ: Используем company_id вместо is_super_admin ===
-    if employee.company_id is None: 
+    # Проверяем, что это не Супер-Админ
+    if employee.company_id is None:
          # Супер-админу пока не даем доступ к расходам компаний
          raise HTTPException(status_code=403, detail="Доступ к расходам для SuperAdmin не реализован.")
     # === КОНЕЦ ИСПРАВЛЕНИЯ ===
 
-    # Проверка прав на просмотр расходов 
+    # Проверка прав на просмотр расходов
     perms = {p.codename for p in employee.role.permissions}
+    # Разрешаем просмотр, если есть право на отчет по смене ИЛИ на полные отчеты
     if 'view_shift_report' not in perms and 'view_full_reports' not in perms:
         raise HTTPException(status_code=403, detail="У вас нет прав на просмотр расходов.")
 
     print(f"[Expense] Запрос списка расходов для компании ID={employee.company_id} за период {start_date} - {end_date}")
 
     # Формируем границы периода (включая весь день end_date)
+    # Используем datetime для корректного сравнения с DateTime полем created_at
     start_datetime = datetime.combine(start_date, datetime.min.time())
+    # Конец дня end_date (23:59:59.999999)
     end_datetime = datetime.combine(end_date, datetime.max.time())
 
     # --- ИСПРАВЛЕНИЕ ОШИБКИ ЗАГРУЗКИ ---
-    # Запрашиваем расходы компании за период, сразу подгружая связанные данные
-    expenses = db.query(Expense).options(
+    # Начинаем строить базовый запрос, сразу подгружая связанные данные
+    query = db.query(Expense).options(
         # ИСПРАВЛЕНИЕ 1: Правильно загружаем Тип Расхода
-        joinedload(Expense.expense_type), 
+        joinedload(Expense.expense_type),
         # ИСПРАВЛЕНИЕ 2: Правильно загружаем Смену и Сотрудника смены
-        joinedload(Expense.shift).joinedload(Shift.employee) 
+        joinedload(Expense.shift).joinedload(Shift.employee)
     ).filter(
     # --- КОНЕЦ ИСПРАВЛЕНИЙ ---
+        # Фильтруем по компании и дате создания
         Expense.company_id == employee.company_id,
         Expense.created_at >= start_datetime,
-        Expense.created_at <= end_datetime
-    ).order_by(Expense.created_at.desc()).all() # Сортируем по дате (новые вверху)
+        Expense.created_at <= end_datetime # Используем <= с концом дня
+    ) # Пока не выполняем .all()
 
-    print(f"[Expense] Найдено {len(expenses)} расходов за период.")
+    # --- НОВАЯ ЛОГИКА ФИЛЬТРАЦИИ ПО ФИЛИАЛУ ДЛЯ РАСХОДОВ ---
+    if employee.role.name == 'Владелец':
+        # Владелец: фильтруем по location_id, ЕСЛИ он передан
+        if location_id is not None:
+            # Проверяем, что филиал принадлежит компании (защита от некорректных запросов)
+            loc_check = db.query(Location).filter(Location.id == location_id, Location.company_id == employee.company_id).first()
+            if not loc_check:
+                 raise HTTPException(status_code=404, detail="Указанный филиал не найден в вашей компании.")
+            # Фильтруем расходы:
+            # 1. Привязанные к сменам ИМЕННО ЭТОГО филиала
+            # 2. ИЛИ "Общие расходы" Владельца (где shift_id = NULL)
+            # Используем LEFT JOIN (isouter=True), чтобы включить расходы без смены
+            query = query.join(Shift, Expense.shift_id == Shift.id, isouter=True).filter(
+                 or_(
+                      Shift.location_id == location_id, # Расходы смен этого филиала
+                      Expense.shift_id == None          # ИЛИ общие расходы
+                 )
+            )
+            print(f"[Расходы] Владелец ID={employee.id} фильтрует расходы по филиалу ID={location_id}")
+        else:
+             # Если location_id не передан, Владелец видит ВСЕ расходы компании (всех филиалов + общие)
+             print(f"[Расходы] Владелец ID={employee.id} просматривает расходы ВСЕХ филиалов и Общие.")
+             # Дополнительно фильтровать query не нужно, базовый фильтр по company_id уже есть
+             pass
+    else:
+        # ОБЫЧНЫЙ СОТРУДНИК: Всегда видит расходы ТОЛЬКО своего филиала, привязанные к сменам
+        if employee.location_id is None:
+             # Если сотрудник не привязан к филиалу, он не должен видеть расходы смен
+             print(f"[Расходы][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу! Не может видеть расходы смен.")
+             return [] # Возвращаем пустой список
+        # Фильтруем расходы, привязанные к сменам ЕГО филиала
+        # Используем INNER JOIN (isouter=False - по умолчанию), т.к. сотрудник видит ТОЛЬКО расходы смен
+        query = query.join(Shift, Expense.shift_id == Shift.id).filter(
+            Shift.location_id == employee.location_id
+        )
+        print(f"[Расходы] Сотрудник ID={employee.id} просматривает расходы своего филиала ID={employee.location_id}")
+    # --- КОНЕЦ НОВОЙ ЛОГИКИ ФИЛЬТРАЦИИ ПО ФИЛИАЛУ ---
+
+    # Добавляем сортировку по дате создания (новые вверху) и выполняем запрос
+    expenses = query.order_by(Expense.created_at.desc()).all()
+
+    print(f"[Expense] Найдено {len(expenses)} расходов за период (с учетом фильтра филиала).")
+    # Возвращаем результат (FastAPI сам преобразует в JSON благодаря response_model)
     return expenses
 
 
@@ -2311,7 +2786,7 @@ def update_expense(
     db: Session = Depends(get_db)
 ):
     """Обновляет существующий расход."""
-    if employee.is_super_admin:
+    if employee.company_id is None:
          raise HTTPException(status_code=403, detail="Супер-админ не может редактировать расходы.")
 
     # Находим расход, который нужно обновить
@@ -2387,7 +2862,7 @@ def delete_expense(
 ):
     """Удаляет запись о расходе (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА И ТРЕБУЕТ ПАРОЛЬ)."""
     
-    if employee.is_super_admin:
+    if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Супер-админ не может удалять расходы компаний.")
 
     # Проверка: Только Владелец может удалять расходы
@@ -2504,15 +2979,6 @@ def issue_orders(
     if 'issue_orders' not in perms:
         raise HTTPException(status_code=403, detail="У вас нет прав на выдачу заказов.")
 
-    # Проверка активной смены (выдача всегда привязана к смене)
-    active_shift = db.query(Shift).filter(
-        Shift.company_id == employee.company_id,
-        Shift.location_id == employee.location_id, # В филиале текущего сотрудника
-        Shift.end_time == None
-    ).first()
-    if not active_shift:
-        raise HTTPException(status_code=400, detail="Нет активной смены для оформления выдачи. Откройте смену.")
-
     order_ids = [item.order_id for item in payload.orders]
     
     # Находим заказы, проверяем их статус и принадлежность компании
@@ -2520,6 +2986,32 @@ def issue_orders(
         Order.id.in_(order_ids),
         Order.company_id == employee.company_id
     ).all()
+
+    # --- НОВЫЙ БЛОК ПРОВЕРКИ СМЕНЫ (вставить сюда) ---
+    if not orders_to_issue:
+         # Эта проверка дублирует существующую, но нужна здесь для безопасности
+         raise HTTPException(status_code=404, detail="Заказы не найдены.")
+
+    # 1. Получаем location_id из ПЕРВОГО заказа
+    order_location_id = orders_to_issue[0].location_id
+
+    # 2. Убедимся, что все заказы из ОДНОГО филиала
+    if not all(o.location_id == order_location_id for o in orders_to_issue):
+        raise HTTPException(status_code=400, detail="Нельзя выдать заказы из разных филиалов одновременно.")
+
+    # 3. Ищем активную смену в ФИЛИАЛЕ ЗАКАЗА (а не сотрудника, который нажимает кнопку)
+    active_shift = db.query(Shift).filter(
+        Shift.company_id == employee.company_id,
+        Shift.location_id == order_location_id, # <-- ПРАВИЛЬНАЯ ПРОВЕРКА
+        Shift.end_time == None
+    ).first()
+
+    if not active_shift:
+        # Находим имя филиала для красивой ошибки
+        location_name_obj = db.query(Location.name).filter(Location.id == order_location_id).first()
+        location_name = location_name_obj[0] if location_name_obj else f"ID {order_location_id}"
+        raise HTTPException(status_code=400, detail=f"Нет активной смены в филиале '{location_name}'. Невозможно оформить выдачу.")
+    # --- КОНЕЦ НОВОГО БЛОКА ---
 
     # Проверки
     if len(orders_to_issue) != len(order_ids):
@@ -2875,67 +3367,123 @@ def get_past_shift_report(
     return report_data
 
 
-@app.get("/api/reports/summary", tags=["Отчеты"])
+# main.py (Полностью заменяет get_summary_report)
+
+@app.get("/api/reports/summary", tags=["Отчеты"]) # Убираем response_model, т.к. возвращаем словарь
 def get_summary_report(
     start_date: date,
     end_date: date,
     location_id: Optional[int] = Query(None), # Добавляем необязательный фильтр по филиалу
     db: Session = Depends(get_db),
-    current_employee: Employee = Depends(get_current_company_employee) # Используем новую зависимость
+    # МЕНЯЕМ ЗАВИСИМОСТЬ на get_current_active_employee
+    current_employee: Employee = Depends(get_current_active_employee) # Используем общую зависимость
 ):
-    company_id = current_employee.company_id
+    """
+    Формирует сводный отчет по доходам, расходам и сменам за период.
+    - Владелец: Может фильтровать по location_id или видеть все.
+    - Сотрудник: Всегда видит только свой филиал.
+    Требует права 'view_full_reports'.
+    """
+    # Проверка прав (только те, кто может видеть полные отчеты)
+    perms = {p.codename for p in current_employee.role.permissions}
+    if 'view_full_reports' not in perms:
+        raise HTTPException(status_code=403, detail="У вас нет прав на просмотр сводных отчетов.")
 
-    # Определяем ID филиалов, к которым у пользователя есть доступ
-    accessible_location_ids = []
-    if current_employee.is_company_owner:
-        if location_id: # Если Владелец выбрал конкретный филиал
+    # Проверка, что это не Супер-Админ
+    if current_employee.company_id is None:
+        raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
+
+    company_id = current_employee.company_id # ID компании текущего сотрудника
+
+    print(f"[Summary Report] Запрос для компании ID={company_id}, период {start_date} - {end_date}, фильтр филиала: {location_id}")
+
+    # --- ЛОГИКА ОПРЕДЕЛЕНИЯ ФИЛИАЛОВ ДЛЯ ФИЛЬТРАЦИИ ---
+    accessible_location_ids = [] # Список ID филиалов, данные которых нужно включить в отчет
+    if current_employee.role.name == 'Владелец':
+        if location_id is not None: # Если Владелец выбрал конкретный филиал
              # Проверяем, что выбранный филиал принадлежит этой компании
              location = db.query(Location).filter(Location.id == location_id, Location.company_id == company_id).first()
              if not location:
                   raise HTTPException(status_code=404, detail="Выбранный филиал не найден или не принадлежит вашей компании.")
              accessible_location_ids = [location_id]
+             print(f"[Summary Report] Владелец фильтрует по филиалу ID={location_id}")
         else: # Если Владелец не выбрал филиал (отчет по всей компании)
+             # Получаем ID всех филиалов компании
              accessible_location_ids = [loc.id for loc in db.query(Location.id).filter(Location.company_id == company_id).all()]
+             print(f"[Summary Report] Владелец просматривает отчет по ВСЕМ филиалам.")
     else: # Обычный сотрудник видит отчет только по своему филиалу
+        if current_employee.location_id is None:
+             # Это не должно произойти, если сотрудник активен, но на всякий случай
+             raise HTTPException(status_code=400, detail="Ваш профиль не привязан к филиалу.")
         accessible_location_ids = [current_employee.location_id]
+        print(f"[Summary Report] Сотрудник просматривает отчет по своему филиалу ID={current_employee.location_id}")
 
     if not accessible_location_ids:
-         # На случай, если у компании нет филиалов или произошла ошибка
-         raise HTTPException(status_code=400, detail="Не удалось определить филиалы для отчета.")
+         # Если список филиалов пуст (например, у компании нет филиалов)
+         # Возвращаем пустой отчет или ошибку, здесь вернем пустой
+         print("[Summary Report] Не найдено доступных филиалов для отчета.")
+         # Формируем пустой ответ
+         empty_summary = {
+             "start_date": start_date, "end_date": end_date, "location_id_filter": location_id,
+             "total_income": 0, "total_cash_income": 0, "total_card_income": 0,
+             "total_expenses": 0, "expenses_by_type": {}, "net_profit": 0, "shifts": []
+         }
+         return {"status": "ok", "summary": empty_summary}
+    # --- КОНЕЦ ЛОГИКИ ОПРЕДЕЛЕНИЯ ФИЛИАЛОВ ---
 
 
     # --- Корректная обработка диапазона дат ---
     start_datetime = datetime.combine(start_date, time.min) # Начало дня start_date 00:00:00
-    end_datetime_exclusive = datetime.combine(end_date + timedelta(days=1), time.min) # Начало СЛЕДУЮЩЕГО дня (для <)
+    # Используем конец дня end_date (23:59:59...) для включения всего дня
+    end_datetime = datetime.combine(end_date, time.max)
 
     # --- Фильтруем выданные заказы по компании, доступным филиалам и дате ---
     issued_orders_query = db.query(Order).filter(
         Order.company_id == company_id,
-        Order.location_id.in_(accessible_location_ids), # Фильтр по филиалам
+        Order.location_id.in_(accessible_location_ids), # Фильтр по доступным филиалам
         Order.status == "Выдан",
         Order.issued_at >= start_datetime,
-        Order.issued_at < end_datetime_exclusive
+        Order.issued_at <= end_datetime # Используем <= с концом дня
     )
     issued_orders = issued_orders_query.all()
+    print(f"[Summary Report] Найдено выданных заказов: {len(issued_orders)}")
 
     # --- Фильтруем все расходы по компании, доступным филиалам и дате ---
-    # Включаем "Общие расходы" Владельца (shift_id is NULL), если он смотрит отчет по всей компании
     all_expenses_query = db.query(Expense).options(joinedload(Expense.expense_type)).filter(
         Expense.company_id == company_id,
         Expense.created_at >= start_datetime,
-        Expense.created_at < end_datetime_exclusive
+        Expense.created_at <= end_datetime # Используем <= с концом дня
     )
-    # Фильтруем по shift.location_id ИЛИ учитываем общие расходы (shift_id is NULL)
-    all_expenses_query = all_expenses_query.join(Shift, Expense.shift_id == Shift.id, isouter=True).filter(
-         or_(
-              Shift.location_id.in_(accessible_location_ids),
-              Expense.shift_id == None # Включаем общие расходы Владельца
+    # Фильтруем по shift.location_id ИЛИ учитываем общие расходы (shift_id is NULL),
+    # НО ТОЛЬКО если Владелец смотрит отчет по ВСЕЙ компании (location_id is None)
+    # ИЛИ если Владелец смотрит отчет по КОНКРЕТНОМУ филиалу (включаем расходы этого филиала + общие)
+    # Сотрудник видит ТОЛЬКО расходы своего филиала (без общих)
+    if current_employee.role.name == 'Владелец':
+        # Если отчет по ВСЕМ филиалам (location_id не задан), включаем расходы ВСЕХ филиалов + Общие
+        if location_id is None:
+            all_expenses_query = all_expenses_query.join(Shift, Expense.shift_id == Shift.id, isouter=True).filter(
+                 or_(
+                      Shift.location_id.in_(accessible_location_ids), # Расходы смен всех доступных филиалов
+                      Expense.shift_id == None                      # И Общие расходы
+                 )
+            )
+        else: # Если отчет по КОНКРЕТНОМУ филиалу, включаем расходы этого филиала + Общие
+             all_expenses_query = all_expenses_query.join(Shift, Expense.shift_id == Shift.id, isouter=True).filter(
+                 or_(
+                      Shift.location_id == location_id, # Расходы смен ТОЛЬКО этого филиала
+                      Expense.shift_id == None          # И Общие расходы
+                 )
+            )
+    else: # Обычный сотрудник
+         # Видит ТОЛЬКО расходы смен своего филиала (INNER JOIN)
+         all_expenses_query = all_expenses_query.join(Shift, Expense.shift_id == Shift.id).filter(
+             Shift.location_id == current_employee.location_id
          )
-    )
 
     all_expenses = all_expenses_query.all()
+    print(f"[Summary Report] Найдено расходов: {len(all_expenses)}")
 
-    # --- Расчеты ---
+    # --- Расчеты (остаются без изменений) ---
     total_cash_income = sum(o.paid_cash_som for o in issued_orders if o.paid_cash_som)
     total_card_income = sum(o.paid_card_som for o in issued_orders if o.paid_card_som)
     total_income = total_cash_income + total_card_income
@@ -2944,26 +3492,34 @@ def get_summary_report(
 
     expenses_by_type = {}
     for exp in all_expenses:
-        type_name = exp.expense_type.name
+        # Безопасно получаем имя типа расхода
+        type_name = exp.expense_type.name if exp.expense_type else "Без типа"
         if type_name not in expenses_by_type:
             expenses_by_type[type_name] = 0
         expenses_by_type[type_name] += exp.amount
 
     net_profit = total_income - total_expenses
 
-    # --- Фильтруем смены по компании, доступным филиалам и дате ---
-    shifts_in_period_query = db.query(Shift).options(joinedload(Shift.employee), joinedload(Shift.location)).filter(
+    # --- Фильтруем смены по компании, доступным филиалам и дате (остается без изменений) ---
+    shifts_in_period_query = db.query(Shift).options(
+        joinedload(Shift.employee),
+        joinedload(Shift.location) # Загружаем локацию
+    ).filter(
         Shift.company_id == company_id,
-        Shift.location_id.in_(accessible_location_ids), # Фильтр по филиалам
-        Shift.start_time >= start_datetime,
-        Shift.start_time < end_datetime_exclusive # Используем конец дня end_date
+        Shift.location_id.in_(accessible_location_ids), # Фильтр по доступным филиалам
+        Shift.start_time >= start_datetime, # Смены, начавшиеся в периоде
+        Shift.start_time <= end_datetime # Используем <=
+        # Можно добавить фильтр по end_time, если нужно включать только ЗАВЕРШЕННЫЕ смены
+        # Shift.end_time != None,
+        # Shift.end_time <= end_datetime
     )
     shifts_in_period = shifts_in_period_query.order_by(Shift.start_time.desc()).all()
+    print(f"[Summary Report] Найдено смен: {len(shifts_in_period)}")
 
-    # --- Формируем ответ ---
+    # --- Формируем ответ (словарь) ---
     summary = {
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": start_date.isoformat(), # Преобразуем в строку для JSON
+        "end_date": end_date.isoformat(),
         "location_id_filter": location_id, # Добавляем информацию о фильтре
         "total_income": total_income,
         "total_cash_income": total_cash_income,
@@ -2971,12 +3527,12 @@ def get_summary_report(
         "total_expenses": total_expenses,
         "expenses_by_type": expenses_by_type,
         "net_profit": net_profit,
-        # Добавляем больше деталей о сменах
+        # Добавляем больше деталей о сменах в список словарей
         "shifts": [
             {
                 "id": shift.id,
-                "start_time": shift.start_time,
-                "end_time": shift.end_time,
+                "start_time": shift.start_time.isoformat(),
+                "end_time": shift.end_time.isoformat() if shift.end_time else None,
                 "employee": {
                     "id": shift.employee.id,
                     "full_name": shift.employee.full_name
@@ -2984,11 +3540,477 @@ def get_summary_report(
                  "location": { # Добавляем информацию о филиале смены
                      "id": shift.location.id,
                      "name": shift.location.name
-                 } if shift.location else None
+                 } if shift.location else None,
+                 # Дополнительно можно вернуть cash/card income и expenses для этой смены, если нужно
             } for shift in shifts_in_period
         ]
     }
+    # Возвращаем словарь напрямую, без Pydantic модели
     return {"status": "ok", "summary": summary}
+
+# main.py (Добавить этот НОВЫЙ эндпоинт)
+
+@app.get("/api/reports/buyout", tags=["Отчеты"])
+def get_buyout_report(
+    start_date: date,
+    end_date: date,
+    location_id: Optional[int] = Query(None), # Фильтр по филиалу
+    db: Session = Depends(get_db),
+    current_employee: Employee = Depends(get_current_active_employee) # Общая зависимость
+):
+    """
+    Формирует отчет по выкупленным заказам и курсовой разнице за период.
+    - Владелец: Может фильтровать по location_id или видеть все.
+    - Сотрудник: Видит только свой филиал.
+    Требует права 'view_full_reports'.
+    """
+    # Проверка прав
+    perms = {p.codename for p in current_employee.role.permissions}
+    if 'view_full_reports' not in perms:
+        raise HTTPException(status_code=403, detail="У вас нет прав на просмотр отчетов по выкупу.")
+
+    if current_employee.company_id is None:
+        raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
+
+    company_id = current_employee.company_id
+    print(f"[Buyout Report] Запрос для компании ID={company_id}, период {start_date} - {end_date}, фильтр филиала: {location_id}")
+
+    # --- ОПРЕДЕЛЕНИЕ ДОСТУПНЫХ ФИЛИАЛОВ (аналогично Сводному отчету) ---
+    accessible_location_ids = []
+    if current_employee.role.name == 'Владелец':
+        if location_id is not None:
+             location = db.query(Location).filter(Location.id == location_id, Location.company_id == company_id).first()
+             if not location: raise HTTPException(status_code=404, detail="Филиал не найден.")
+             accessible_location_ids = [location_id]
+             print(f"[Buyout Report] Владелец фильтрует по филиалу ID={location_id}")
+        else:
+             accessible_location_ids = [loc.id for loc in db.query(Location.id).filter(Location.company_id == company_id).all()]
+             print(f"[Buyout Report] Владелец просматривает отчет по ВСЕМ филиалам.")
+    else: # Обычный сотрудник
+        if current_employee.location_id is None: raise HTTPException(status_code=400, detail="Профиль не привязан к филиалу.")
+        accessible_location_ids = [current_employee.location_id]
+        print(f"[Buyout Report] Сотрудник просматривает отчет по своему филиалу ID={current_employee.location_id}")
+
+    if not accessible_location_ids:
+         print("[Buyout Report] Не найдено доступных филиалов.")
+         return {"status": "ok", "report": {"items": [], "total_profit": 0}} # Возвращаем пустой отчет
+    # --- КОНЕЦ ОПРЕДЕЛЕНИЯ ФИЛИАЛОВ ---
+
+    # --- Даты (аналогично Сводному отчету) ---
+    start_datetime = datetime.combine(start_date, time.min)
+    end_datetime = datetime.combine(end_date, time.max)
+
+    # --- ЗАПРОС К БД ---
+    # Выбираем заказы типа "Выкуп", созданные в указанный период И относящиеся к доступным филиалам
+    buyout_orders_query = db.query(Order).options(joinedload(Order.client)).filter(
+        Order.company_id == company_id,
+        Order.location_id.in_(accessible_location_ids), # Фильтр по филиалам
+        Order.purchase_type == "Выкуп",
+        Order.created_at >= start_datetime, # Используем дату СОЗДАНИЯ заказа для выкупа
+        Order.created_at <= end_datetime
+    ).order_by(Order.created_at.desc()) # Сортируем по дате создания
+
+    buyout_orders = buyout_orders_query.all()
+    print(f"[Buyout Report] Найдено заказов на выкуп: {len(buyout_orders)}")
+
+    # --- РАСЧЕТ ДАННЫХ ОТЧЕТА ---
+    report_items = []
+    total_profit = 0
+    for order in buyout_orders:
+        price_for_client = 0
+        actual_cost = 0
+        profit = 0
+
+        # Рассчитываем цену для клиента (если есть данные)
+        if order.buyout_item_cost_cny and order.buyout_rate_for_client:
+            # Считаем комиссию (используем % из заказа или 10% по умолчанию)
+            commission_percent = order.buyout_commission_percent if order.buyout_commission_percent is not None else 10.0
+            commission_amount = order.buyout_item_cost_cny * (commission_percent / 100.0)
+            # Итоговая цена = (Стоимость товара + Комиссия) * Курс для клиента
+            price_for_client = (order.buyout_item_cost_cny + commission_amount) * order.buyout_rate_for_client
+
+        # Рассчитываем себестоимость (если есть реальный курс)
+        if order.buyout_item_cost_cny and order.buyout_actual_rate:
+            actual_cost = order.buyout_item_cost_cny * order.buyout_actual_rate
+
+        # Рассчитываем прибыль (только если обе суммы посчитаны)
+        if price_for_client > 0 and actual_cost > 0:
+            profit = price_for_client - actual_cost
+
+        total_profit += profit # Добавляем к общей прибыли
+
+        # Добавляем данные по заказу в список
+        report_items.append({
+            "order_id": order.id,
+            "track_code": order.track_code,
+            "created_at": order.created_at.isoformat(), # В строку для JSON
+            "client_name": order.client.full_name if order.client else "?",
+            "item_cost_cny": order.buyout_item_cost_cny,
+            "commission_percent": order.buyout_commission_percent, # Добавили %
+            "rate_for_client": order.buyout_rate_for_client,
+            "price_for_client": price_for_client, # Рассчитанная цена
+            "actual_rate": order.buyout_actual_rate, # Реальный курс
+            "actual_cost": actual_cost, # Рассчитанная себестоимость
+            "profit": profit # Рассчитанная прибыль
+        })
+    # --- КОНЕЦ РАСЧЕТА ---
+
+    # Возвращаем результат
+    return {
+        "status": "ok",
+        "report": {
+            "items": report_items,
+            "total_profit": total_profit
+        }
+    }
+
+# --- ДОБАВИТЬ ЭТОТ НОВЫЙ ЭНДПОИНТ ---
+@app.post("/api/orders/calculate", tags=["Заказы (Владелец)"])
+async def calculate_orders( # Добавляем async для уведомлений
+    payload: CalculatePayload,
+    employee: Employee = Depends(get_current_active_employee), # Используем общую зависимость
+    db: Session = Depends(get_db)
+):
+    """
+    Рассчитывает стоимость для выбранных заказов и сохраняет расчетные данные.
+    Может опционально изменить статус заказов.
+    Доступно сотрудникам с правом 'manage_orders'.
+    """
+    if employee.company_id is None:
+        raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
+
+    # Проверка прав (например, 'manage_orders' или 'issue_orders'?)
+    # Давайте пока разрешим тем, кто может управлять заказами
+    perms = {p.codename for p in employee.role.permissions}
+    if 'manage_orders' not in perms:
+        raise HTTPException(status_code=403, detail="У вас нет прав на расчет стоимости заказов.")
+
+    order_ids = [item.order_id for item in payload.orders]
+    if not order_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны заказы для расчета.")
+
+    # Проверка нового статуса (если передан)
+    if payload.new_status and payload.new_status not in ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Недопустимый новый статус: {payload.new_status}")
+
+    # 1. Находим заказы в базе, проверяем принадлежность к компании и статус
+    orders_to_update_query = db.query(Order).options(joinedload(Order.client)).filter(
+        Order.id.in_(order_ids),
+        Order.company_id == employee.company_id
+    )
+    orders_to_update = orders_to_update_query.all()
+
+    # Проверка, все ли заказы найдены
+    found_ids = {o.id for o in orders_to_update}
+    missing_ids = [oid for oid in order_ids if oid not in found_ids]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"Заказы с ID {missing_ids} не найдены в вашей компании.")
+
+    # Проверка, что заказы не выданы
+    issued_orders = [o.track_code for o in orders_to_update if o.status == "Выдан"]
+    if issued_orders:
+        raise HTTPException(status_code=400, detail=f"Нельзя пересчитать уже выданные заказы: {issued_orders}")
+
+    # 2. Обновляем расчетные данные и статус для каждого заказа
+    updated_count = 0
+    notifications_to_send = {} # Словарь для группировки уведомлений по клиентам
+    try:
+        for order in orders_to_update:
+            item_data = next((item for item in payload.orders if item.order_id == order.id), None)
+            if item_data: # Должен всегда находиться
+                original_status = order.status # Запоминаем старый статус
+
+                # Обновляем расчетные поля
+                order.calculated_weight_kg = item_data.weight_kg
+                order.calculated_price_per_kg_usd = payload.price_per_kg_usd
+                order.calculated_exchange_rate_usd = payload.exchange_rate_usd
+                order.calculated_final_cost_som = (
+                    item_data.weight_kg * payload.price_per_kg_usd * payload.exchange_rate_usd
+                )
+
+                # Обновляем статус, если он передан и отличается от текущего
+                if payload.new_status and payload.new_status != original_status:
+                    order.status = payload.new_status
+                    # Готовим данные для уведомления
+                    if order.client and order.client.telegram_chat_id:
+                        client_id = order.client.id
+                        if client_id not in notifications_to_send:
+                            notifications_to_send[client_id] = {"client": order.client, "track_codes": []}
+                        notifications_to_send[client_id]["track_codes"].append(order.track_code)
+
+                updated_count += 1
+
+        db.commit() # Сохраняем все изменения
+        print(f"[Calculate Orders] Расчет сохранен для {updated_count} заказов. Новый статус: {payload.new_status or 'не изменен'}")
+
+
+        return {"status": "ok", "message": f"Расчет сохранен для {updated_count} заказов." + (f" Статус обновлен на '{payload.new_status}'." if payload.new_status else "")}
+
+    except Exception as e:
+        db.rollback()
+        import traceback
+        print(f"!!! Ошибка БД при сохранении расчета заказов:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при сохранении расчета: {e}")
+
+# --- НОВЫЕ Модели для идентификации пользователя Ботом ---
+class BotIdentifyPayload(BaseModel):
+    company_id: int
+    telegram_chat_id: str # ID чата пользователя в Telegram
+    phone_number: Optional[str] = None # Номер телефона (если пользователь отправил контакт)
+
+# --- ИЗМЕНИТЬ ClientBotInfo ---
+class ClientBotInfo(ClientOut): # Наследуется от ClientOut
+    pass # Дополнительных полей нет
+    # ДОБАВИТЬ Config (для надежности, хотя должно наследоваться)
+    class Config:
+        from_attributes = True # <--- ДОБАВЛЕНО
+# --- КОНЕЦ ИЗМЕНЕНИЙ ClientBotInfo ---
+
+class BotIdentifyResponse(BaseModel):
+    client: ClientBotInfo
+    is_owner: bool
+    # ДОБАВИТЬ Config и сюда, так как она содержит вложенную модель с from_attributes
+    class Config:
+        from_attributes = True
+
+# --- НОВЫЙ ЭНДПОИНТ для Идентификации Пользователя Ботом ---
+@app.post("/api/bot/identify_user", tags=["Telegram Bot"], response_model=BotIdentifyResponse)
+def identify_bot_user(
+    payload: BotIdentifyPayload,
+    db: Session = Depends(get_db)
+):
+    """
+    Ищет клиента по Telegram Chat ID или номеру телефона для указанной компании.
+    Если найден по номеру, привязывает Chat ID.
+    Возвращает данные клиента и флаг, является ли он Владельцем.
+    Вызывается Telegram-ботом.
+    """
+    client = None
+    is_owner = False
+    print(f"[Bot Identify] Поиск пользователя для Company ID: {payload.company_id}, Chat ID: {payload.telegram_chat_id}, Phone: {payload.phone_number}")
+
+    # --- Шаг 1: Проверка компании ---
+    company = db.query(Company).filter(Company.id == payload.company_id).first()
+    if not company:
+        print(f"!!! [Bot Identify] Ошибка: Компания ID {payload.company_id} не найдена.")
+        raise HTTPException(status_code=404, detail=f"Компания с ID {payload.company_id} не найдена.")
+
+    # --- Шаг 2: Поиск по Telegram Chat ID ---
+    if payload.telegram_chat_id:
+        client = db.query(Client).filter(
+            Client.telegram_chat_id == payload.telegram_chat_id,
+            Client.company_id == payload.company_id
+        ).first()
+        if client:
+             print(f"[Bot Identify] Клиент найден по Chat ID: {client.id} - {client.full_name}")
+
+    # --- Шаг 3: Поиск по номеру телефона (если не найден по Chat ID и номер передан) ---
+    if not client and payload.phone_number:
+        cleaned_phone = re.sub(r'\D', '', str(payload.phone_number))
+        print(f"[Bot Identify] Поиск по номеру телефона: {cleaned_phone}")
+        client = db.query(Client).filter(
+            Client.phone == cleaned_phone,
+            Client.company_id == payload.company_id
+        ).first()
+
+        if client:
+            print(f"[Bot Identify] Клиент найден по номеру телефона: {client.id} - {client.full_name}")
+            # --- Привязка Chat ID, если его еще нет или он другой ---
+            if client.telegram_chat_id != payload.telegram_chat_id:
+                existing_client_with_chat_id = db.query(Client).filter(
+                    Client.telegram_chat_id == payload.telegram_chat_id,
+                    Client.company_id == payload.company_id
+                ).first()
+                if existing_client_with_chat_id:
+                     print(f"!!! [Bot Identify] Ошибка: Chat ID {payload.telegram_chat_id} уже привязан к другому клиенту (ID: {existing_client_with_chat_id.id}) в этой компании.")
+                     raise HTTPException(status_code=409, detail="Этот Telegram аккаунт уже привязан к другому клиенту.")
+                else:
+                    print(f"[Bot Identify] Привязка Chat ID {payload.telegram_chat_id} к клиенту ID {client.id}")
+                    client.telegram_chat_id = payload.telegram_chat_id
+                    try:
+                        db.commit()
+                        db.refresh(client)
+                    except Exception as e_commit:
+                         db.rollback()
+                         print(f"!!! [Bot Identify] Ошибка при сохранении Chat ID: {e_commit}")
+                         raise HTTPException(status_code=500, detail="Ошибка базы данных при привязке Telegram.")
+            # --- Конец привязки Chat ID ---
+        else:
+             print(f"[Bot Identify] Клиент с телефоном {cleaned_phone} не найден в компании {payload.company_id}.")
+
+    # --- Шаг 4: Проверка, является ли найденный клиент Владельцем ---
+    if client:
+        # Ищем сотрудника-владельца В ЭТОЙ компании с таким же ПОЛНЫМ ИМЕНЕМ
+        owner_employee = db.query(Employee).join(Role).filter(
+            Employee.company_id == payload.company_id,
+            # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+            Employee.full_name == client.full_name, # Сравниваем по полному имени
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+            Role.name == "Владелец"
+        ).first()
+        if owner_employee:
+            is_owner = True
+            print(f"[Bot Identify] Найденный клиент (ID: {client.id}) является Владельцем (найден сотрудник с тем же именем).")
+        else:
+             print(f"[Bot Identify] Найденный клиент (ID: {client.id}) НЕ является Владельцем.")
+
+    # --- Шаг 5: Возвращаем результат или 404 ---
+    if client:
+        try:
+            # Используем ClientBotInfo (наследуется от ClientOut) для формирования ответа
+            client_response_data = ClientBotInfo.from_orm(client)
+            return BotIdentifyResponse(client=client_response_data, is_owner=is_owner)
+        except Exception as pydantic_error:
+            # Ловим возможные ошибки при преобразовании в Pydantic модель
+            import traceback
+            print(f"!!! [Bot Identify] Ошибка Pydantic при формировании ответа для клиента ID {client.id}:\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера при обработке данных клиента: {pydantic_error}")
+    else:
+        # Если клиент не найден ни по Chat ID, ни по телефону
+        raise HTTPException(status_code=404, detail="Клиент не найден. Пожалуйста, проверьте номер или зарегистрируйтесь.")
+
+# --- КОНЕЦ ИСПРАВЛЕННОЙ ФУНКЦИИ ---
+
+# main.py (ДОБАВИТЬ ЛОГИРОВАНИЕ в get_client_by_id)
+
+@app.get("/api/clients/{client_id}", tags=["Клиенты (Владелец)", "Telegram Bot"], response_model=ClientOut)
+def get_client_by_id(
+    client_id: int,
+    company_id: int = Query(...), # Требуем company_id
+    db: Session = Depends(get_db)
+):
+    """Получает данные одного клиента по ID для указанной компании."""
+    # --- ДОБАВИТЬ ЛОГ ---
+    print(f"--- [Get Client By ID] Запрос клиента ID={client_id} для компании ID={company_id} ---")
+    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+    client = db.query(Client).filter(
+        Client.id == client_id,
+        Client.company_id == company_id
+    ).first()
+    if not client:
+        # --- ДОБАВИТЬ ЛОГ ---
+        print(f"!!! [Get Client By ID] Клиент ID={client_id} НЕ НАЙДЕН в компании ID={company_id}.")
+        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+        raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
+    # --- ДОБАВИТЬ ЛОГ ---
+    print(f"--- [Get Client By ID] Клиент ID={client_id} найден: {client.full_name} ---")
+    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+    return client
+
+# main.py (ДОБАВИТЬ этот эндпоинт)
+
+# --- НОВЫЙ ЭНДПОИНТ для получения настроек компании (для бота и ЛК) ---
+# Модель для ответа
+class SettingOut(BaseModel):
+    key: str
+    value: Optional[str]
+
+@app.get("/api/settings", tags=["Настройки", "Telegram Bot"], response_model=List[SettingOut])
+def get_company_settings(
+    company_id: int = Query(...), # Обязательный ID компании
+    keys: Optional[List[str]] = Query(None), # Необязательный список ключей для фильтрации
+    db: Session = Depends(get_db)
+    # Здесь не нужна аутентификация сотрудника, т.к. вызывается ботом/ЛК
+):
+    """
+    Возвращает настройки для указанной компании.
+    Можно фильтровать по списку ключей (параметр 'keys').
+    """
+    print(f"[Get Settings] Запрос настроек для Company ID: {company_id}. Ключи: {keys}")
+    # Проверяем, существует ли компания
+    company = db.query(Company.id).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
+
+    # Запрашиваем настройки для этой компании
+    query = db.query(Setting).filter(Setting.company_id == company_id)
+
+    # Если передан список ключей, фильтруем по ним
+    if keys:
+        query = query.filter(Setting.key.in_(keys))
+
+    settings = query.all()
+    print(f"[Get Settings] Найдено настроек: {len(settings)}")
+
+    # Преобразуем результат в нужный формат (можно использовать Pydantic напрямую)
+    # FastAPI сделает это сам благодаря response_model=List[SettingOut]
+    return settings
+
+# --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
+
+# main.py (ДОБАВИТЬ ЭТОТ ЭНДПОИНТ)
+@app.patch("/api/settings", tags=["Настройки"])
+def update_company_settings(
+    payload: List[SettingUpdate], # Принимаем список настроек для обновления
+    employee: Employee = Depends(get_company_owner), # Только Владелец может менять
+    db: Session = Depends(get_db)
+):
+    """Обновляет одну или несколько настроек для компании Владельца."""
+    updated_count = 0
+    errors = []
+    company_id = employee.company_id
+    print(f"[Update Settings] Владелец ID={employee.id} обновляет настройки для компании ID={company_id}")
+
+    # Получаем текущие настройки компании из БД для сравнения
+    current_settings = {s.key: s for s in db.query(Setting).filter(Setting.company_id == company_id).all()}
+
+    for item in payload:
+        key_to_update = item.key
+        new_value = item.value # Может быть None или ""
+
+        # Ищем существующую настройку по ключу
+        setting_obj = current_settings.get(key_to_update)
+
+        if setting_obj:
+            # Если настройка существует, обновляем ее значение, если оно изменилось
+            if setting_obj.value != new_value:
+                print(f"  - Обновление ключа '{key_to_update}': '{setting_obj.value}' -> '{new_value}'")
+                setting_obj.value = new_value
+                updated_count += 1
+            else:
+                 print(f"  - Ключ '{key_to_update}': Значение не изменилось.")
+        else:
+            # Если настройки с таким ключом нет, СОЗДАЕМ ее
+            print(f"  - Создание нового ключа '{key_to_update}' со значением '{new_value}'")
+            new_setting = Setting(key=key_to_update, value=new_value, company_id=company_id)
+            db.add(new_setting)
+            updated_count += 1 # Считаем создание как обновление
+
+    # Сохраняем все изменения в БД
+    if updated_count > 0:
+        try:
+            db.commit()
+            print(f"[Update Settings] Успешно обновлено/создано {updated_count} настроек.")
+            return {"status": "ok", "message": f"Настройки ({updated_count} шт.) успешно сохранены."}
+        except Exception as e:
+            db.rollback()
+            import traceback
+            print(f"!!! [Update Settings] Ошибка при сохранении настроек:\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Ошибка базы данных при сохранении настроек: {e}")
+    else:
+        print("[Update Settings] Нет изменений для сохранения.")
+        return {"status": "ok", "message": "Нет изменений для сохранения."}
+
+
+# main.py (ДОБАВИТЬ ЭТОТ НОВЫЙ ЭНДПОИНТ)
+
+@app.get("/api/bot/locations", tags=["Telegram Bot"], response_model=List[LocationOut])
+def get_locations_for_bot(
+    company_id: int = Query(...), # Обязательный ID компании от бота
+    db: Session = Depends(get_db)
+    # Нет аутентификации сотрудника
+):
+    """Возвращает список филиалов для указанной компании (для бота)."""
+    # Проверяем, существует ли компания
+    company = db.query(Company.id).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
+
+    locations = db.query(Location).filter(Location.company_id == company_id).order_by(Location.name).all()
+    print(f"INFO: [Bot Locations] Запрос филиалов для компании ID {company_id}. Найдено: {len(locations)}")
+    return locations
+
+# --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
 
 # --- 7. УТИЛИТЫ ---
 
