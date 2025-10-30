@@ -20,6 +20,10 @@
 }
     .loader-spinner { border: 8px solid #f3f3f3; border-top: 8px solid #4f46e5; border-radius: 50%; width: 60px; height: 60px; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    #calculate-modal .modal-content {
+        width: 42rem; /* Задаем ширину (max-w-2xl) */
+        min-height: 550px; /* Задаем минимальную высоту, чтобы список помещался */
+    }
 </style>
 </head>
 <body class="bg-gray-100">
@@ -150,6 +154,76 @@
         </div>
 </div>
 
+<div id="calculate-modal" class="modal">
+        <div class="modal-content relative bg-white p-6 rounded-lg shadow-lg max-w-2xl w-full">
+            <div class="flex justify-between items-start mb-4">
+                <h3 class="text-2xl font-bold">Предварительный расчет</h3>
+                <button onclick="closeModal('calculate-modal')" class="text-2xl font-bold">&times;</button>
+            </div>
+
+            <div id="calc-step-1-search" class="space-y-4">
+                 <label class="block text-sm font-medium">Найдите клиента</label>
+                <div class="relative">
+                    <input type="text" id="calc-client-search-input" autocomplete="off" placeholder="Введите имя, код или телефон..." class="w-full p-2 border rounded">
+                    <div id="calc-client-search-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-lg z-30 max-h-48 overflow-y-auto"></div>
+                </div>
+                <p id="calc-selected-client-info" class="hidden text-center font-semibold p-2 bg-gray-100 rounded"></p>
+                <input type="hidden" id="calc-selected-client-id">
+            </div>
+
+            <div id="calc-step-2-orders" class="hidden space-y-4 mt-4 border-t pt-4">
+                <label class="block text-sm font-medium">Выберите заказы для расчета:</label>
+                <div id="calc-orders-list" class="max-h-60 overflow-y-auto space-y-2 border p-2 rounded">
+                    <p class="text-gray-500">Сначала выберите клиента.</p>
+                </div>
+                 <div class="flex items-center">
+                    <input type="checkbox" id="calc-select-all-orders" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                    <label for="calc-select-all-orders" class="ml-2 text-sm">Выбрать все</label>
+                </div>
+            </div>
+
+            <div id="calc-step-3-calculation" class="hidden mt-4 border-t pt-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="space-y-4">
+                     <div class="p-3 bg-blue-50 rounded-lg">
+                        <label class="block text-sm font-medium">Общий вес (кг)</label>
+                        <input type="number" step="any" id="calc-total-weight-input" placeholder="Для авто-распределения" class="mt-1 w-full p-2 border rounded-md">
+                    </div>
+                    <div id="calc-individual-weights" class="max-h-40 overflow-y-auto pr-2 space-y-2">
+                        </div>
+                </div>
+                 <div class="space-y-4">
+                     <div class="p-3 bg-gray-100 rounded-lg space-y-2">
+                        <div>
+                            <label class="block text-sm">Цена за кг ($) *</label>
+                            <input type="number" step="0.1" id="calc-price-per-kg" value="" class="w-full p-2 border rounded" required>
+                        </div>
+                        <div>
+                            <label class="block text-sm">Курс USD (сом) *</label>
+                            <input type="number" step="0.1" id="calc-exchange-rate" value="" class="w-full p-2 border rounded" required>
+                        </div>
+                    </div>
+                     <div class="p-4 bg-indigo-50 rounded-lg text-right">
+                        <div class="text-lg">Итого к оплате: <span id="calc-total-cost-display" class="font-bold">0.00 сом</span></div>
+                     </div>
+                </div>
+            </div>
+
+            <div id="calc-step-4-actions" class="hidden mt-6 flex justify-between items-center border-t pt-4">
+                 <div class="flex items-center gap-2">
+                     <label for="calc-new-status-select" class="text-sm">Изменить статус на:</label>
+                     <select id="calc-new-status-select" class="p-2 border rounded bg-white text-sm">
+                         <option value="">-- Не менять --</option>
+                         </select>
+                 </div>
+                 <div class="flex gap-4">
+                    <button type="button" onclick="closeModal('calculate-modal')" class="bg-gray-300 hover:bg-gray-400 text-black font-bold py-2 px-6 rounded-lg">Отмена</button>
+                    <button type="button" id="save-calculation-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg">Сохранить</button>
+                 </div>
+             </div>
+
+        </div>
+    </div>
+
 <script>
 // =================================================================
 // МОДУЛЬ: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И НАСТРОЙКИ (v4.1 - Rebuild)
@@ -243,60 +317,83 @@ async function handleApiError(response) {
     }
 }
 
-// Общая функция для выполнения запросов к API
+// --- Общая функция для выполнения запросов к API (ИСПРАВЛЕНА для GET params) ---
 async function apiFetch(endpoint, options = {}) {
     // Проверка авторизации перед каждым запросом
     if (!currentUser || !currentUser.id) {
          console.error(`[API] Попытка вызова API (${endpoint}) без авторизации! Перезагрузка...`);
          alert("Ошибка авторизации. Пожалуйста, войдите снова.");
-         location.reload(); // Перезагружаем страницу
-         // Выбрасываем ошибку, чтобы прервать выполнение текущей операции
+         location.reload();
          throw new Error("Пользователь не авторизован");
     }
 
-    // Установка заголовков по умолчанию (Content-Type и кастомный X-Employee-ID)
+    // Установка заголовков по умолчанию
     options.headers = {
-        'Content-Type': 'application/json', // Ожидаем JSON по умолчанию
-        'X-Employee-ID': currentUser.id, // Идентификатор сотрудника для бэкенда
-        ...options.headers // Позволяем переопределить заголовки при вызове функции
+        'Content-Type': 'application/json',
+        'X-Employee-ID': currentUser.id, // Идентификатор сотрудника
+        ...options.headers
     };
 
-    // Логируем исходящий запрос для отладки
-    console.log(`[API] Request: ${options.method || 'GET'} ${endpoint}`);
-    // Можно добавить логирование тела запроса (если оно есть и не слишком большое)
-    // if (options.body) console.log(`[API] Request Body:`, options.body);
+    // --- ДОБАВЛЕНО: Обработка параметров для GET запросов ---
+    let url = `${API_URL}${endpoint}`;
+    const method = options.method?.toUpperCase() || 'GET'; // Определяем метод
+
+    // Если это GET запрос и есть параметры в options.params
+    if (method === 'GET' && options.params) {
+        // Создаем объект URLSearchParams из options.params
+        const searchParams = new URLSearchParams();
+        // Проходим по ключам объекта params
+        for (const key in options.params) {
+            const value = options.params[key];
+            // Если значение - массив (например, 'keys' или 'statuses'), добавляем каждый элемент отдельно
+            if (Array.isArray(value)) {
+                value.forEach(item => searchParams.append(key, item));
+            } else if (value !== undefined && value !== null) { // Добавляем только непустые значения
+                searchParams.append(key, value);
+            }
+        }
+        // Добавляем параметры к URL, если они есть
+        const queryString = searchParams.toString();
+        if (queryString) {
+            url += `?${queryString}`;
+        }
+        // Удаляем params из options, чтобы они не мешали fetch
+        delete options.params;
+    }
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+    // Логируем исходящий запрос (теперь с правильным URL для GET)
+    console.log(`[API] Request: ${method} ${url}`);
+    // if (options.body) console.log(`[API] Request Body:`, options.body); // Можно раскомментировать для отладки
 
     try {
-        // Выполняем запрос к API
-        const response = await fetch(`${API_URL}${endpoint}`, options);
+        // Выполняем запрос к API (используем обновленный url)
+        const response = await fetch(url, options); // <--- Используем url
 
         // Логируем статус ответа
-        console.log(`[API] Response: ${response.status} ${response.statusText} for ${options.method || 'GET'} ${endpoint}`);
+        console.log(`[API] Response: ${response.status} ${response.statusText} for ${method} ${url}`);
 
-        // Проверяем статус ответа: если не OK (не 2xx), выбрасываем ошибку
+        // Проверяем статус ответа
         if (!response.ok) {
-            const errorDetails = await handleApiError(response); // Пытаемся получить детальное сообщение
+            const errorDetails = await handleApiError(response);
             console.error(`[API] Error Response Body for ${endpoint}:`, errorDetails);
-            // Выбрасываем ошибку с сообщением от сервера
-            throw new Error(errorDetails);
+            throw new Error(errorDetails); // Выбрасываем ошибку
         }
 
-        // Обработка успешного ответа 204 No Content (тела нет)
+        // Обработка 204 No Content
         if (response.status === 204) {
             console.log(`[API] Received 204 No Content for ${endpoint}`);
-            return null; // Возвращаем null
+            return null;
         }
 
-        // Пытаемся распарсить успешный ответ как JSON
+        // Парсим успешный ответ как JSON
         const data = await response.json();
         // console.log(`[API] Success Response Data for ${endpoint}:`, data); // Раскомментировать для детальной отладки
-        return data; // Возвращаем полученные данные
+        return data; // Возвращаем данные
 
-    } catch (error) {
-         // Ловим ошибки сети (например, сервер недоступен) или ошибки парсинга JSON
-         console.error(`[API] Network or Parsing Error for ${endpoint}:`, error);
-         // Пробрасываем ошибку дальше, чтобы ее можно было поймать и обработать в вызывающей функции
-         // (Например, показать пользователю сообщение "Ошибка сети")
+    } catch (error) { // Ловим ошибки сети, парсинга JSON или выброшенные ошибки API
+         console.error(`[API] Network or Processing Error for ${endpoint}:`, error);
+         // Пробрасываем ошибку дальше
          throw error;
     }
 }
@@ -551,6 +648,13 @@ async function initializeMainAppUI() {
                 tabsHtml += '<button data-tab="reports" class="tab-btn">Отчеты</button>'; 
                 contentHtml += '<div id="tab-reports" class="tab-pane"></div>'; 
             }
+            // --- ДОБАВИТЬ ВКЛАДКУ НАСТРОЕК (для Владельца) ---
+            // TODO: Добавить право 'manage_settings' в ALL_PERMISSIONS и выдать его роли Владельца
+            if (currentUser.role === 'Владелец') { // Пока просто проверяем роль Владельца
+                tabsHtml += '<button data-tab="settings" class="tab-btn">Настройки</button>';
+                contentHtml += '<div id="tab-settings" class="tab-pane"></div>';
+            }
+            // --- КОНЕЦ ДОБАВЛЕНИЯ ---
         }
         
         tabsContainer.innerHTML = tabsHtml.replaceAll('class="tab-btn"', 'class="tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"'); 
@@ -569,7 +673,8 @@ async function initializeMainAppUI() {
         if (document.getElementById('tab-issue')) renderPromises.push(renderIssueTab());
         if (document.getElementById('tab-expense-types')) renderPromises.push(renderExpenseTypesTab());
         if (document.getElementById('tab-expenses')) renderPromises.push(renderExpensesTab());
-        if (document.getElementById('tab-reports')) renderPromises.push(renderReportsTab()); 
+        if (document.getElementById('tab-reports')) renderPromises.push(renderReportsTab());
+        if (document.getElementById('tab-settings')) renderPromises.push(renderSettingsTab()); 
         
         await Promise.all(renderPromises); 
         console.log("[UI] Функции рендеринга вкладок завершены.");
@@ -1437,16 +1542,16 @@ async function fetchAndRenderCompanies() {
 // --- Открытие модального окна Компании (для создания или редактирования) ---
 function openCompanyModal(company = null) {
     console.log("[Modal] openCompanyModal: Start", company);
+    // Находим модальное окно и контейнер контента
     const modal = document.getElementById('company-modal');
     if (!modal) return console.error("!!! openCompanyModal: Modal element #company-modal not found!");
-
     const modalContent = modal.querySelector('.modal-content');
     if (!modalContent) return console.error("!!! openCompanyModal: Modal content not found!");
 
-    const isEdit = company !== null; // Определяем, редактирование это или создание
+    // Определяем, режим редактирования (true) или создания (false)
+    const isEdit = company !== null;
 
     // Генерируем HTML для содержимого модального окна
-    // Используем префикс 'modal-' для ID всех полей формы
     modalContent.innerHTML = `
         <div class="flex justify-between items-start mb-4">
             <h3 class="text-2xl font-bold">${isEdit ? 'Редактировать Компанию' : 'Создать Новую Компанию'}</h3>
@@ -1464,14 +1569,13 @@ function openCompanyModal(company = null) {
                     <label for="modal-company-code" class="block text-sm font-medium text-gray-700">Код Компании (A-Z, 0-9, _) *</label>
                     <input type="text" id="modal-company-code" class="mt-1 w-full p-2 border rounded uppercase font-mono" required
                            value="${isEdit ? company.company_code : ''}"
-                           ${isEdit ? 'disabled title="Код нельзя изменить после создания"' : 'placeholder="Напр. VISH, CARGO_KG"'}
-                           maxlength="15" pattern="^[A-Z0-9_]{3,15}$">
-                     <p class="text-xs text-gray-500 mt-1">3-15 знаков. Нельзя изменить после создания.</p>
+                           ${isEdit ? 'readonly title="Код нельзя изменить после создания"' : 'placeholder="Напр. VISH, CARGO_KG"'} maxlength="15">
+                     <p class="text-xs text-gray-500 mt-1">3-15 знаков. Нельзя изменить.</p>
                 </div>
             </div>
             <div>
                 <label for="modal-company-subscription" class="block text-sm font-medium text-gray-700">Дата окончания подписки *</label>
-                <input type="date" id="modal-company-subscription" class="mt-1 w-full p-2 border rounded" required value="${isEdit && company.subscription_paid_until ? company.subscription_paid_until : ''}">
+                <input type="date" id="modal-company-subscription" class="mt-1 w-full p-2 border rounded" required value="${isEdit && company.subscription_paid_until ? company.subscription_paid_until.split('T')[0] : ''}">
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -1484,23 +1588,36 @@ function openCompanyModal(company = null) {
                 </div>
             </div>
 
+            <div class="border-t pt-4 space-y-4">
+                <h4 class="text-lg font-semibold text-gray-700">Настройки Telegram Бота</h4>
+                <div>
+                     <label for="modal-company-bot-token" class="block text-sm font-medium text-gray-700">Токен Telegram Бота</label>
+                     <input type="text" id="modal-company-bot-token" class="mt-1 w-full p-2 border rounded font-mono text-xs" value="${isEdit ? (company.telegram_bot_token || '') : ''}" placeholder="Например: 1234567890:ABC...">
+                     <p class="text-xs text-gray-500 mt-1">Получите у @BotFather в Telegram. Оставьте пустым, если бот не используется.</p>
+                </div>
+                <div>
+                     <label for="modal-company-bot-username" class="block text-sm font-medium text-gray-700">Имя пользователя Бота (Username)</label>
+                     <input type="text" id="modal-company-bot-username" class="mt-1 w-full p-2 border rounded" value="${isEdit ? (company.telegram_bot_username || '') : ''}" placeholder="Например: @MyCargoCompanyBot">
+                     <p class="text-xs text-gray-500 mt-1">Опционально. Начинается с @.</p>
+                </div>
+            </div>
             <div id="modal-company-owner-fields" class="border-t pt-4 space-y-4 ${isEdit ? 'hidden' : 'block'}">
-                <h4 class="text-lg font-semibold">Данные Владельца Компании</h4>
-                <div>
-                     <label for="modal-company-owner-name" class="block text-sm font-medium text-gray-700">ФИО Владельца *</label>
-                     <input type="text" id="modal-company-owner-name" class="mt-1 w-full p-2 border rounded" ${!isEdit ? 'required' : ''}>
-                </div>
-                <div>
-                     <label for="modal-company-owner-password" class="block text-sm font-medium text-gray-700">Пароль Владельца *</label>
-                     <input type="text" id="modal-company-owner-password" class="mt-1 w-full p-2 border rounded" ${!isEdit ? 'required' : ''}>
-                </div>
+                 <h4 class="text-lg font-semibold">Данные Владельца Компании</h4>
+                 <div>
+                      <label for="modal-company-owner-name" class="block text-sm font-medium text-gray-700">ФИО Владельца *</label>
+                      <input type="text" id="modal-company-owner-name" class="mt-1 w-full p-2 border rounded" ${!isEdit ? 'required' : ''}>
+                 </div>
+                 <div>
+                      <label for="modal-company-owner-password" class="block text-sm font-medium text-gray-700">Пароль Владельца *</label>
+                      <input type="text" id="modal-company-owner-password" class="mt-1 w-full p-2 border rounded" ${!isEdit ? 'required' : ''}>
+                 </div>
             </div>
 
             <div id="modal-company-status-field" class="border-t pt-4 ${isEdit ? 'block' : 'hidden'}">
-                 <label class="flex items-center">
-                     <input type="checkbox" id="modal-company-is-active" class="h-4 w-4 rounded" ${isEdit && company.is_active ? 'checked' : ''}>
-                     <span class="ml-2 text-sm font-medium text-gray-700">Компания Активна (Разрешен вход)</span>
-                 </label>
+                  <label class="flex items-center">
+                      <input type="checkbox" id="modal-company-is-active" class="h-4 w-4 rounded" ${isEdit && company.is_active ? 'checked' : ''}>
+                      <span class="ml-2 text-sm font-medium text-gray-700">Компания Активна (Разрешен вход)</span>
+                  </label>
             </div>
 
             <div class="flex gap-4 mt-6 border-t pt-4">
@@ -1510,28 +1627,30 @@ function openCompanyModal(company = null) {
         </form>
     `;
 
-    // Устанавливаем дату подписки по умолчанию (+30 дней) для НОВОЙ компании
+    // Установка даты подписки по умолчанию (+30 дней) для НОВОЙ компании
     if (!isEdit) {
          const subInput = document.getElementById('modal-company-subscription');
          if (subInput && !subInput.value) {
               const today = new Date();
               today.setDate(today.getDate() + 30);
+              // Форматируем дату в YYYY-MM-DD для input type="date"
               subInput.value = today.toISOString().split('T')[0];
               console.log("[Modal] Установлена дата подписки по умолчанию:", subInput.value);
          }
     }
 
-    // --- Добавляем слушатель submit к ТОЛЬКО ЧТО созданной форме ---
+    // Привязываем слушатель submit к ТОЛЬКО ЧТО созданной форме
     const formElement = document.getElementById('modal-company-form');
     if (formElement) {
         // Удаляем старые слушатели перед добавлением нового
         formElement.replaceWith(formElement.cloneNode(true));
+        // Добавляем слушатель к новой форме
         document.getElementById('modal-company-form').addEventListener('submit', handleSaveCompany);
         console.log("[Modal Listener OK] Added submit to #modal-company-form");
     } else {
+        // Если форма не найдена после генерации HTML - это ошибка
         console.error("!!! openCompanyModal: Form #modal-company-form NOT FOUND after innerHTML!");
     }
-    // --- Конец добавления слушателя ---
 
     openModal('company-modal'); // Открываем модальное окно
     console.log("[Modal] openCompanyModal: End");
@@ -1571,31 +1690,38 @@ function handleCompanyActions(e) {
 
 // --- Сохранение данных Компании (вызывается из модального окна) ---
 async function handleSaveCompany(e) {
-    e.preventDefault(); // Предотвращаем стандартную отправку
+    e.preventDefault(); // Предотвращаем стандартную отправку формы
     console.log("[Save] handleSaveCompany: Start");
-    showLoader(); // Показываем лоадер
+    showLoader(); // Показываем индикатор загрузки
 
-    // Считываем ID компании (если он есть - значит редактируем)
+    // Считываем ID компании (если он есть - режим редактирования)
     const companyId = document.getElementById('modal-company-id')?.value;
     const isEdit = !!companyId; // true, если ID есть
-    let url = '/superadmin/companies'; // URL для создания
+    // Определяем URL и метод в зависимости от режима
+    let url = '/api/superadmin/companies'; // URL для создания
     let method = 'POST'; // Метод для создания
-    let payload = {}; // Объект для данных, которые отправим на сервер
+    if(isEdit) {
+        url = `/api/superadmin/companies/${companyId}`; // URL для обновления
+        method = 'PATCH'; // Метод для обновления
+    }
+    // Объект для данных, отправляемых на сервер
+    let payload = {};
 
     try {
         // --- Собираем данные из полей модального окна ---
         if (isEdit) {
             // --- РЕДАКТИРОВАНИЕ ---
-            url = `/superadmin/companies/${companyId}`; // Обновляем URL
-            method = 'PATCH'; // Обновляем метод
             payload = {
                 name: document.getElementById('modal-company-name')?.value.trim(),
                 subscription_paid_until: document.getElementById('modal-company-subscription')?.value,
                 contact_person: document.getElementById('modal-company-contact-person')?.value.trim() || null,
                 contact_phone: document.getElementById('modal-company-contact-phone')?.value.trim() || null,
-                is_active: document.getElementById('modal-company-is-active')?.checked
+                is_active: document.getElementById('modal-company-is-active')?.checked,
+                // ДОБАВЛЕНО: Считываем поля бота
+                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null, // Отправляем null, если поле пустое
+                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null // Отправляем null, если поле пустое
             };
-            // Проверка обязательных полей
+            // Проверка обязательных полей при редактировании
             if (!payload.name || !payload.subscription_paid_until) {
                 throw new Error("Название компании и дата окончания подписки обязательны.");
             }
@@ -1608,20 +1734,24 @@ async function handleSaveCompany(e) {
                 contact_person: document.getElementById('modal-company-contact-person')?.value.trim() || null,
                 contact_phone: document.getElementById('modal-company-contact-phone')?.value.trim() || null,
                 owner_full_name: document.getElementById('modal-company-owner-name')?.value.trim(),
-                owner_password: document.getElementById('modal-company-owner-password')?.value // Пароль не тримим
+                owner_password: document.getElementById('modal-company-owner-password')?.value, // Пароль не тримим
+                // ДОБАВЛЕНО: Считываем поля бота
+                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null, // null если пусто
+                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null // null если пусто
             };
-            // Проверка обязательных полей
-            if (!payload.name || !payload.company_code || !payload.subscription_paid_until || !payload.owner_full_name || !payload.owner_password) {
-                 throw new Error("Все поля со звездочкой (*) обязательны при создании компании.");
-            }
-             // Проверка корректности кода компании (дублируем проверку бэкенда)
-            if (!/^[A-Z0-9_]{3,15}$/.test(payload.company_code)) {
-                 throw new Error("Код компании некорректен (3-15 знаков, только латинские буквы A-Z, цифры 0-9 и символ подчеркивания '_').");
-            }
+            // Проверка обязательных полей при создании
+             if (!payload.name || !payload.company_code || !payload.subscription_paid_until || !payload.owner_full_name || !payload.owner_password) {
+                  throw new Error("Все поля со звездочкой (*) обязательны при создании компании.");
+             }
+             // Проверка корректности кода компании
+             if (!/^[A-Z0-9_]{3,15}$/.test(payload.company_code)) {
+                  throw new Error("Код компании некорректен (3-15 знаков, только латинские буквы A-Z, цифры 0-9 и символ подчеркивания '_').");
+             }
         }
 
         // --- Отправляем запрос на сервер ---
         console.log(`[Save] handleSaveCompany: Sending ${method} to ${url}`, payload);
+        // Используем универсальную функцию apiFetch для отправки запроса
         const result = await apiFetch(url, { method: method, body: JSON.stringify(payload) });
         console.log("[Save] handleSaveCompany: Server response", result);
 
@@ -1632,6 +1762,7 @@ async function handleSaveCompany(e) {
 
     } catch(err) { // Обработка ошибок (от валидации или от apiFetch)
         console.error("[Save] handleSaveCompany: Error", err);
+        // Показываем сообщение об ошибке пользователю
         alert(`Ошибка сохранения данных компании: ${err.message}`);
         // Оставляем модальное окно открытым для исправления
     } finally {
@@ -1901,7 +2032,7 @@ async function handleSaveLocation(e) {
     // Считываем ID (для определения режима - создание/редактирование)
     const locationId = document.getElementById('location-id')?.value;
     const isEdit = !!locationId; // true, если ID есть
-    const url = isEdit ? `/locations/${locationId}` : '/locations'; // Определяем URL
+    const url = isEdit ? `/api/locations/${locationId}` : '/api/locations'; // Определяем URL
     const method = isEdit ? 'PATCH' : 'POST'; // Определяем метод
 
     // Собираем данные из полей формы
@@ -3437,6 +3568,7 @@ async function renderOrdersTab() {
                         
                         
                         <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm transition-colors duration-150" title="Экспортировать отфильтрованные заказы в Excel">📥 Экспорт</button>
+                        <button id="orders-calculate-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-blue-600 hover:bg-blue-100 text-sm transition-colors duration-150" title="Открыть окно расчета стоимости для выбранного клиента">🧮 Рассчитать</button>
                     </div>
                     
                     <button id="refresh-orders-btn" title="Обновить список заказов" class="text-2xl text-gray-500 hover:text-indigo-600 transition-colors duration-150">&circlearrowright;</button>
@@ -3492,6 +3624,7 @@ async function renderOrdersTab() {
     replaceAndListen('orders-apply-status-filter', 'click', applyOrdersFiltersAndFetch);
     replaceAndListen('orders-reset-status-filter', 'click', resetOrdersStatusFilter);
     replaceAndListen('orders-export-btn', 'click', handleExportOrders);
+    replaceAndListen('orders-calculate-btn', 'click', openCalculateModal);
     // НОВЫЙ СЛУШАТЕЛЬ ДЛЯ ФИЛЬТРА ФИЛИАЛОВ
     replaceAndListen('orders-location-filter', 'change', fetchAndRenderOrders); 
 
@@ -3526,102 +3659,7 @@ async function renderOrdersTab() {
 }
 
 
-// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ fetchAndRenderOrders)
 
-async function fetchAndRenderOrders(filters = {}) {
-    console.log("[Fetch] fetchAndRenderOrders: Start");
-    const listContainer = document.getElementById('orders-list-container');
-    if (!listContainer) return console.error("!!! fetchAndRenderOrders: listContainer #orders-list-container not found!");
-    listContainer.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка заказов...</p>';
-    showLoader(); 
-
-    // Собираем параметры для запроса из фильтров
-    const params = new URLSearchParams();
-    const selectedParties = Array.from(document.querySelectorAll('#orders-party-list input:checked')).map(cb => cb.value);
-    selectedParties.forEach(date => params.append('party_dates', date));
-    const selectedStatuses = Array.from(document.querySelectorAll('#orders-status-list input:checked')).map(cb => cb.value);
-    selectedStatuses.forEach(status => params.append('statuses', status));
-
-    // Если фильтр по статусам пуст, по умолчанию НЕ показываем "Выдан"
-    if (selectedStatuses.length === 0 && orderStatuses.length > 0) {
-        orderStatuses.filter(s => s !== 'Выдан').forEach(status => params.append('statuses', status));
-    }
-    
-    // --- ИСПРАВЛЕНИЕ: Передача выбранного location_id для Владельца ---
-    if (currentUser.role === 'Владелец') {
-        const locationFilterSelect = document.getElementById('orders-location-filter');
-        if (locationFilterSelect && locationFilterSelect.value) { // Если select существует и выбрано значение
-            params.append('location_id', locationFilterSelect.value);
-            console.log("[Fetch Orders] Filtering by location_id:", locationFilterSelect.value);
-        } else {
-             console.log("[Fetch Orders] Owner viewing all locations.");
-        }
-    }
-    // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-    // Формируем URL с параметрами (префикс /api уже должен быть)
-    const url = `/api/orders?${params.toString()}`;
-    console.log("[Fetch] fetchAndRenderOrders: Requesting with params:", params.toString());
-
-    try {
-        // Запрашиваем заказы
-        const orders = await apiFetch(url); 
-        companyOrders = orders; // Обновляем кэш
-        console.log("[Fetch] fetchAndRenderOrders: Received orders:", orders);
-
-        if (!orders || orders.length === 0) {
-            listContainer.innerHTML = '<p class="text-gray-500">Заказы по заданным фильтрам не найдены.</p>';
-        } else {
-            // --- Группировка заказов по клиенту ---
-            const groupedOrders = orders.reduce((acc, order) => {
-                const clientId = order.client?.id || 'unknown'; 
-                if (!acc[clientId]) {
-                    acc[clientId] = { client: order.client, orders: [] };
-                }
-                acc[clientId].orders.push(order);
-                return acc;
-            }, {});
-            console.log("[Fetch] fetchAndRenderOrders: Orders grouped by client:", groupedOrders);
-
-            // --- Рендеринг сгруппированных заказов ---
-            listContainer.innerHTML = Object.values(groupedOrders).map(group => {
-                group.orders.sort((a, b) => b.id - a.id); // Новые вверху
-                const client = group.client || { full_name: 'Неизвестный клиент', phone: '', client_code_prefix: '', client_code_num: '' }; 
-                const clientCode = `${client.client_code_prefix || ''}${client.client_code_num || 'Нет кода'}`;
-                const ordersHtml = group.orders.map(o => renderOrderListItem(o)).join(''); 
-                const groupSearchData = `
-                    data-client-name="${client.full_name?.toLowerCase() || ''}"
-                    data-client-phone="${client.phone || ''}"
-                    data-client-code="${clientCode.toLowerCase()}"
-                    data-tracks="${group.orders.map(o => o.track_code?.toLowerCase() || '').join(' ')}"
-                `;
-                return `
-                    <div class="client-order-group border rounded-lg overflow-hidden mb-4 shadow-sm bg-white" ${groupSearchData}>
-                        <div class="bg-gray-100 p-3 flex flex-wrap justify-between items-center border-b gap-2">
-                             <div>
-                                <p class="font-bold text-lg text-gray-800">${client.full_name} (${clientCode})</p>
-                                <p class="text-sm text-gray-600">${client.phone}</p>
-                             </div>
-                             <span class="text-sm font-medium text-gray-500">${group.orders.length} зак.</span>
-                        </div>
-                        <div class="p-4 space-y-3">
-                             ${ordersHtml}
-                        </div>
-                    </div>
-                `;
-            }).join('');
-            console.log("[Fetch] fetchAndRenderOrders: Grouped HTML rendered.");
-        }
-        hideBulkActionBar(); // Сбрасываем панель массовых действий
-
-    } catch (e) {
-        console.error("!!! [Fetch] fetchAndRenderOrders: Error", e);
-        listContainer.innerHTML = `<p class="text-red-500">Ошибка загрузки списка заказов: ${e.message}</p>`;
-    } finally {
-        hideLoader(); 
-        console.log("[Fetch] fetchAndRenderOrders: End");
-    }
-}
 
 
 // Рендерит HTML для ОДНОГО заказа в списке (без обертки клиента)
@@ -3778,10 +3816,139 @@ function toggleOrderBuyoutFields(e) {
     }
 }
 
-// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ handleAddOrderSubmit)
+// --- НОВАЯ ФУНКЦИЯ: Рендерит список заказов ИЗ КЭША companyOrders ---
+function renderOrderListFromCache() {
+    console.log("[Render Cache] renderOrderListFromCache: Start");
+    const listContainer = document.getElementById('orders-list-container');
+    if (!listContainer) return console.error("!!! renderOrderListFromCache: listContainer #orders-list-container not found!");
 
-// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ handleAddOrderSubmit)
+    const orders = companyOrders; // Используем данные из ГЛОБАЛЬНОГО кэша
 
+    if (!orders || orders.length === 0) {
+        listContainer.innerHTML = '<p class="text-gray-500">Заказы по заданным фильтрам не найдены.</p>';
+    } else {
+        // --- Группировка заказов по клиенту ---
+        const groupedOrders = orders.reduce((acc, order) => {
+            const clientId = order.client?.id || 'unknown';
+            if (!acc[clientId]) {
+                acc[clientId] = { client: order.client, orders: [] };
+            }
+            acc[clientId].orders.push(order);
+            return acc;
+        }, {});
+        console.log("[Render Cache] Orders grouped by client:", groupedOrders);
+
+        // --- Рендеринг сгруппированных заказов ---
+        listContainer.innerHTML = Object.values(groupedOrders).map(group => {
+            group.orders.sort((a, b) => b.id - a.id); // Новые вверху
+            const client = group.client || { full_name: 'Неизвестный клиент', phone: '', client_code_prefix: '', client_code_num: '' };
+            const clientCode = `${client.client_code_prefix || ''}${client.client_code_num || 'Нет кода'}`;
+            const ordersHtml = group.orders.map(o => renderOrderListItem(o)).join(''); // Используем старую функцию рендеринга одного элемента
+            const groupSearchData = `
+                data-client-name="${client.full_name?.toLowerCase() || ''}"
+                data-client-phone="${client.phone || ''}"
+                data-client-code="${clientCode.toLowerCase()}"
+                data-tracks="${group.orders.map(o => o.track_code?.toLowerCase() || '').join(' ')}"
+            `;
+            return `
+                <div class="client-order-group border rounded-lg overflow-hidden mb-4 shadow-sm bg-white" ${groupSearchData}>
+                    <div class="bg-gray-100 p-3 flex flex-wrap justify-between items-center border-b gap-2">
+                         <div>
+                            <p class="font-bold text-lg text-gray-800">${client.full_name} (${clientCode})</p>
+                            <p class="text-sm text-gray-600">${client.phone}</p>
+                         </div>
+                         <span class="text-sm font-medium text-gray-500">${group.orders.length} зак.</span>
+                    </div>
+                    <div class="p-4 space-y-3">
+                         ${ordersHtml}
+                    </div>
+                </div>
+            `;
+        }).join('');
+        console.log("[Render Cache] Grouped HTML rendered.");
+    }
+    hideBulkActionBar(); // Сбрасываем панель массовых действий после перерисовки
+    // Обновляем поиск и чекбокс "Выбрать все", если они активны
+    handleOrdersSearch({ target: document.getElementById('orders-search-input') }); // Перефильтровываем отображение
+    updateSelectAllCheckboxState(); // Обновляем галочку "Выбрать все"
+    console.log("[Render Cache] renderOrderListFromCache: End");
+}
+
+
+// --- ИЗМЕНЕННАЯ ФУНКЦИЯ: Загружает заказы с API и вызывает renderOrderListFromCache ---
+async function fetchAndRenderOrders(filters = {}) {
+    console.log("[Fetch] fetchAndRenderOrders: Start");
+    const listContainer = document.getElementById('orders-list-container');
+    if (!listContainer) return console.error("!!! fetchAndRenderOrders: listContainer #orders-list-container not found!");
+    listContainer.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка заказов...</p>';
+    showLoader();
+
+    // Собираем параметры для запроса из фильтров
+    const params = new URLSearchParams();
+
+    // --- ДОБАВИТЬ ЭТОТ БЛОК ---
+    // Добавляем ID компании В ЛЮБОМ СЛУЧАЕ (он обязателен на бэкенде)
+    if (currentCompany && currentCompany.id) {
+        params.append('company_id', currentCompany.id);
+        console.log("[Fetch Orders] Добавлен company_id:", currentCompany.id);
+    } else if (currentUser && !currentUser.is_super_admin) {
+        // Если currentCompany не определен (маловероятно для Владельца/Сотрудника, но на всякий случай)
+        console.error("!!! [Fetch Orders] ОШИБКА: Не удалось определить ID компании для запроса заказов!");
+        listContainer.innerHTML = '<p class="text-red-500">Ошибка: Не удалось определить ID компании.</p>';
+        hideLoader();
+        return; // Прерываем выполнение
+    }
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+    // Добавляем фильтры по датам
+    const selectedParties = Array.from(document.querySelectorAll('#orders-party-list input:checked')).map(cb => cb.value);
+    selectedParties.forEach(date => params.append('party_dates', date));
+
+    // Добавляем фильтры по статусам
+    const selectedStatuses = Array.from(document.querySelectorAll('#orders-status-list input:checked')).map(cb => cb.value);
+    selectedStatuses.forEach(status => params.append('statuses', status));
+
+    // Если фильтр по статусам пуст И это не СуперАдмин (т.е. обычный пользователь CRM)
+    // то по умолчанию НЕ показываем "Выдан"
+    if (selectedStatuses.length === 0 && currentUser && !currentUser.is_super_admin && orderStatuses.length > 0) {
+        orderStatuses.filter(s => s !== 'Выдан').forEach(status => params.append('statuses', status));
+    }
+
+    // Передача выбранного location_id для Владельца
+    if (currentUser.role === 'Владелец') {
+        const locationFilterSelect = document.getElementById('orders-location-filter');
+        if (locationFilterSelect && locationFilterSelect.value) {
+            params.append('location_id', locationFilterSelect.value);
+            console.log("[Fetch Orders] Filtering by location_id:", locationFilterSelect.value);
+        } else {
+             console.log("[Fetch Orders] Owner viewing all locations.");
+        }
+    }
+
+    const url = `/api/orders?${params.toString()}`;
+    console.log("[Fetch] fetchAndRenderOrders: Requesting with params:", params.toString());
+
+    try {
+        // Запрашиваем заказы
+        const orders = await apiFetch(url);
+        companyOrders = orders; // Обновляем кэш новыми данными с сервера
+        console.log("[Fetch] fetchAndRenderOrders: Received and cached orders:", orders.length);
+
+        // ВЫЗЫВАЕМ НОВУЮ ФУНКЦИЮ ДЛЯ РЕНДЕРИНГА ИЗ КЭША
+        renderOrderListFromCache();
+
+    } catch (e) {
+        console.error("!!! [Fetch] fetchAndRenderOrders: Error", e);
+        listContainer.innerHTML = `<p class="text-red-500">Ошибка загрузки списка заказов: ${e.message}</p>`;
+        companyOrders = []; // Очищаем кэш при ошибке
+    } finally {
+        hideLoader();
+        console.log("[Fetch] fetchAndRenderOrders: End");
+    }
+}
+
+
+// --- ИЗМЕНЕННАЯ ФУНКЦИЯ: Обработчик добавления заказа ---
 async function handleAddOrderSubmit(e) {
     e.preventDefault(); // Предотвращаем стандартную отправку формы
     console.log("[Add Order] handleAddOrderSubmit: Start");
@@ -3856,21 +4023,18 @@ async function handleAddOrderSubmit(e) {
         });
         console.log("[Add Order] Server response (new order):", newOrder);
         alert(`Заказ #${newOrder.id} (${newOrder.track_code}) успешно создан!`);
-        
-        const addOrderForm = document.getElementById('add-order-form');
-        if(addOrderForm) addOrderForm.reset();  
 
-        // --- ИСПРАВЛЕННЫЙ БЛОК СБРОСА ПОЛЕЙ ---
+        const addOrderForm = document.getElementById('add-order-form');
+        if(addOrderForm) addOrderForm.reset();
+
         // Дополнительно сбрасываем/очищаем поля, которые не сбрасываются методом reset()
         const clientSearchInput = document.getElementById('order-client-search-input');
-        if (clientSearchInput) clientSearchInput.value = ''; // Используем if проверку
-
+        if (clientSearchInput) clientSearchInput.value = '';
         const selectedClientIdInput = document.getElementById('order-selected-client-id');
-        if (selectedClientIdInput) selectedClientIdInput.value = ''; // Используем if проверку
-
+        if (selectedClientIdInput) selectedClientIdInput.value = '';
         const buyoutFieldsDiv = document.getElementById('order-buyout-fields');
-        if (buyoutFieldsDiv) buyoutFieldsDiv.classList.add('hidden'); // Используем if проверку
-        // --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+        if (buyoutFieldsDiv) buyoutFieldsDiv.classList.add('hidden');
+        console.log("[Add Order] Form reset complete.");
 
         // Устанавливаем сегодняшнюю дату по умолчанию для партии после сброса
         const today = new Date().toISOString().split('T')[0];
@@ -3881,16 +4045,31 @@ async function handleAddOrderSubmit(e) {
         if (locationSelect && currentUser.location_id) {
              locationSelect.value = currentUser.location_id;
         }
-        console.log("[Add Order] Form reset complete.");
 
-        // Обновляем список заказов на странице
-        await fetchAndRenderOrders();
+        // --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+        // Добавляем новый заказ В НАЧАЛО кэша
+        companyOrders.unshift(newOrder); // newOrder - это ответ от бэкенда
+        console.log("[Add Order] Новый заказ добавлен в кэш companyOrders.");
 
-    } catch (err) { 
+        // Перерисовываем список ИЗ ОБНОВЛЕННОГО КЭША
+        renderOrderListFromCache();
+        console.log("[Add Order] Список заказов перерисован из кэша.");
+
+        // Обновляем доступные даты партий (на всякий случай, если это была новая дата)
+        try {
+            availablePartyDates = await apiFetch('/api/orders/parties');
+            populatePartyFilter(); // Обновляем HTML фильтра дат
+            console.log("[Add Order] Фильтр дат партий обновлен.");
+        } catch(partyError) {
+            console.warn("[Add Order] Не удалось обновить даты партий после добавления заказа:", partyError);
+        }
+        // --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+    } catch (err) {
         console.error("!!! [Add Order] Ошибка при создании заказа:", err);
-        alert(`Ошибка создания заказа: ${err.message}`); 
+        alert(`Ошибка создания заказа: ${err.message}`);
     } finally {
-        hideLoader(); 
+        hideLoader();
         console.log("[Add Order] handleAddOrderSubmit: End");
     }
 }
@@ -3898,9 +4077,6 @@ async function handleAddOrderSubmit(e) {
 // === КОНЕЦ ФУНКЦИЙ ДЛЯ ФОРМЫ ДОБАВЛЕНИЯ ЗАКАЗА ===
 
 // --- Функции для Импорта Заказов ---
-// index.html (Полностью заменяет handleOrderExcelImport)
-
-// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ handleOrderExcelImport)
 
 async function handleOrderExcelImport() {
     console.log("[Import Orders] handleOrderExcelImport: Start");
@@ -5274,55 +5450,119 @@ function handleIssueButtonClick(e) {
 
 // --- Рендеринг Модального Окна Выдачи ---
 async function renderIssueModal(ordersToIssue) {
+    console.log("[Render Issue Modal] Start rendering for orders:", ordersToIssue);
+    // Находим элементы модального окна
     const issueModal = document.getElementById('issue-modal');
+    // Проверка, что модальное окно существует
+    if (!issueModal) {
+        console.error("!!! renderIssueModal: Modal element #issue-modal not found!");
+        return;
+    }
     const modalContent = issueModal.querySelector('.modal-content');
-    modalContent.innerHTML = '<p>Загрузка данных для выдачи...</p>';
-    openModal('issue-modal');
-    showLoader();
+    // Проверка, что контейнер для контента существует
+    if (!modalContent) {
+        console.error("!!! renderIssueModal: Modal content container (.modal-content) not found!");
+        return;
+    }
+
+    // Показываем заглушку загрузки и открываем модальное окно
+    modalContent.innerHTML = '<p class="text-center p-8 animate-pulse">Загрузка данных для выдачи...</p>';
+    openModal('issue-modal'); // Открываем модальное окно
+    showLoader(); // Показываем глобальный лоадер
 
     try {
-        // Получаем полные данные заказов из кэша (для предрасчитанной суммы)
-        const fullOrderData = ordersToIssue.map(o => companyOrders.find(co => co.id === o.id)).filter(Boolean);
-        let preCalculatedTotal = 0;
-        fullOrderData.forEach(o => preCalculatedTotal += o.calculated_final_cost_som || 0);
+        // --- Получаем полные данные заказов из кэша ---
+        // Создаем Map для быстрого доступа к полным данным по ID заказа
+        const fullOrderDataMap = new Map();
+        // Проходим по списку ID заказов для выдачи
+        ordersToIssue.forEach(o => {
+            // Ищем полные данные заказа в глобальном кэше companyOrders
+            const fullData = companyOrders.find(co => co.id === o.id);
+            // Если данные найдены, добавляем их в Map
+            if (fullData) {
+                fullOrderDataMap.set(o.id, fullData);
+            } else {
+                // Предупреждаем, если данные заказа не найдены в кэше
+                console.warn(`[Render Issue Modal] Full data for Order ID ${o.id} not found in cache.`);
+            }
+        });
 
-        const ordersHtml = ordersToIssue.map(o => `
+        // --- Рассчитываем предварительную (расчетную) сумму ---
+        let preCalculatedTotal = 0;
+        // Проходим по найденным полным данным заказов
+        fullOrderDataMap.forEach(o => {
+            // Суммируем предрасчитанную стоимость (calculated_final_cost_som), если она есть
+            preCalculatedTotal += o.calculated_final_cost_som || 0;
+        });
+        console.log(`[Render Issue Modal] Pre-calculated total: ${preCalculatedTotal}`);
+
+        // --- Генерируем HTML для списка заказов С ПРЕДЗАПОЛНЕННЫМ ВЕСОМ ---
+        const ordersHtml = ordersToIssue.map(o => {
+            // Получаем полные данные для этого заказа из созданной Map
+            const orderData = fullOrderDataMap.get(o.id);
+            // Получаем предрасчитанный вес (calculated_weight_kg) или пустую строку, если его нет
+            const calculatedWeight = orderData?.calculated_weight_kg ?? ''; // Используем ?? '' для value
+
+            // Возвращаем HTML для элемента списка
+            return `
             <div class="flex justify-between items-center border-b pb-2 mb-2">
                 <span class="font-semibold text-sm">${o.track_code}</span>
-                <input type="number" step="any" placeholder="Вес (кг)" class="issue-weight-input w-24 p-1 border rounded text-sm" 
-                       data-order-id="${o.id}" required>
-            </div>
-        `).join('');
-        
-        // Получаем курсы и цену по умолчанию из ТЕКУЩЕЙ АКТИВНОЙ смены
-        let defaultPrice = 5.5; 
-        let defaultRate = 87.5;
-        if (activeShift) { // Используем данные активной смены, если она есть
+                <input type="number" step="any" placeholder="Вес (кг)"
+                       class="issue-weight-input w-24 p-1 border rounded text-sm"
+                       data-order-id="${o.id}"
+                       value="${calculatedWeight}" /* <-- ВСТАВЛЕНО ЗНАЧЕНИЕ ВЕСА */
+                       required> </div>
+            `;
+        }).join(''); // Соединяем HTML всех заказов
+        // --- КОНЕЦ ГЕНЕРАЦИИ HTML СПИСКА ЗАКАЗОВ ---
+
+        // --- Получаем курсы и цену по умолчанию ---
+        let defaultPrice = 5.5; // Значение по умолчанию
+        let defaultRate = 87.5; // Значение по умолчанию
+        // Пытаемся взять значения из ТЕКУЩЕЙ АКТИВНОЙ смены (если она есть)
+        if (activeShift) {
              defaultPrice = activeShift.price_per_kg_usd || defaultPrice;
              defaultRate = activeShift.exchange_rate_usd || defaultRate;
+             console.log("[Render Issue Modal] Using values from active shift:", defaultPrice, defaultRate);
+        } else {
+             console.log("[Render Issue Modal] Active shift not found, using default values.");
         }
 
+        // --- Собираем HTML всего модального окна ---
         modalContent.innerHTML = `
             <div class="flex justify-between items-start mb-4">
                  <h3 class="text-2xl font-bold">Оформление выдачи (${ordersToIssue.length} зак.)</h3>
-                 <button onclick="closeModal('issue-modal')" class="text-2xl font-bold">&times;</button>
+                 <button onclick="closeModal('issue-modal')" class="text-2xl font-bold leading-none p-1 -m-1">&times;</button>
             </div>
             <form id="issue-form">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div class="space-y-4">
                         <div class="p-3 bg-blue-50 rounded-lg">
-                            <label class="block text-sm font-medium">Общий вес (кг)</label>
+                            <label for="total-weight-input" class="block text-sm font-medium">Общий вес (кг)</label>
                             <input type="number" step="any" id="total-weight-input" placeholder="Для авто-распределения" class="mt-1 w-full p-2 border rounded-md">
                         </div>
-                        <div class="max-h-60 overflow-y-auto pr-2">${ordersHtml}</div>
-                        <div class="p-3 bg-gray-100 rounded-lg space-y-2">
-                            <div> <label class="block text-sm">Цена за кг ($)</label> <input type="number" step="0.1" id="issue-price-per-kg" value="${defaultPrice}" class="w-full p-2 border rounded"> </div>
-                            <div> <label class="block text-sm">Курс USD (сом)</label> <input type="number" step="0.1" id="issue-exchange-rate" value="${defaultRate}" class="w-full p-2 border rounded"> </div>
+                        <div class="max-h-60 overflow-y-auto pr-2">${ordersHtml}</div> <div class="p-3 bg-gray-100 rounded-lg space-y-2">
+                            <div>
+                                <label for="issue-price-per-kg" class="block text-sm">Цена за кг ($) *</label>
+                                <input type="number" step="0.1" id="issue-price-per-kg" value="${defaultPrice}" class="w-full p-2 border rounded" required>
+                            </div>
+                            <div>
+                                <label for="issue-exchange-rate" class="block text-sm">Курс USD (сом) *</label>
+                                <input type="number" step="0.1" id="issue-exchange-rate" value="${defaultRate}" class="w-full p-2 border rounded" required>
+                            </div>
                         </div>
                     </div>
                     <div class="space-y-4">
-                        <div> <label class="block text-sm font-medium">Способ оплаты</label> <select id="payment-method-select" class="w-full mt-1 p-2 border rounded-md bg-white"> <option value="cash">Наличные</option> <option value="card">Картой</option> <option value="mixed">Смешанный</option> </select> </div>
-                        <div id="payment-fields-container" class="space-y-3"></div>
+                        <div>
+                            <label for="payment-method-select" class="block text-sm font-medium">Способ оплаты</label>
+                            <select id="payment-method-select" class="w-full mt-1 p-2 border rounded-md bg-white">
+                                <option value="cash">Наличные</option>
+                                <option value="card">Картой</option>
+                                <option value="mixed">Смешанный</option>
+                            </select>
+                        </div>
+                        <div id="payment-fields-container" class="space-y-3">
+                            </div>
                         <div class="p-4 bg-indigo-50 rounded-lg text-right space-y-2">
                             ${preCalculatedTotal > 0 ? `<div class="text-sm text-gray-600">Предварительная сумма: ${preCalculatedTotal.toFixed(2)} сом</div>` : ''}
                             <div class="text-lg">Итого к оплате (факт): <span id="total-cost-display" class="font-bold">0.00 сом</span></div>
@@ -5331,20 +5571,32 @@ async function renderIssueModal(ordersToIssue) {
                         </div>
                     </div>
                 </div>
-                <div class="mt-6 flex justify-end gap-4">
-                    <button type="button" onclick="closeModal('issue-modal')" class="bg-gray-300 hover:bg-gray-400 text-black font-bold py-2 px-6 rounded-lg">Отмена</button>
+                <div class="mt-6 flex justify-end gap-4 border-t pt-4"> <button type="button" onclick="closeModal('issue-modal')" class="bg-gray-300 hover:bg-gray-400 text-black font-bold py-2 px-6 rounded-lg">Отмена</button>
                     <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg">Выдать</button>
                 </div>
             </form>
         `;
-        
-        // Добавляем логику для полей оплаты и расчета
-        setupIssueModalLogic(); 
 
-    } catch (error) {
-         modalContent.innerHTML = `<p class="text-red-500">Ошибка подготовки к выдаче: ${error.message}</p>`;
+        // --- Привязываем логику расчета и обработчики к созданным элементам ---
+        setupIssueModalLogic(); // <--- Эта функция инициализирует расчеты и слушатели внутри модалки
+        console.log("[Render Issue Modal] Logic attached.");
+
+    } catch (error) { // Обработка ошибок при подготовке окна
+         console.error("!!! [Render Issue Modal] Error preparing modal:", error);
+         // Показываем сообщение об ошибке в модальном окне
+         modalContent.innerHTML = `
+              <div class="flex justify-between items-start mb-4">
+                 <h3 class="text-2xl font-bold text-red-700">Ошибка</h3>
+                 <button onclick="closeModal('issue-modal')" class="text-2xl font-bold">&times;</button>
+              </div>
+              <p class="text-red-600">Не удалось подготовить окно выдачи: ${error.message}</p>
+              <div class="mt-6 text-right">
+                  <button onclick="closeModal('issue-modal')" class="bg-gray-300 py-2 px-4 rounded">Закрыть</button>
+              </div>`;
     } finally {
+         // В любом случае скрываем глобальный лоадер
          hideLoader();
+         console.log("[Render Issue Modal] End.");
     }
 }
 
@@ -5698,18 +5950,48 @@ function handleIssueSearch(e) {
 // --- Рендеринг вкладки "Расходы" ---
 async function renderExpensesTab() {
     console.log("[Render] renderExpensesTab: Start");
-    const today = new Date().toISOString().split('T')[0];
-    const pane = document.getElementById('tab-expenses');
-    if (!pane) return;
+    const today = new Date().toISOString().split('T')[0]; // Сегодняшняя дата для полей по умолчанию
+    const pane = document.getElementById('tab-expenses'); // Находим контейнер вкладки
+    // Если контейнер не найден (например, из-за ошибки в HTML или правах), выходим
+    if (!pane) {
+        console.warn("[Render] renderExpensesTab: Pane #tab-expenses not found.");
+        return;
+    }
 
-    // Генерируем основной HTML для вкладки
+    // --- ДОБАВИТЬ: HTML для фильтра филиалов (только Владелец) ---
+    let locationFilterHtml = ''; // Инициализируем пустой строкой
+    // Показываем фильтр, только если текущий пользователь - Владелец
+    // И если глобальный кэш филиалов companyLocations загружен и содержит больше одного филиала
+    if (currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) {
+        // Генерируем <option> для каждого филиала
+        const locationOptions = companyLocations.map(loc =>
+            // Предварительно выбираем основной филиал Владельца, если он есть
+            `<option value="${loc.id}" ${loc.id === currentUser.location_id ? 'selected' : ''}>${loc.name}</option>`
+        ).join(''); // Соединяем все <option> в одну строку
+
+        // Формируем HTML для select'а
+        locationFilterHtml = `
+            <div>
+                <label for="expenses-location-filter" class="block text-sm font-medium text-gray-700">Филиал:</label>
+                <select id="expenses-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
+                    <option value="">-- Все расходы --</option> ${locationOptions} </select>
+            </div>
+        `;
+        console.log("[Render Expenses] Фильтр филиалов для Владельца добавлен.");
+    } else {
+         console.log("[Render Expenses] Фильтр филиалов не требуется или недоступен.");
+    }
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ФИЛЬТРА ФИЛИАЛОВ ---
+
+
+    // Генерируем основной HTML для всей вкладки "Расходы"
     pane.innerHTML = `
         <div id="expenses-container" class="bg-white p-6 rounded-lg shadow-md">
             <div class="flex flex-wrap justify-between items-center gap-4 mb-4 border-b pb-4">
                 <h2 class="text-2xl font-bold text-gray-800">Учет расходов</h2>
                 <button id="add-expense-btn" class="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 text-sm">➕ Добавить расход</button>
             </div>
-            
+
             <div class="flex flex-wrap gap-4 items-end p-4 bg-gray-50 rounded-lg mb-4 border">
                 <div>
                     <label for="expense-start-date" class="block text-sm font-medium text-gray-700">С</label>
@@ -5719,58 +6001,59 @@ async function renderExpensesTab() {
                     <label for="expense-end-date" class="block text-sm font-medium text-gray-700">По</label>
                     <input type="date" id="expense-end-date" value="${today}" class="mt-1 p-2 border rounded-md">
                 </div>
-                ${(currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) ? `
-                <div>
-                    <label for="expense-location-filter" class="block text-sm font-medium text-gray-700">Филиал</label>
-                    <select id="expense-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
-                        <option value="">-- Все филиалы --</option>
-                        ${companyLocations.map(loc => `<option value="${loc.id}">${loc.name}</option>`).join('')}
-                    </select>
-                </div>
-                ` : ''}
-                <button id="filter-expenses-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">Показать</button>
-            </div>
-            
+                ${locationFilterHtml}
+                <button id="filter-expenses-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 ml-auto">Показать</button> </div>
+
             <div class="mb-4">
                 <input type="search" id="expenses-search-input" placeholder="🔍 Поиск по типу, сумме, примечанию..." class="w-full p-2 border rounded-lg">
             </div>
-            
+
             <div id="expenses-list" class="space-y-3">
                 <p class="text-gray-500">Нажмите "Показать", чтобы загрузить расходы за период.</p>
             </div>
         </div>
     `;
 
-    // --- Добавляем слушатели к элементам, созданным ВЫШЕ ---
+    // --- Добавляем слушатели к элементам, которые мы ТОЛЬКО ЧТО создали ---
+    // Находим главный контейнер вкладки
     const containerDiv = document.getElementById('expenses-container');
+    // Проверяем, найден ли контейнер (на всякий случай)
     if (containerDiv) {
         // Кнопка "Добавить расход"
         const addBtn = document.getElementById('add-expense-btn');
+        // Если кнопка найдена, добавляем слушатель клика, который откроет модальное окно
         if (addBtn) addBtn.addEventListener('click', () => openExpenseModal());
 
-        // Кнопка "Показать" (фильтр)
+        // Кнопка "Показать" (для применения фильтров даты и филиала)
         const filterBtn = document.getElementById('filter-expenses-btn');
-        if (filterBtn) filterBtn.addEventListener('click', fetchAndRenderExpenses); 
-        
+        // Если кнопка найдена, добавляем слушатель клика, который вызовет загрузку и рендеринг расходов
+        if (filterBtn) filterBtn.addEventListener('click', fetchAndRenderExpenses);
+
         // Поле поиска
         const searchInput = document.getElementById('expenses-search-input');
+        // Если поле найдено, добавляем слушатель ввода, который будет фильтровать УЖЕ отображенный список
         if (searchInput) searchInput.addEventListener('input', handleExpensesSearch);
-        
-        // Список (для делегирования действий)
+
+        // Список расходов (для делегирования кликов по кнопкам "Изменить", "Удалить")
         const listDiv = document.getElementById('expenses-list');
+        // Если список найден, добавляем слушатель клика на весь список
         if (listDiv) listDiv.addEventListener('click', handleExpenseActions);
 
-        // ДОБАВИТЬ ЭТОТ СЛУШАТЕЛЬ:
-        const locationFilter = document.getElementById('expense-location-filter');
-        if (locationFilter) {
-            locationFilter.addEventListener('change', fetchAndRenderExpenses);
-            console.log("[Listener OK] Added change to #expense-location-filter");
+        // ДОБАВИТЬ СЛУШАТЕЛЬ ДЛЯ НОВОГО ФИЛЬТРА ФИЛИАЛОВ
+        const locationFilterSelect = document.getElementById('expenses-location-filter');
+        // Если select филиалов был добавлен И найден
+        if (locationFilterSelect) {
+            // Добавляем слушатель события 'change' (смена выбора)
+            locationFilterSelect.addEventListener('change', fetchAndRenderExpenses);
+            console.log("[Listener OK] Added change to #expenses-location-filter");
         }
+        // КОНЕЦ ДОБАВЛЕНИЯ
 
-        // Загружаем расходы за сегодня при первой загрузке (по умолчанию)
+        // Загружаем расходы за сегодня (по умолчанию) при первой загрузке вкладки
         await fetchAndRenderExpenses();
 
     } else {
+        // Если главный контейнер не найден, выводим ошибку в консоль
         console.error("!!! renderExpensesTab: #expenses-container not found.");
     }
 
@@ -5781,94 +6064,128 @@ async function renderExpensesTab() {
 // --- Загрузка и отображение списка Расходов ---
 // index.html (ЗАМЕНИТЬ ЭТОЙ ФУНКЦИЕЙ СТАРУЮ fetchAndRenderExpenses)
 
+// --- Загрузка и отображение списка Расходов ---
 async function fetchAndRenderExpenses() {
     console.log("[Fetch] fetchAndRenderExpenses: Start");
+    // Находим контейнер, куда будем выводить список расходов
     const listDiv = document.getElementById('expenses-list');
-    const startDate = document.getElementById('expense-start-date')?.value;
-    const endDate = document.getElementById('expense-end-date')?.value;
-    if (!listDiv || !startDate || !endDate) return;
+    // Находим поля с датами начала и конца периода
+    const startDateInput = document.getElementById('expense-start-date');
+    const endDateInput = document.getElementById('expense-end-date');
 
+    // Проверяем, найдены ли все необходимые элементы
+    if (!listDiv || !startDateInput || !endDateInput) {
+        console.error("!!! fetchAndRenderExpenses: Critical elements not found (listDiv or date inputs).");
+        return; // Выходим, если что-то не найдено
+    }
+    // Получаем значения дат
+    const startDate = startDateInput.value;
+    const endDate = endDateInput.value;
+    // Проверяем, что даты выбраны
+    if (!startDate || !endDate) {
+        listDiv.innerHTML = '<p class="text-yellow-500">Пожалуйста, выберите даты начала и конца периода.</p>';
+        return; // Выходим, если даты не выбраны
+    }
+
+    // Показываем заглушку "Загрузка..."
     listDiv.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка расходов...</p>';
-    showLoader(); 
+    showLoader(); // Показываем глобальный индикатор загрузки
+
+    // --- ДОБАВИТЬ: Считываем выбранный location_id (если пользователь - Владелец) ---
+    // Создаем объект URLSearchParams для удобного добавления параметров к URL
+    const params = new URLSearchParams({
+        start_date: startDate, // Добавляем дату начала
+        end_date: endDate     // Добавляем дату конца
+    });
+    // Проверяем, является ли текущий пользователь Владельцем
+    if (currentUser.role === 'Владелец') {
+        // Находим select для выбора филиала
+        const locationSelect = document.getElementById('expenses-location-filter');
+        // Если select существует И в нем выбрано какое-то значение (не пустая опция "-- Все расходы --")
+        if (locationSelect && locationSelect.value) {
+            // Добавляем параметр location_id к запросу
+            params.append('location_id', locationSelect.value);
+            console.log("[Fetch Expenses] Filtering by location_id:", locationSelect.value);
+        } else {
+             // Если Владелец выбрал "-- Все расходы --" или select'а нет
+             console.log("[Fetch Expenses] Owner viewing all locations' expenses.");
+        }
+    }
+    // Для обычного сотрудника location_id не добавляем, бэкенд отфильтрует сам
+    // Формируем URL запроса с параметрами (?start_date=...&end_date=...&location_id=...)
+    const url = `/api/expenses?${params.toString()}`;
+    console.log("[Fetch Expenses] Requesting URL:", url);
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
 
     try {
-        // --- ИСПРАВЛЕНИЕ: Собираем параметры, включая location_id ---
-        const params = new URLSearchParams({
-            start_date: startDate,
-            end_date: endDate
-        });
-
-        // Добавляем location_id, если он выбран Владельцем
-        // (Ищем фильтр expense-location-filter)
-        const locationSelect = document.getElementById('expense-location-filter');
-        if (locationSelect && locationSelect.value) { // (Этот select существует, только если роль = Владелец)
-            params.append('location_id', locationSelect.value);
-        }
-
-        const url = `/api/expenses?${params.toString()}`;
-        console.log("[Fetch Expenses] Requesting URL:", url);
-        // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-        // Запрос к эндпоинту /api/expenses
+        // Выполняем запрос к API с помощью нашей вспомогательной функции apiFetch
+        // Используем сформированный URL с параметрами
         const expenses = await apiFetch(url);
 
+        // Проверяем, вернул ли бэкенд пустой список
         if (!expenses || expenses.length === 0) {
-            listDiv.innerHTML = '<p class="text-gray-500">Расходов за выбранный период (и филиал) не найдено.</p>';
+            listDiv.innerHTML = '<p class="text-gray-500">Расходов за выбранный период (с учетом фильтра) не найдено.</p>';
         } else {
-            // Генерируем HTML
+            // Если расходы есть, генерируем HTML для каждого элемента
             listDiv.innerHTML = expenses.map(exp => {
 
-                let employeeName = 'Общий (Владелец)'; 
+                // --- ИСПРАВЛЕНИЕ: Безопасное получение имени сотрудника ---
+                // Определяем имя сотрудника. По умолчанию - "Общий", если расход не привязан к смене.
+                let employeeName = 'Общий (Владелец)'; // Значение по умолчанию
+                // Проверяем, есть ли у расхода связь со сменой (shift),
+                // есть ли у смены связь с сотрудником (employee),
+                // и есть ли у сотрудника имя (full_name)
                 if (exp.shift && exp.shift.employee && exp.shift.employee.full_name) {
-                    employeeName = exp.shift.employee.full_name; 
+                    employeeName = exp.shift.employee.full_name; // Если все есть, берем имя сотрудника из смены
                 }
+                // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-                // Проверка, может ли ТЕКУЩИЙ пользователь редактировать
-                const canEdit = (currentUser.role === 'Владелец') || 
-                                (exp.shift && exp.shift.end_time === null); 
+                // Определяем, можно ли редактировать этот расход
+                // Владелец может редактировать любые расходы
+                // Сотрудник может редактировать только расходы из АКТИВНОЙ смены (shift.end_time === null)
+                const canEdit = (currentUser.role === 'Владелец') ||
+                                (exp.shift && exp.shift.end_time === null);
 
-                // Проверка, может ли ТЕКУЩИЙ пользователь удалять
-                const canDelete = (currentUser.role === 'Владелец') && 
-                                (exp.shift === null || exp.shift.end_time === null); 
+                // Определяем, можно ли удалять этот расход
+                // Только Владелец может удалять, и только если расход не из закрытой смены
+                const canDelete = (currentUser.role === 'Владелец') &&
+                                (exp.shift === null || exp.shift.end_time === null);
 
+                // Формируем HTML-разметку для одного расхода
                 return `
                     <div class="p-3 bg-gray-50 rounded-md border flex flex-wrap justify-between items-center gap-2 expense-item"
-                         data-notes="${(exp.notes || '').toLowerCase()}"
-                         data-type="${(exp.expense_type?.name || '').toLowerCase()}">
-
-                        <div class="flex-grow min-w-[200px]">
-                            <p class="font-bold text-lg">${exp.expense_type?.name || 'Тип не указан'} — <span class="text-red-600">${exp.amount.toFixed(2)} сом</span></p>
+                         data-notes="${(exp.notes || '').toLowerCase()}" data-type="${(exp.expense_type?.name || '').toLowerCase()}"> <div class="flex-grow min-w-[200px]">
+                            <p class="font-bold text-lg">
+                                ${exp.expense_type?.name || 'Тип не указан'} — <span class="text-red-600">${exp.amount.toFixed(2)} сом</span>
+                            </p>
                             <p class="text-sm text-gray-700">${exp.notes || 'Без примечания'}</p>
                             <p class="text-xs text-gray-500">
-                                ${new Date(exp.created_at).toLocaleString()} | Сотрудник: ${employeeName}
+                                ${new Date(exp.created_at).toLocaleString('ru-RU')} | Сотрудник: ${employeeName}
                             </p>
                         </div>
 
                         <div class="flex-shrink-0 flex gap-2">
                             ${canEdit ? `
-                            <button data-expense-json='${JSON.stringify(exp)}' 
-                                    class="edit-expense-btn text-sm bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded">
+                            <button data-expense-json='${JSON.stringify(exp)}' class="edit-expense-btn text-sm bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded">
                                 Изменить
                             </button>
-                            ` : ''}
-
-                            ${canDelete ? `
-                            <button data-expense-id="${exp.id}" 
-                                    data-expense-name="${exp.expense_type?.name}"
-                                    class="delete-expense-btn text-sm bg-red-200 hover:bg-red-300 text-red-800 px-3 py-1 rounded">
+                            ` : ''} ${canDelete ? `
+                            <button data-expense-id="${exp.id}"
+                                    data-expense-name="${exp.expense_type?.name || 'Расход'}" class="delete-expense-btn text-sm bg-red-200 hover:bg-red-300 text-red-800 px-3 py-1 rounded">
                                 Удалить
                             </button>
-                            ` : ''}
-                        </div>
+                            ` : ''} </div>
                     </div>
                 `;
-            }).join('');
+            }).join(''); // Соединяем HTML всех расходов в одну строку
         }
         console.log("[Fetch] fetchAndRenderExpenses: Success");
     } catch (e) {
+        // Если произошла ошибка при запросе к API
         console.error("!!! [Fetch] fetchAndRenderExpenses: Error", e);
         listDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки расходов: ${e.message}</p>`;
     } finally {
+        // В любом случае (успех или ошибка) скрываем глобальный индикатор загрузки
         hideLoader();
     }
 }
@@ -6119,18 +6436,27 @@ function renderReportsTab() {
     let firstSubTabName = null; // Имя первой доступной под-вкладки
 
     // Создаем под-вкладки на основе прав
+    // Отчет по смене
     if (userPerms.has('view_shift_report')) {
         subTabsHtml += '<button data-subtab="shift-report" class="report-subtab-btn tab-btn">Отчет по смене</button>';
         subContentHtml += '<div id="subtab-shift-report" class="report-subtab-pane tab-pane"></div>';
         if (!firstSubTabName) firstSubTabName = 'shift-report';
     }
+    // Сводный отчет
     if (userPerms.has('view_full_reports')) {
         subTabsHtml += '<button data-subtab="summary-report" class="report-subtab-btn tab-btn">Сводный отчет</button>';
         subContentHtml += '<div id="subtab-summary-report" class="report-subtab-pane tab-pane"></div>';
         if (!firstSubTabName) firstSubTabName = 'summary-report';
+
+        // --- ДОБАВИТЬ ЭТОТ БЛОК ---
+        // Отчет по выкупу (добавляем сюда же, так как требует прав на полные отчеты)
+        subTabsHtml += '<button data-subtab="buyout-report" class="report-subtab-btn tab-btn">Отчет по выкупу</button>';
+        subContentHtml += '<div id="subtab-buyout-report" class="report-subtab-pane tab-pane"></div>';
+        if (!firstSubTabName) firstSubTabName = 'buyout-report';
+        // --- КОНЕЦ ДОБАВЛЕНИЯ ---
     }
 
-    // Генерируем HTML
+    // Генерируем HTML для под-вкладок и их контейнеров
     pane.innerHTML = `
         <div class="border-b border-gray-200">
             <nav class="-mb-px flex space-x-8" id="reports-subtabs">
@@ -6145,26 +6471,40 @@ function renderReportsTab() {
     // Привязываем слушатель к под-вкладкам
     const subtabsContainer = document.getElementById('reports-subtabs');
     if (subtabsContainer) {
-        subtabsContainer.addEventListener('click', e => {
+        // Используем replaceWith/cloneNode для удаления старых слушателей (на всякий случай)
+        const newSubtabsContainer = subtabsContainer.cloneNode(true);
+        subtabsContainer.parentNode.replaceChild(newSubtabsContainer, subtabsContainer);
+        // Добавляем слушатель к новому контейнеру
+        newSubtabsContainer.addEventListener('click', e => {
             const tabButton = e.target.closest('.report-subtab-btn');
             if (tabButton) {
                 activateReportSubTab(tabButton.dataset.subtab); // Активируем под-вкладку
             }
         });
+        console.log("[Listener OK] Added click delegate to #reports-subtabs");
     }
 
-    // Рендерим содержимое под-вкладок (они теперь точно найдутся)
+    // Рендерим содержимое ВСЕХ под-вкладок (они теперь точно найдутся)
     if (document.getElementById('subtab-shift-report')) {
         renderShiftReportSubTab();
     }
     if (document.getElementById('subtab-summary-report')) {
         renderSummaryReportSubTab();
     }
-    
+    // --- ДОБАВИТЬ ВЫЗОВ РЕНДЕРИНГА ДЛЯ НОВОЙ ВКЛАДКИ ---
+    if (document.getElementById('subtab-buyout-report')) {
+        renderBuyoutReportSubTab(); // Вызываем новую функцию рендеринга
+    }
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
     // Активируем первую доступную под-вкладку
     if (firstSubTabName) {
-        activateReportSubTab(firstSubTabName);
+        // Небольшая задержка, чтобы DOM успел обновиться перед активацией
+        setTimeout(() => activateReportSubTab(firstSubTabName), 0);
+    } else {
+        console.warn("[Render Reports] No sub-tabs available to activate.");
     }
+    console.log("[Render] renderReportsTab: End");
 }
 
 // --- Активация под-вкладок ---
@@ -6311,27 +6651,39 @@ async function fetchAndRenderCurrentShiftReport() {
 
 // --- Рендеринг под-вкладки "Сводный отчет" ---
 function renderSummaryReportSubTab() {
-    const pane = document.getElementById('subtab-summary-report');
-    if (!pane) return;
-    const today = new Date().toISOString().split('T')[0];
+    console.log("[Render] renderSummaryReportSubTab: Start");
+    const pane = document.getElementById('subtab-summary-report'); // Находим контейнер под-вкладки
+    // Если контейнер не найден, выходим
+    if (!pane) {
+         console.warn("[Render] renderSummaryReportSubTab: Pane #subtab-summary-report not found.");
+         return;
+    }
+    const today = new Date().toISOString().split('T')[0]; // Сегодняшняя дата
 
-    // Фильтр филиалов (только для Владельца)
-    let locationFilterHtml = '';
+    // --- HTML для фильтра филиалов (только для Владельца) ---
+    let locationFilterHtml = ''; // Инициализируем пустой строкой
+    // Показываем, если пользователь Владелец И есть больше одного филиала в кэше
     if (currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) {
+        // Генерируем <option> для каждого филиала
         const locationOptions = companyLocations.map(loc =>
+            // Атрибут value содержит ID, текст - название филиала
             `<option value="${loc.id}">${loc.name}</option>`
         ).join('');
+        // Формируем HTML для select'а
         locationFilterHtml = `
             <div>
                 <label for="summary-location-filter" class="block text-sm font-medium text-gray-700">Филиал:</label>
                 <select id="summary-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
-                    <option value="">-- Все филиалы --</option>
-                    ${locationOptions}
-                </select>
+                    <option value="">-- Все филиалы --</option> ${locationOptions} </select>
             </div>
         `;
+        console.log("[Render Summary] Фильтр филиалов для Владельца добавлен.");
+    } else {
+         console.log("[Render Summary] Фильтр филиалов не требуется.");
     }
+    // --- КОНЕЦ HTML ФИЛЬТРА ---
 
+    // Генерируем основной HTML для под-вкладки
     pane.innerHTML = `
         <div class="bg-white p-6 rounded-lg shadow-md max-w-3xl mx-auto">
             <h2 class="text-2xl font-bold mb-4">Сводный отчет</h2>
@@ -6344,97 +6696,434 @@ function renderSummaryReportSubTab() {
                     <label for="summary-end-date" class="block text-sm font-medium">По</label>
                     <input type="date" id="summary-end-date" value="${today}" class="mt-1 p-2 border rounded-md">
                 </div>
-                ${locationFilterHtml} 
-                <button id="generate-summary-report-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md">Сформировать</button>
+                ${locationFilterHtml}
+                <button id="generate-summary-report-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md ml-auto">Сформировать</button>
             </div>
             <div id="summary-report-content">
                 <p class="text-gray-500">Выберите период и нажмите "Сформировать".</p>
             </div>
         </div>
     `;
-    
-    document.getElementById('generate-summary-report-btn')?.addEventListener('click', fetchAndRenderSummaryReport);
+
+    // --- Добавляем слушатели к ТОЛЬКО ЧТО созданным элементам ---
+    // Кнопка "Сформировать"
+    const generateBtn = document.getElementById('generate-summary-report-btn');
+    if (generateBtn) {
+        generateBtn.addEventListener('click', fetchAndRenderSummaryReport);
+        console.log("[Listener OK] Added click to #generate-summary-report-btn");
+    }
+
+    // Фильтр филиалов (если он был создан)
+    const locationSelect = document.getElementById('summary-location-filter');
+    if (locationSelect) {
+         // Добавляем слушатель 'change', который будет вызывать `fetchAndRenderSummaryReport`
+         // Это позволит отчету обновляться сразу при смене филиала (опционально, можно оставить только кнопку "Сформировать")
+        locationSelect.addEventListener('change', fetchAndRenderSummaryReport);
+        console.log("[Listener OK] Added change to #summary-location-filter");
+    }
+
+    console.log("[Render] renderSummaryReportSubTab: End");
+}
+
+// --- Рендеринг под-вкладки "Отчет по выкупу" ---
+function renderBuyoutReportSubTab() {
+    console.log("[Render] renderBuyoutReportSubTab: Start");
+    const pane = document.getElementById('subtab-buyout-report'); // Находим контейнер
+    if (!pane) {
+        console.warn("[Render] renderBuyoutReportSubTab: Pane #subtab-buyout-report not found.");
+        return;
+    }
+    const today = new Date().toISOString().split('T')[0]; // Сегодняшняя дата
+
+    // Фильтр филиалов (аналогично Сводному отчету)
+    let locationFilterHtml = '';
+    if (currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) {
+        const locationOptions = companyLocations.map(loc =>
+            `<option value="${loc.id}">${loc.name}</option>`
+        ).join('');
+        locationFilterHtml = `
+            <div>
+                <label for="buyout-location-filter" class="block text-sm font-medium text-gray-700">Филиал:</label>
+                <select id="buyout-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
+                    <option value="">-- Все филиалы --</option>
+                    ${locationOptions}
+                </select>
+            </div>
+        `;
+    }
+
+    // Генерируем HTML для под-вкладки
+    pane.innerHTML = `
+        <div class="bg-white p-6 rounded-lg shadow-md"> <h2 class="text-2xl font-bold mb-4">Отчет по выкупам и курсовой разнице</h2>
+            <div class="flex flex-wrap gap-4 items-end p-4 bg-gray-50 rounded-lg mb-4 border">
+                <div>
+                    <label for="buyout-start-date" class="block text-sm font-medium">С</label>
+                    <input type="date" id="buyout-start-date" value="${today}" class="mt-1 p-2 border rounded-md">
+                </div>
+                <div>
+                    <label for="buyout-end-date" class="block text-sm font-medium">По</label>
+                    <input type="date" id="buyout-end-date" value="${today}" class="mt-1 p-2 border rounded-md">
+                </div>
+                ${locationFilterHtml} <button id="generate-buyout-report-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md ml-auto">Сформировать</button>
+            </div>
+            <div class="mb-4">
+                <input type="search" id="buyout-report-search-input" placeholder="🔍 Поиск по клиенту, трек-коду..." class="w-full p-2 border rounded-lg">
+            </div>
+            <div id="buyout-report-content" class="overflow-x-auto"> <p class="text-gray-500">Выберите период и нажмите "Сформировать".</p>
+            </div>
+        </div>
+    `;
+
+    // --- Добавляем слушатели ---
+    const generateBtn = document.getElementById('generate-buyout-report-btn');
+    if (generateBtn) {
+        generateBtn.addEventListener('click', fetchAndRenderBuyoutReport);
+        console.log("[Listener OK] Added click to #generate-buyout-report-btn");
+    }
+    const searchInput = document.getElementById('buyout-report-search-input');
+    if (searchInput) {
+        searchInput.addEventListener('input', handleBuyoutReportSearch); // Нужна функция handleBuyoutReportSearch
+        console.log("[Listener OK] Added input to #buyout-report-search-input");
+    }
+    const locationSelect = document.getElementById('buyout-location-filter');
+    if (locationSelect) {
+        locationSelect.addEventListener('change', fetchAndRenderBuyoutReport);
+        console.log("[Listener OK] Added change to #buyout-location-filter");
+    }
+
+    console.log("[Render] renderBuyoutReportSubTab: End");
+    // Не загружаем отчет сразу, ждем нажатия кнопки "Сформировать"
+}
+
+// --- Рендеринг под-вкладки "Отчет по выкупу" ---
+function renderBuyoutReportSubTab() {
+    console.log("[Render] renderBuyoutReportSubTab: Start");
+    const pane = document.getElementById('subtab-buyout-report'); // Находим контейнер
+    if (!pane) {
+        console.warn("[Render] renderBuyoutReportSubTab: Pane #subtab-buyout-report not found.");
+        return;
+    }
+    const today = new Date().toISOString().split('T')[0]; // Сегодняшняя дата
+
+    // Фильтр филиалов (аналогично Сводному отчету)
+    let locationFilterHtml = '';
+    if (currentUser.role === 'Владелец' && companyLocations && companyLocations.length > 1) {
+        const locationOptions = companyLocations.map(loc =>
+            `<option value="${loc.id}">${loc.name}</option>`
+        ).join('');
+        locationFilterHtml = `
+            <div>
+                <label for="buyout-location-filter" class="block text-sm font-medium text-gray-700">Филиал:</label>
+                <select id="buyout-location-filter" class="mt-1 p-2 border rounded-md bg-white text-sm w-full">
+                    <option value="">-- Все филиалы --</option>
+                    ${locationOptions}
+                </select>
+            </div>
+        `;
+    }
+
+    // Генерируем HTML для под-вкладки
+    pane.innerHTML = `
+        <div class="bg-white p-6 rounded-lg shadow-md"> <h2 class="text-2xl font-bold mb-4">Отчет по выкупам и курсовой разнице</h2>
+            <div class="flex flex-wrap gap-4 items-end p-4 bg-gray-50 rounded-lg mb-4 border">
+                <div>
+                    <label for="buyout-start-date" class="block text-sm font-medium">С</label>
+                    <input type="date" id="buyout-start-date" value="${today}" class="mt-1 p-2 border rounded-md">
+                </div>
+                <div>
+                    <label for="buyout-end-date" class="block text-sm font-medium">По</label>
+                    <input type="date" id="buyout-end-date" value="${today}" class="mt-1 p-2 border rounded-md">
+                </div>
+                ${locationFilterHtml} <button id="generate-buyout-report-btn" class="bg-blue-600 text-white py-2 px-4 rounded-md ml-auto">Сформировать</button>
+            </div>
+            <div class="mb-4">
+                <input type="search" id="buyout-report-search-input" placeholder="🔍 Поиск по клиенту, трек-коду..." class="w-full p-2 border rounded-lg">
+            </div>
+            <div id="buyout-report-content" class="overflow-x-auto"> <p class="text-gray-500">Выберите период и нажмите "Сформировать".</p>
+            </div>
+        </div>
+    `;
+
+    // --- Добавляем слушатели ---
+    const generateBtn = document.getElementById('generate-buyout-report-btn');
+    if (generateBtn) {
+        generateBtn.addEventListener('click', fetchAndRenderBuyoutReport);
+        console.log("[Listener OK] Added click to #generate-buyout-report-btn");
+    }
+    const searchInput = document.getElementById('buyout-report-search-input');
+    if (searchInput) {
+        searchInput.addEventListener('input', handleBuyoutReportSearch); // Нужна функция handleBuyoutReportSearch
+        console.log("[Listener OK] Added input to #buyout-report-search-input");
+    }
+    const locationSelect = document.getElementById('buyout-location-filter');
+    if (locationSelect) {
+        locationSelect.addEventListener('change', fetchAndRenderBuyoutReport);
+        console.log("[Listener OK] Added change to #buyout-location-filter");
+    }
+
+    console.log("[Render] renderBuyoutReportSubTab: End");
+    // Не загружаем отчет сразу, ждем нажатия кнопки "Сформировать"
 }
 
 // --- Загрузка Сводного отчета ---
 async function fetchAndRenderSummaryReport() {
+    console.log("[Fetch] fetchAndRenderSummaryReport: Start");
+    // Находим контейнер для вывода результата
     const contentDiv = document.getElementById('summary-report-content');
-    if (!contentDiv) return;
+    // Находим поля с датами
+    const startDateInput = document.getElementById('summary-start-date');
+    const endDateInput = document.getElementById('summary-end-date');
+
+    // Проверяем наличие элементов
+    if (!contentDiv || !startDateInput || !endDateInput) {
+        console.error("!!! fetchAndRenderSummaryReport: Critical elements not found.");
+        return;
+    }
+    // Получаем значения дат
+    const startDate = startDateInput.value;
+    const endDate = endDateInput.value;
+    // Проверяем, выбраны ли даты
+    if (!startDate || !endDate) {
+        contentDiv.innerHTML = '<p class="text-yellow-500">Пожалуйста, выберите даты начала и конца периода.</p>';
+        return;
+    }
+
+    // Показываем заглушку и лоадер
     contentDiv.innerHTML = '<p class="animate-pulse">Формирование отчета...</p>';
     showLoader();
 
-    const startDate = document.getElementById('summary-start-date').value;
-    const endDate = document.getElementById('summary-end-date').value;
-    
+    // --- ДОБАВИТЬ: Считываем выбранный location_id ---
+    // Создаем объект URLSearchParams
     const params = new URLSearchParams({
         start_date: startDate,
         end_date: endDate
     });
-    
-    // Добавляем location_id, если он выбран Владельцем
+    // Ищем select филиалов
     const locationSelect = document.getElementById('summary-location-filter');
+    // Если select существует (т.е. пользователь - Владелец и филиалов > 1)
+    // И если выбрано значение (не пустая опция "-- Все филиалы --")
     if (locationSelect && locationSelect.value) {
+        // Добавляем параметр location_id к запросу
         params.append('location_id', locationSelect.value);
+        console.log("[Fetch Summary] Filtering by location_id:", locationSelect.value);
+    } else if (currentUser.role === 'Владелец') {
+        console.log("[Fetch Summary] Owner viewing summary for ALL locations.");
     }
-    
+    // Формируем URL с параметрами
+    const url = `/api/reports/summary?${params.toString()}`;
+    console.log("[Fetch Summary] Requesting URL:", url);
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
     try {
-        const response = await apiFetch(`/api/reports/summary?${params.toString()}`);
+        // Выполняем запрос к API с помощью apiFetch
+        const response = await apiFetch(url); // Используем URL с параметрами
+        // Извлекаем данные отчета из ответа
         const summary = response.summary;
 
+        // Генерируем HTML для блока с расходами по типам
         let expensesHtml = Object.entries(summary.expenses_by_type)
+            // Для каждой пары [тип, сумма] создаем div
             .map(([type, amount]) => `<div class="flex justify-between text-sm text-gray-700 ml-4"><span>- ${type}:</span><span>${amount.toFixed(2)} сом</span></div>`)
-            .join('');
+            .join(''); // Соединяем все div'ы в одну строку
+        // Если блок пустой, показываем сообщение
         if (!expensesHtml) expensesHtml = '<p class="text-sm text-gray-500 ml-4">Расходов за период нет.</p>';
-        
+
+        // Генерируем HTML для блока со списком смен
         let shiftsHtml = '<h3 class="text-xl font-bold mt-6 mb-2">Закрытые смены за период</h3>';
+        // Проверяем, есть ли смены в ответе
         if (!summary.shifts || summary.shifts.length === 0) {
             shiftsHtml += '<p class="text-gray-500">Закрытых смен за этот период не найдено.</p>';
         } else {
+            // Для каждой смены генерируем div с информацией и кнопкой
             shiftsHtml += summary.shifts.map(shift => {
-                // Ищем имя филиала в кэше
-                const locationName = shift.location?.name || 'Филиал ?'; // Используем имя из ответа API
+                // Получаем имя сотрудника и филиала (если они есть)
+                const employeeName = shift.employee?.full_name || 'Неизвестен';
+                const locationName = shift.location?.name || 'Филиал ?';
+                // Форматируем даты начала и конца смены
+                const startTimeStr = shift.start_time ? new Date(shift.start_time).toLocaleString('ru-RU') : '?';
+                const endTimeStr = shift.end_time ? new Date(shift.end_time).toLocaleString('ru-RU') : 'АКТИВНА';
+
+                // Возвращаем HTML для одной смены
                 return `
-                    <div class="p-2 border rounded-md hover:bg-gray-50 flex justify-between items-center text-sm">
-                        <div>
-                            <p><strong>${shift.employee?.full_name || 'Неизвестен'}</strong> @ ${locationName}</p>
-                            <p class="text-xs text-gray-500">${new Date(shift.start_time).toLocaleString()} - ${shift.end_time ? new Date(shift.end_time).toLocaleString() : 'АКТИВНА'}</p>
+                    <div class="p-2 border rounded-md hover:bg-gray-50 flex justify-between items-center text-sm mb-2"> <div>
+                            <p><strong>${employeeName}</strong> @ ${locationName}</p>
+                            <p class="text-xs text-gray-500">${startTimeStr} - ${endTimeStr}</p>
                         </div>
                         <button class="view-shift-report-btn bg-blue-100 text-blue-800 text-xs px-3 py-1 rounded-full" data-shift-id="${shift.id}">Подробнее</button>
                     </div>
-                `
-            }).join('');
+                `;
+            }).join(''); // Соединяем HTML всех смен
         }
 
-        // Рендерим весь отчет
+        // Рендерим весь HTML отчета в contentDiv
         contentDiv.innerHTML = `
-            <div class="border-t pt-4 mt-4 space-y-3 text-lg">
-                <div class="flex justify-between text-green-600"><span>Общая выручка (+):</span><span class="font-bold">${summary.total_income.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-sm text-gray-700 ml-4"><span>(Наличными):</span><span>${summary.total_cash_income.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-sm text-gray-700 ml-4"><span>(Картой):</span><span>${summary.total_card_income.toFixed(2)} сом</span></div>
-                
-                <div class="flex justify-between text-red-600 mt-4"><span>Общие расходы (-):</span><span class="font-bold">${summary.total_expenses.toFixed(2)} сом</span></div>
-                ${expensesHtml}
+            <div class="border rounded-lg p-4 mb-6 bg-gray-50"> <h3 class="text-lg font-semibold mb-3 text-gray-700">Финансовые показатели:</h3>
+                <div class="space-y-2"> <div class="flex justify-between text-green-600"><span>Общая выручка (+):</span><span class="font-bold">${summary.total_income.toFixed(2)} сом</span></div>
+                    <div class="flex justify-between text-sm text-gray-700 ml-4"><span>(Наличными):</span><span>${summary.total_cash_income.toFixed(2)} сом</span></div>
+                    <div class="flex justify-between text-sm text-gray-700 ml-4"><span>(Картой):</span><span>${summary.total_card_income.toFixed(2)} сом</span></div>
+
+                    <div class="flex justify-between text-red-600 pt-2"><span>Общие расходы (-):</span><span class="font-bold">${summary.total_expenses.toFixed(2)} сом</span></div>
+                    ${expensesHtml} </div>
             </div>
-            <div class="border-t pt-4 mt-6">
-                <div class="flex justify-between text-2xl font-bold ${summary.net_profit >= 0 ? 'text-green-700' : 'text-red-700'}">
+            <div class="border-t pt-4"> <div class="flex justify-between text-2xl font-bold ${summary.net_profit >= 0 ? 'text-green-700' : 'text-red-700'}">
                     <span>Чистая прибыль:</span><span>${summary.net_profit.toFixed(2)} сом</span>
                 </div>
             </div>
-            ${shiftsHtml}
+            <div class="mt-6"> ${shiftsHtml} </div>
         `;
 
-        // Привязываем слушатели к кнопкам "Подробнее"
+        // Привязываем слушатели к ТОЛЬКО ЧТО созданным кнопкам "Подробнее"
         contentDiv.querySelectorAll('.view-shift-report-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const shiftId = e.target.dataset.shiftId;
-                showPastShiftReportModal(shiftId);
+            // Используем replaceWith/cloneNode для удаления старых слушателей (на всякий случай)
+            const newBtn = btn.cloneNode(true);
+            btn.parentNode.replaceChild(newBtn, btn);
+            // Добавляем слушатель к новой кнопке
+            newBtn.addEventListener('click', (e) => {
+                const shiftId = e.target.dataset.shiftId; // Получаем ID смены из data-атрибута
+                showPastShiftReportModal(shiftId); // Вызываем функцию показа модального окна для этой смены
             });
         });
-    } catch (e) {
-        contentDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки отчета: ${e.message}</p>`;
+        console.log("[Fetch Summary] Report rendered successfully.");
+
+    } catch (e) { // Обработка ошибок при запросе к API
+        console.error("!!! [Fetch Summary] Error fetching or rendering summary report:", e);
+        contentDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки сводного отчета: ${e.message}</p>`;
     } finally {
+        // Скрываем глобальный лоадер в любом случае
         hideLoader();
+        console.log("[Fetch] fetchAndRenderSummaryReport: End");
     }
+}
+
+// --- Загрузка и рендеринг Отчета по выкупу ---
+async function fetchAndRenderBuyoutReport() {
+    console.log("[Fetch] fetchAndRenderBuyoutReport: Start");
+    const contentDiv = document.getElementById('buyout-report-content');
+    const startDateInput = document.getElementById('buyout-start-date');
+    const endDateInput = document.getElementById('buyout-end-date');
+    if (!contentDiv || !startDateInput || !endDateInput) return; // Проверка
+
+    const startDate = startDateInput.value;
+    const endDate = endDateInput.value;
+    if (!startDate || !endDate) {
+        contentDiv.innerHTML = '<p class="text-yellow-500">Выберите даты.</p>';
+        return;
+    }
+
+    contentDiv.innerHTML = '<p class="animate-pulse">Формирование отчета по выкупу...</p>';
+    showLoader();
+
+    // --- Формируем URL с параметрами ---
+    const params = new URLSearchParams({
+        start_date: startDate,
+        end_date: endDate
+    });
+    // Добавляем location_id (аналогично Сводному отчету)
+    const locationSelect = document.getElementById('buyout-location-filter');
+    if (locationSelect && locationSelect.value) {
+        params.append('location_id', locationSelect.value);
+        console.log("[Fetch Buyout] Filtering by location_id:", locationSelect.value);
+    } else if (currentUser.role === 'Владелец') {
+        console.log("[Fetch Buyout] Owner viewing buyout for ALL locations.");
+    }
+    // Используем РЕАЛЬНЫЙ URL эндпоинта
+    const url = `/api/reports/buyout?${params.toString()}`;
+    console.log("[Fetch Buyout] Requesting URL:", url);
+    // --- Конец формирования URL ---
+
+    try {
+        // --- ЗАПРОС К API ---
+        const response = await apiFetch(url); // Выполняем запрос
+        // Извлекаем данные из ответа бэкенда
+        const { items, total_profit } = response.report;
+        // --- КОНЕЦ ЗАПРОСА К API ---
+
+
+        if (!items || items.length === 0) {
+            contentDiv.innerHTML = '<p class="text-gray-500">Заказов на выкуп за выбранный период (с учетом фильтра) нет.</p>';
+            return;
+        }
+
+        // Генерируем строки таблицы
+        const rowsHtml = items.map(item => `
+            <tr class="border-b text-sm hover:bg-gray-50 buyout-report-row">
+                <td class="p-2 whitespace-nowrap">${new Date(item.created_at).toLocaleDateString('ru-RU')}</td>
+                <td class="p-2">${item.client_name || '?'}</td>
+                <td class="p-2">${item.track_code || '?'}</td>
+                <td class="p-2 text-right">${item.item_cost_cny?.toFixed(2) || '-'}</td>
+                <td class="p-2 text-right">${item.rate_for_client?.toFixed(2) || '-'}</td>
+                <td class="p-2 text-right font-semibold">${item.price_for_client?.toFixed(2) || '-'}</td>
+                <td class="p-2 text-right">${item.actual_rate?.toFixed(2) || 'Не указан'}</td>
+                <td class="p-2 text-right">${item.actual_cost?.toFixed(2) || '-'}</td>
+                <td class="p-2 text-right font-bold ${item.profit >= 0 ? 'text-green-600' : 'text-red-600'}">${item.profit?.toFixed(2) || '0.00'}</td>
+            </tr>
+        `).join('');
+
+        // Генерируем HTML всей таблицы и итоговой суммы
+        contentDiv.innerHTML = `
+            <table class="w-full min-w-[900px]"> <thead class="bg-gray-100 sticky top-0"> <tr class="text-left text-xs font-bold uppercase text-gray-600">
+                        <th class="p-2">Дата</th>
+                        <th class="p-2">Клиент</th>
+                        <th class="p-2">Трек</th>
+                        <th class="p-2 text-right">Цена(CNY)</th>
+                        <th class="p-2 text-right">Курс(клиент)</th>
+                        <th class="p-2 text-right">Цена(клиент)</th>
+                        <th class="p-2 text-right">Реал. курс</th>
+                        <th class="p-2 text-right">Себестоимость</th>
+                        <th class="p-2 text-right">Прибыль</th>
+                    </tr>
+                </thead>
+                <tbody>${rowsHtml}</tbody>
+            </table>
+            <div class="mt-4 text-right border-t pt-4">
+                <span class="text-lg font-bold">Итоговая прибыль от курсовой разницы:</span>
+                <span id="buyout-total-profit" class="text-xl font-bold ${total_profit >= 0 ? 'text-green-700' : 'text-red-700'}">${total_profit.toFixed(2)} сом</span>
+            </div>
+        `;
+        console.log("[Fetch Buyout] Report rendered with REAL data.");
+
+    } catch (e) { // Обработка ошибок
+        console.error("!!! [Fetch Buyout] Error fetching or rendering buyout report:", e);
+        contentDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки отчета по выкупу: ${e.message}</p>`;
+    } finally {
+        // Скрываем лоадер
+        hideLoader();
+        console.log("[Fetch] fetchAndRenderBuyoutReport: End");
+    }
+}
+
+// --- Функция поиска по Отчету о выкупе ---
+function handleBuyoutReportSearch(e) {
+    const searchTerm = e.target.value.toLowerCase().trim();
+    console.log(`[Search Buyout] Term: "${searchTerm}"`);
+    let visibleProfit = 0; // Переменная для подсчета прибыли видимых строк
+
+    // Находим все строки таблицы (кроме шапки)
+    document.querySelectorAll('#buyout-report-content table tbody tr.buyout-report-row').forEach(row => {
+        const rowContent = row.textContent?.toLowerCase() || ''; // Получаем текст всей строки
+        // Проверяем, содержит ли строка поисковый запрос
+        const isMatch = rowContent.includes(searchTerm);
+        // Показываем или скрываем строку
+        row.style.display = isMatch ? '' : 'none';
+        // Если строка видима, добавляем ее прибыль к общей видимой прибыли
+        if (isMatch) {
+            // Находим ячейку с прибылью (последняя td)
+            const profitCell = row.querySelector('td:last-child');
+            if (profitCell) {
+                visibleProfit += parseFloat(profitCell.textContent) || 0; // Добавляем значение
+            }
+        }
+    });
+
+    // Обновляем отображение итоговой прибыли ТОЛЬКО для видимых строк
+    const totalProfitSpan = document.getElementById('buyout-total-profit');
+    if (totalProfitSpan) {
+        totalProfitSpan.textContent = `${visibleProfit.toFixed(2)} сом`; // Показываем сумму видимых
+        // Меняем цвет в зависимости от знака
+        totalProfitSpan.classList.toggle('text-green-700', visibleProfit >= 0);
+        totalProfitSpan.classList.toggle('text-red-700', visibleProfit < 0);
+    }
+    console.log(`[Search Buyout] Filtering complete. Visible profit: ${visibleProfit.toFixed(2)}`);
 }
 
 // --- Показ модального окна с отчетом по ПРОШЛОЙ смене ---
@@ -6487,6 +7176,615 @@ async function showPastShiftReportModal(shiftId) {
     }
 }
 // === КОНЕЦ МОДУЛЯ ОТЧЕТЫ ===
+
+// === НАЧАЛО: Логика модального окна Расчета (Адаптированная) ===
+
+// --- Функция открытия и инициализации модального окна расчета ---
+function openCalculateModal() {
+    console.log("[Calculate Modal] Открытие окна расчета...");
+    const calculateModal = document.getElementById('calculate-modal');
+    if (!calculateModal) return; // Проверка
+
+    // --- Сброс окна в начальное состояние ---
+    // Шаг 1 (Поиск)
+    const searchInput = document.getElementById('calc-client-search-input');
+    if(searchInput) searchInput.value = '';
+    const searchResults = document.getElementById('calc-client-search-results');
+    if(searchResults) searchResults.innerHTML = '';
+    if(searchResults) searchResults.classList.add('hidden'); // Убедимся, что скрыт
+    const clientInfo = document.getElementById('calc-selected-client-info');
+    if(clientInfo) clientInfo.classList.add('hidden');
+    const clientIdInput = document.getElementById('calc-selected-client-id');
+    if(clientIdInput) clientIdInput.value = '';
+
+    // Шаг 2 (Заказы)
+    const step2 = document.getElementById('calc-step-2-orders');
+    if(step2) step2.classList.add('hidden');
+    const ordersList = document.getElementById('calc-orders-list');
+    if(ordersList) ordersList.innerHTML = '<p class="text-gray-500">Сначала выберите клиента.</p>';
+    const selectAllCheckbox = document.getElementById('calc-select-all-orders');
+    if(selectAllCheckbox) selectAllCheckbox.checked = false;
+
+    // Шаг 3 (Расчет)
+    const step3 = document.getElementById('calc-step-3-calculation');
+    if(step3) step3.classList.add('hidden');
+    const totalWeightInput = document.getElementById('calc-total-weight-input');
+    if(totalWeightInput) totalWeightInput.value = '';
+    const individualWeights = document.getElementById('calc-individual-weights');
+    if(individualWeights) individualWeights.innerHTML = '';
+    const totalCostDisplay = document.getElementById('calc-total-cost-display');
+    if(totalCostDisplay) totalCostDisplay.textContent = '0.00 сом';
+
+    // Шаг 4 (Действия)
+    const step4 = document.getElementById('calc-step-4-actions');
+    if(step4) step4.classList.add('hidden');
+
+    // --- Подгрузка актуальных курсов и цены ---
+    // Используем данные активной смены (если есть) или стандартные значения
+    const defaultPriceInput = document.getElementById('calc-price-per-kg');
+    const defaultRateInput = document.getElementById('calc-exchange-rate');
+    if (defaultPriceInput) {
+         defaultPriceInput.value = activeShift?.price_per_kg_usd || 5.5; // Значение по умолчанию
+    }
+    if (defaultRateInput) {
+         defaultRateInput.value = activeShift?.exchange_rate_usd || 87.5; // Значение по умолчанию
+    }
+
+    // --- Заполнение выпадающего списка статусов ---
+    const statusSelect = document.getElementById('calc-new-status-select');
+    if (statusSelect) {
+        // Добавляем опцию "Не менять" и все статусы из глобальной переменной orderStatuses
+        statusSelect.innerHTML = '<option value="">-- Не менять --</option>' +
+                                  orderStatuses.map(s => `<option value="${s}">${s}</option>`).join('');
+    }
+
+    // --- Привязка слушателей (ВАЖНО делать это здесь, чтобы избежать дублей) ---
+    // Используем replaceAndListen для надежности
+    const replaceAndListenCalc = (id, event, handler) => {
+        const element = document.getElementById(id);
+        if (element) {
+            const newElement = element.cloneNode(true);
+            element.parentNode?.replaceChild(newElement, element);
+            newElement.addEventListener(event, handler);
+            console.log(`[Calc Listener OK] Added ${event} to #${id}`);
+        } else {
+             console.warn(`!!! Calculate Modal: Element #${id} NOT FOUND during listener attachment.`);
+        }
+    };
+
+    replaceAndListenCalc('calc-client-search-input', 'input', handleCalcClientSearch);
+    replaceAndListenCalc('calc-select-all-orders', 'change', handleCalcSelectAllOrders);
+    replaceAndListenCalc('save-calculation-btn', 'click', saveCalculation); // Функция сохранения
+
+    // Слушатели для полей расчета будут добавлены в handleCalculationCheckboxChange
+
+    // Открываем модальное окно
+    openModal('calculate-modal');
+    console.log("[Calculate Modal] Окно открыто и инициализировано.");
+}
+
+// --- Поиск клиента ВНУТРИ модального окна расчета ---
+function handleCalcClientSearch(e) {
+    const input = e.target;
+    const resultsDiv = document.getElementById('calc-client-search-results');
+    const selectedIdInput = document.getElementById('calc-selected-client-id');
+    const clientInfoDiv = document.getElementById('calc-selected-client-info');
+
+    // Используем универсальную функцию поиска
+    handleGenericClientSearch(input, resultsDiv, (client) => {
+        // Callback-функция, вызываемая при выборе клиента
+        input.value = ''; // Очищаем поиск
+        if(resultsDiv) resultsDiv.classList.add('hidden'); // Скрываем результаты
+        if(selectedIdInput) selectedIdInput.value = client.id; // Сохраняем ID
+        if(clientInfoDiv) { // Показываем инфо о выбранном клиенте
+             clientInfoDiv.textContent = `Выбран клиент: ${client.full_name} (${client.client_code_prefix || ''}${client.client_code_num || 'Нет кода'})`;
+             clientInfoDiv.classList.remove('hidden');
+        }
+        // Запускаем загрузку заказов этого клиента
+        loadClientOrdersForCalculation(client.id);
+    });
+}
+
+// --- Загрузка и отображение заказов клиента ДЛЯ РАСЧЕТА ---
+async function loadClientOrdersForCalculation(clientId) {
+    console.log(`[Calculate Modal] Загрузка заказов для клиента ID: ${clientId}`);
+    const ordersListDiv = document.getElementById('calc-orders-list');
+    const step2Div = document.getElementById('calc-step-2-orders');
+    const step3Div = document.getElementById('calc-step-3-calculation');
+    const step4Div = document.getElementById('calc-step-4-actions');
+
+    if (!ordersListDiv || !step2Div || !step3Div || !step4Div) return; // Проверка
+
+    ordersListDiv.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка заказов...</p>';
+    step2Div.classList.remove('hidden'); // Показываем блок выбора заказов
+    step3Div.classList.add('hidden');    // Скрываем блок расчета
+    step4Div.classList.add('hidden');    // Скрываем блок действий
+
+    try {
+        // Формируем URL для получения заказов ТОЛЬКО этого клиента и НЕ выданных
+        const params = new URLSearchParams({ client_id: clientId });
+        // Добавляем все статусы, кроме "Выдан"
+        orderStatuses.filter(s => s !== 'Выдан').forEach(s => params.append('statuses', s));
+
+        // Выполняем запрос к API (используем существующий эндпоинт GET /api/orders)
+        const clientOrders = await apiFetch(`/api/orders?${params.toString()}`);
+
+        if (!clientOrders || clientOrders.length === 0) {
+            ordersListDiv.innerHTML = '<p class="text-gray-500">У этого клиента нет заказов для расчета (кроме выданных).</p>';
+            return;
+        }
+
+        // Генерируем HTML для списка заказов с чекбоксами
+        ordersListDiv.innerHTML = clientOrders.map(order => `
+            <div class="flex items-center justify-between py-1">
+                <div class="flex items-center">
+                    <input type="checkbox" id="calc-order-${order.id}" value="${order.id}"
+                           class="calc-order-checkbox h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                           data-track-code="${order.track_code}"
+                           data-order-json='${JSON.stringify(order)}'> <label for="calc-order-${order.id}" class="ml-3 block text-sm text-gray-900">
+                        ${order.track_code} <span class="text-xs text-gray-500">(${order.status})</span>
+                    </label>
+                </div>
+                <span class="text-xs text-blue-600">
+                    ${order.calculated_weight_kg ? `Вес: ${order.calculated_weight_kg} кг` : ''}
+                    ${order.calculated_final_cost_som ? ` / Цена: ${order.calculated_final_cost_som.toFixed(0)} сом` : ''}
+                </span>
+            </div>
+        `).join('');
+
+        // Добавляем обработчики на чекбоксы заказов ПОСЛЕ их создания
+        ordersListDiv.querySelectorAll('.calc-order-checkbox').forEach(cb => {
+            // Удаляем старый слушатель перед добавлением нового
+            const newCb = cb.cloneNode(true);
+            cb.parentNode.replaceChild(newCb, cb);
+            newCb.addEventListener('change', handleCalculationCheckboxChange);
+        });
+        console.log(`[Calculate Modal] Заказы (${clientOrders.length}) загружены и отображены.`);
+
+    } catch (error) {
+        console.error("!!! [Calculate Modal] Ошибка загрузки заказов:", error);
+        ordersListDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки заказов: ${error.message}</p>`;
+    }
+}
+
+// --- Обработчик для чекбокса "Выбрать все" в окне расчета ---
+function handleCalcSelectAllOrders(e) {
+    const isChecked = e.target.checked;
+    console.log(`[Calculate Modal] Select all checkbox changed to: ${isChecked}`);
+    // Находим все чекбоксы заказов ВНУТРИ МОДАЛЬНОГО ОКНА
+    document.querySelectorAll('#calc-orders-list .calc-order-checkbox').forEach(cb => {
+        cb.checked = isChecked; // Устанавливаем то же состояние
+    });
+    // Вызываем обработчик изменения, чтобы показать/скрыть блок расчета и обновить поля
+    handleCalculationCheckboxChange();
+}
+
+// --- Обработчик изменения любого чекбокса заказа в окне расчета ---
+function handleCalculationCheckboxChange() {
+    // Находим все ОТМЕЧЕННЫЕ чекбоксы заказов в модалке
+    const checkedCheckboxes = document.querySelectorAll('#calc-orders-list .calc-order-checkbox:checked');
+    const calculationDiv = document.getElementById('calc-step-3-calculation');
+    const actionsDiv = document.getElementById('calc-step-4-actions');
+    const individualWeightsDiv = document.getElementById('calc-individual-weights');
+
+    // Проверяем, есть ли отмеченные
+    if (checkedCheckboxes.length > 0) {
+        console.log(`[Calculate Modal] ${checkedCheckboxes.length} orders selected. Showing calculation steps.`);
+        // Если выбран хотя бы один заказ, показываем блоки расчета и кнопок
+        if(calculationDiv) calculationDiv.classList.remove('hidden');
+        if(actionsDiv) actionsDiv.classList.remove('hidden');
+        if(!individualWeightsDiv) return; // Выходим, если контейнер для веса не найден
+
+        // Генерируем поля для ввода веса только для ВЫБРАННЫХ заказов
+        individualWeightsDiv.innerHTML = ''; // Очищаем предыдущие поля
+        checkedCheckboxes.forEach(cb => {
+            const orderId = cb.value;
+            const trackCode = cb.dataset.trackCode;
+            let orderData = {};
+            try { // Пытаемся получить полные данные заказа из data-атрибута
+                 orderData = JSON.parse(cb.dataset.orderJson);
+            } catch(e) { console.warn("Could not parse order data from checkbox", e); }
+            // Берем сохраненный вес (calculated_weight_kg), если он есть
+            const prefilledWeight = orderData?.calculated_weight_kg || '';
+
+            // Добавляем HTML для поля ввода веса
+            individualWeightsDiv.innerHTML += `
+                <div class="flex justify-between items-center border-b pb-1 mb-1"> <span class="font-semibold text-sm">${trackCode}</span>
+                    <input type="number" step="any" placeholder="Вес (кг)"
+                           class="calc-weight-input w-24 p-1 border rounded text-sm"
+                           data-order-id="${orderId}" value="${prefilledWeight}" required>
+                </div>
+            `;
+        });
+
+        // Добавляем слушатели для ТОЛЬКО ЧТО созданных полей расчета
+        addCalculationListeners();
+        // Сразу пересчитываем стоимость с предзаполненными данными
+        updateCalculationTotals();
+
+    } else {
+        console.log("[Calculate Modal] No orders selected. Hiding calculation steps.");
+        // Если ни один заказ не выбран, скрываем блоки и очищаем поля веса
+        if(calculationDiv) calculationDiv.classList.add('hidden');
+        if(actionsDiv) actionsDiv.classList.add('hidden');
+        if(individualWeightsDiv) individualWeightsDiv.innerHTML = '';
+    }
+     // Обновляем состояние чекбокса "Выбрать все"
+     updateCalcSelectAllCheckboxState();
+}
+
+// Обновляет состояние чекбокса "Выбрать все" ВНУТРИ ОКНА РАСЧЕТА
+function updateCalcSelectAllCheckboxState() {
+     const selectAllCheckbox = document.getElementById('calc-select-all-orders');
+     if (!selectAllCheckbox) return;
+
+     const allCheckboxes = document.querySelectorAll('#calc-orders-list .calc-order-checkbox');
+     const checkedCount = document.querySelectorAll('#calc-orders-list .calc-order-checkbox:checked').length;
+
+     if (allCheckboxes.length === 0) {
+         selectAllCheckbox.checked = false;
+         selectAllCheckbox.indeterminate = false;
+     } else if (checkedCount === 0) {
+         selectAllCheckbox.checked = false;
+         selectAllCheckbox.indeterminate = false;
+     } else if (checkedCount === allCheckboxes.length) {
+         selectAllCheckbox.checked = true;
+         selectAllCheckbox.indeterminate = false;
+     } else {
+         selectAllCheckbox.checked = false;
+         selectAllCheckbox.indeterminate = true;
+     }
+}
+
+// --- Добавление слушателей к полям расчета (вес, цена, курс) ---
+// Вызывается из handleCalculationCheckboxChange ПОСЛЕ создания полей веса
+function addCalculationListeners() {
+    console.log("[Calculate Modal] Adding listeners to calculation inputs.");
+    // Общий вес (используем replaceAndListenCalc для надежности)
+    const replaceAndListenCalc = (id, event, handler) => {
+        const element = document.getElementById(id);
+        if (element) {
+            const newElement = element.cloneNode(true);
+            element.parentNode?.replaceChild(newElement, element);
+            newElement.addEventListener(event, handler);
+        }
+    };
+    replaceAndListenCalc('calc-total-weight-input', 'input', handleTotalWeightChange);
+
+    // Индивидуальные веса (находим ВСЕ и привязываем слушатель)
+    document.querySelectorAll('.calc-weight-input').forEach(input => {
+        // Удаляем старый слушатель перед добавлением нового
+        const newInput = input.cloneNode(true);
+        input.parentNode.replaceChild(newInput, input);
+        // Добавляем слушатель к новому элементу
+        newInput.addEventListener('input', () => {
+             // Сбрасываем общий вес, если начали вводить индивидуальный
+            const totalWeightInp = document.getElementById('calc-total-weight-input');
+            if(totalWeightInp) totalWeightInp.value = '';
+            // Пересчитываем итоговую сумму
+            updateCalculationTotals();
+        });
+    });
+
+    // Цена и курс
+    replaceAndListenCalc('calc-price-per-kg', 'input', updateCalculationTotals);
+    replaceAndListenCalc('calc-exchange-rate', 'input', updateCalculationTotals);
+}
+
+// --- Обработчик изменения общего веса (для авто-распределения) ---
+function handleTotalWeightChange() {
+    const totalWeightInput = document.getElementById('calc-total-weight-input');
+    const totalWeight = parseFloat(totalWeightInput?.value) || 0; // Безопасное получение значения
+    const individualInputs = document.querySelectorAll('.calc-weight-input');
+
+    console.log(`[Calculate Modal] Total weight changed: ${totalWeight}`);
+
+    // Распределяем вес, только если он >= 0 и есть поля для распределения
+    if (totalWeight >= 0 && individualInputs.length > 0) {
+        const weightPerItem = (totalWeight / individualInputs.length).toFixed(3); // Распределяем поровну, 3 знака после запятой
+        console.log(`[Calculate Modal] Auto-distributing weight: ${weightPerItem} kg per item.`);
+        individualInputs.forEach(input => { input.value = weightPerItem; });
+    } else if (totalWeight < 0) {
+         console.warn("[Calculate Modal] Total weight cannot be negative.");
+         if(totalWeightInput) totalWeightInput.value = ''; // Сбрасываем отрицательное значение
+         individualInputs.forEach(input => { input.value = ''; }); // Очищаем индивидуальные
+    } else {
+        // Если общий вес убрали или 0, очищаем индивидуальные
+        console.log("[Calculate Modal] Clearing individual weights.");
+        individualInputs.forEach(input => { input.value = ''; });
+    }
+    // Пересчитываем итоговую сумму в любом случае
+    updateCalculationTotals();
+}
+
+// --- Пересчет и отображение итоговой стоимости ---
+function updateCalculationTotals() {
+    const priceInput = document.getElementById('calc-price-per-kg');
+    const rateInput = document.getElementById('calc-exchange-rate');
+    const totalCostDisplay = document.getElementById('calc-total-cost-display');
+
+    // Проверки на наличие элементов
+    if (!priceInput || !rateInput || !totalCostDisplay) {
+         console.error("!!! updateCalculationTotals: Missing required elements.");
+         return;
+    }
+
+    const price = parseFloat(priceInput.value) || 0;
+    const rate = parseFloat(rateInput.value) || 0;
+    let currentTotalWeight = 0;
+    // Суммируем значения из ВСЕХ полей индивидуального веса
+    document.querySelectorAll('.calc-weight-input').forEach(input => {
+        currentTotalWeight += parseFloat(input.value) || 0;
+    });
+
+    // Рассчитываем итоговую стоимость
+    const totalCost = currentTotalWeight * price * rate;
+    // Отображаем результат, форматируя до 2 знаков после запятой
+    totalCostDisplay.textContent = `${totalCost.toFixed(2)} сом`;
+    // console.log(`[Calculate Modal] Totals updated: Weight=${currentTotalWeight.toFixed(3)}, Price=${price}, Rate=${rate}, TotalCost=${totalCost.toFixed(2)}`);
+}
+
+// --- Сохранение расчета (вызывается кнопкой "Сохранить") ---
+async function saveCalculation() {
+    console.log("[Calculate Modal] saveCalculation: Start");
+    // Находим все отмеченные чекбоксы заказов
+    const selectedCheckboxes = document.querySelectorAll('#calc-orders-list .calc-order-checkbox:checked');
+    // Получаем значения цены и курса
+    const pricePerKgInput = document.getElementById('calc-price-per-kg');
+    const exchangeRateInput = document.getElementById('calc-exchange-rate');
+    const pricePerKg = parseFloat(pricePerKgInput?.value);
+    const exchangeRate = parseFloat(exchangeRateInput?.value);
+    // Получаем выбранный новый статус (или null, если "-- Не менять --")
+    const statusSelect = document.getElementById('calc-new-status-select');
+    const newStatus = statusSelect?.value || null;
+
+    // --- Собираем данные по весу для каждого выбранного заказа ---
+    const ordersPayloadItems = []; // Массив для отправки на бэкенд
+    let hasInvalidWeight = false; // Флаг для проверки корректности веса
+    selectedCheckboxes.forEach(cb => {
+        const orderId = parseInt(cb.value);
+        // Находим соответствующее поле ввода веса
+        const weightInput = document.querySelector(`.calc-weight-input[data-order-id="${orderId}"]`);
+        const weight = parseFloat(weightInput?.value);
+
+        // Проверяем, что вес введен и он больше нуля
+        if (!weight || weight <= 0) {
+            hasInvalidWeight = true; // Ставим флаг, если вес некорректен
+            if(weightInput) weightInput.classList.add('border-red-500'); // Подсвечиваем неверное поле
+        } else {
+            if(weightInput) weightInput.classList.remove('border-red-500'); // Убираем подсветку
+        }
+        // Добавляем данные заказа в массив (даже если вес некорректен, чтобы проверка сработала)
+        ordersPayloadItems.push({ order_id: orderId, weight_kg: weight || 0 });
+    });
+
+    // --- Проверки перед отправкой ---
+    if (ordersPayloadItems.length === 0) {
+        alert('Не выбрано ни одного заказа для расчета.');
+        return;
+    }
+    if (hasInvalidWeight) {
+        alert('Ошибка: Вес должен быть указан (больше нуля) для всех выбранных заказов. Проверьте подсвеченные поля.');
+        return;
+    }
+    // Проверяем цену и курс
+    let validationError = false;
+    if (!pricePerKg || pricePerKg <= 0) {
+        alert('Ошибка: Укажите корректную цену за кг (больше нуля).');
+        if(pricePerKgInput) pricePerKgInput.classList.add('border-red-500');
+        validationError = true;
+    } else {
+         if(pricePerKgInput) pricePerKgInput.classList.remove('border-red-500');
+    }
+    if (!exchangeRate || exchangeRate <= 0) {
+        alert('Ошибка: Укажите корректный курс USD (больше нуля).');
+        if(exchangeRateInput) exchangeRateInput.classList.add('border-red-500');
+        validationError = true;
+    } else {
+         if(exchangeRateInput) exchangeRateInput.classList.remove('border-red-500');
+    }
+    if(validationError) return; // Прерываем, если есть ошибки валидации
+
+    // Формируем тело запроса для API
+    const payload = {
+        orders: ordersPayloadItems,      // Список заказов с весом
+        price_per_kg_usd: pricePerKg,    // Цена
+        exchange_rate_usd: exchangeRate, // Курс
+        new_status: newStatus            // Новый статус (или null)
+    };
+
+    console.log("[Calculate Modal] Отправка данных на /api/orders/calculate:", payload);
+    showLoader(); // Показываем индикатор загрузки
+
+    try {
+        // Выполняем POST запрос к новому эндпоинту
+        const response = await apiFetch('/api/orders/calculate', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        });
+
+        console.log("[Calculate Modal] Server response:", response);
+        alert(response.message || 'Расчет успешно сохранен!');
+        closeModal('calculate-modal'); // Закрываем модальное окно
+
+        // Обновляем список заказов на основной вкладке "Заказы"
+        // Вызываем fetchAndRenderOrders, чтобы загрузить свежие данные (включая обновленные статусы и расчеты)
+        await fetchAndRenderOrders();
+        console.log("[Calculate Modal] Список заказов на основной вкладке обновлен.");
+
+    } catch (error) { // Обработка ошибок от API
+        console.error("!!! [Calculate Modal] Ошибка при сохранении расчета:", error);
+        alert(`Ошибка при сохранении расчета: ${error.message}`);
+        // Оставляем модальное окно открытым при ошибке
+    } finally {
+        hideLoader(); // Скрываем индикатор загрузки
+        console.log("[Calculate Modal] saveCalculation: End");
+    }
+}
+
+// === КОНЕЦ: Логика модального окна Расчета ===
+
+// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ RENDER ---
+// --- Рендеринг вкладки "Настройки" ---
+function renderSettingsTab() {
+    console.log("[Render] renderSettingsTab: Start");
+    const pane = document.getElementById('tab-settings');
+    if (!pane) {
+        console.warn("[Render] renderSettingsTab: Pane #tab-settings not found.");
+        return;
+    }
+
+    // Определяем ключи настроек, которые хотим показать Владельцу
+    const settingKeys = [
+        { key: 'china_warehouse_address', label: 'Адрес склада в Китае', placeholder: 'Адрес склада в Китае, используйте {{client_code}} для подстановки кода', type: 'textarea' },
+        { key: 'address_instruction_pdf_link', label: 'Ссылка на PDF с инструкцией', placeholder: 'https://.../instruction.pdf', type: 'text' }, // НОВОЕ ПОЛЕ
+        { key: 'bishkek_office_address', label: 'Адрес офиса в Бишкеке', placeholder: 'Город, улица, дом', type: 'text' },
+        { key: 'contact_phone', label: 'Контактный телефон', placeholder: '+996...', type: 'text' },
+        { key: 'whatsapp_link', label: 'Ссылка WhatsApp', placeholder: 'https://wa.me/996...', type: 'text' },
+        { key: 'instagram_link', label: 'Ссылка Instagram', placeholder: 'https://instagram.com/...', type: 'text' },
+        { key: 'map_link', label: 'Ссылка на карту (2ГИС и т.п.)', placeholder: 'https://go.2gis.com/...', type: 'text' }
+    ];
+
+    // Генерируем HTML для полей ввода
+    const fieldsHtml = settingKeys.map(item => `
+        <div class="mb-4">
+            <label for="setting-${item.key}" class="block text-sm font-medium text-gray-700">${item.label}</label>
+            ${item.type === 'textarea' ? `
+                <textarea id="setting-${item.key}" name="${item.key}" rows="4" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="${item.placeholder || ''}"></textarea>
+            ` : `
+                <input type="${item.type || 'text'}" id="setting-${item.key}" name="${item.key}" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="${item.placeholder || ''}">
+            `}
+            ${item.key === 'china_warehouse_address' ? '<p class="mt-1 text-xs text-gray-500">Используйте <code>{{client_code}}</code> или <code>{client_code}</code> для подстановки кода клиента.</p>' : ''}
+            ${item.key === 'address_instruction_pdf_link' ? '<p class="mt-1 text-xs text-gray-500">Эта ссылка будет показана в боте под адресом склада.</p>' : ''}
+        </div>
+    `).join('');
+
+    // Генерируем основной HTML вкладки
+    pane.innerHTML = `
+        <div class="bg-white p-6 rounded-lg shadow-md max-w-3xl mx-auto">
+            <h2 class="text-2xl font-bold mb-6 text-gray-800">Настройки компании</h2>
+            <form id="settings-form">
+                ${fieldsHtml}
+                <div class="mt-6 pt-4 border-t">
+                    <button type="submit" class="w-full sm:w-auto px-6 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition-colors">Сохранить настройки</button>
+                </div>
+            </form>
+            <div id="settings-save-status" class="mt-4 text-sm"></div> </div>
+    `;
+
+    // --- Добавляем слушатель к форме ---
+    const formElement = document.getElementById('settings-form');
+    if (formElement) {
+        // Удаляем старый слушатель перед добавлением нового
+        formElement.replaceWith(formElement.cloneNode(true));
+        document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
+        console.log("[Listener OK] Added submit to #settings-form");
+    } else {
+        console.error("!!! renderSettingsTab: #settings-form not found.");
+    }
+
+    // --- Загружаем и отображаем текущие настройки ---
+    fetchAndRenderSettings();
+
+    console.log("[Render] renderSettingsTab: End");
+}
+
+// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ FETCH ---
+// --- Загрузка и отображение настроек компании ---
+async function fetchAndRenderSettings() {
+    console.log("[Fetch] fetchAndRenderSettings: Start");
+    const formElement = document.getElementById('settings-form');
+    const statusDiv = document.getElementById('settings-save-status');
+    if (!formElement || !statusDiv) return;
+
+    statusDiv.textContent = 'Загрузка текущих настроек...';
+    showLoader();
+
+    try {
+        // Запрашиваем настройки ТЕКУЩЕЙ компании
+        if (!currentCompany || !currentCompany.id) {
+             throw new Error("Не удалось определить ID текущей компании.");
+        }
+        // Определяем ключи, которые хотим запросить
+        const keysToFetch = Array.from(formElement.elements)
+                                .map(el => el.name)
+                                .filter(Boolean); // Получаем имена всех полей формы
+
+        const response = await apiFetch(`/api/settings`, { params: { company_id: currentCompany.id, keys: keysToFetch } });
+
+        if (!response || !Array.isArray(response)) {
+            throw new Error("Не удалось получить настройки с сервера.");
+        }
+
+        console.log("[Fetch] fetchAndRenderSettings: Received settings:", response);
+
+        // Заполняем поля формы полученными значениями
+        response.forEach(setting => {
+            const inputElement = formElement.elements[setting.key];
+            if (inputElement) {
+                inputElement.value = setting.value || ''; // Ставим пустую строку, если значение null
+            }
+        });
+
+        statusDiv.textContent = ''; // Убираем сообщение о загрузке
+        console.log("[Fetch] fetchAndRenderSettings: Settings loaded into form.");
+
+    } catch (error) {
+        console.error("!!! [Fetch] fetchAndRenderSettings: Error", error);
+        statusDiv.textContent = `Ошибка загрузки настроек: ${error.message}`;
+    } finally {
+        hideLoader();
+    }
+}
+
+// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ SAVE ---
+// --- Сохранение настроек компании ---
+async function handleSaveSettings(e) {
+    e.preventDefault(); // Предотвращаем стандартную отправку
+    console.log("[Save] handleSaveSettings: Start");
+    const formElement = document.getElementById('settings-form');
+    const statusDiv = document.getElementById('settings-save-status');
+    if (!formElement || !statusDiv) return;
+
+    statusDiv.textContent = 'Сохранение настроек...';
+    statusDiv.className = 'mt-4 text-sm text-blue-600 animate-pulse'; // Стиль для процесса сохранения
+    showLoader();
+
+    // Собираем данные из полей формы в нужный формат для API ([{key: k, value: v}, ...])
+    const payload = [];
+    // Проходим по всем элементам формы (input, textarea)
+    for (const element of formElement.elements) {
+        // Убеждаемся, что у элемента есть имя (key) и он не кнопка
+        if (element.name && element.type !== 'submit') {
+            payload.push({
+                key: element.name,
+                value: element.value || null // Отправляем null, если поле пустое
+            });
+        }
+    }
+
+    console.log("[Save] handleSaveSettings: Payload to send:", payload);
+
+    try {
+        // Отправляем PATCH запрос на /api/settings
+        // company_id будет определен на бэкенде по Владельцу (employee)
+        const response = await apiFetch(`/api/settings`, {
+            method: 'PATCH',
+            body: JSON.stringify(payload)
+        });
+
+        console.log("[Save] handleSaveSettings: Server response:", response);
+        statusDiv.textContent = response.message || 'Настройки успешно сохранены!';
+        statusDiv.className = 'mt-4 text-sm text-green-600'; // Стиль для успеха
+
+    } catch (error) { // Обработка ошибок
+        console.error("!!! [Save] handleSaveSettings: Error", error);
+        statusDiv.textContent = `Ошибка сохранения: ${error.message}`;
+        statusDiv.className = 'mt-4 text-sm text-red-600'; // Стиль для ошибки
+    } finally {
+        hideLoader();
+    }
+}
 
 
 </script>
