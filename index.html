@@ -648,11 +648,10 @@ async function initializeMainAppUI() {
                 tabsHtml += '<button data-tab="reports" class="tab-btn">Отчеты</button>'; 
                 contentHtml += '<div id="tab-reports" class="tab-pane"></div>'; 
             }
-            // --- ДОБАВИТЬ ВКЛАДКУ НАСТРОЕК (для Владельца) ---
-            // TODO: Добавить право 'manage_settings' в ALL_PERMISSIONS и выдать его роли Владельца
-            if (currentUser.role === 'Владелец') { // Пока просто проверяем роль Владельца
-                tabsHtml += '<button data-tab="settings" class="tab-btn">Настройки</button>';
-                contentHtml += '<div id="tab-settings" class="tab-pane"></div>';
+            // --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ (Только Владелец видит Настройки) ---
+            if (currentUser.role === 'Владелец') {
+                 tabsHtml += '<button data-tab="settings" class="tab-btn">Настройки</button>';
+                 contentHtml += '<div id="tab-settings" class="tab-pane"></div>';
             }
             // --- КОНЕЦ ДОБАВЛЕНИЯ ---
         }
@@ -1975,14 +1974,16 @@ function addLocationActionListeners() {
 
 
 // --- Открытие модального окна Филиала (для создания или редактирования) ---
-function openLocationModal(location = null) {
-    console.log("[Modal] openLocationModal: Start", location);
+// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ openLocationModal)
+
+function openLocationModal(locationData = null) {
+    console.log("[Modal] openLocationModal: Start", locationData);
     const modal = document.getElementById('location-modal');
     if (!modal) return console.error("!!! openLocationModal: Modal element #location-modal not found!");
     const modalContent = modal.querySelector('.modal-content');
     if (!modalContent) return console.error("!!! openLocationModal: Modal content not found!");
 
-    const isEdit = location !== null; // true, если переданы данные для редактирования
+    const isEdit = locationData !== null;
 
     // Генерируем HTML для содержимого модального окна
     modalContent.innerHTML = `
@@ -1990,15 +1991,38 @@ function openLocationModal(location = null) {
             <h3 class="text-2xl font-bold">${isEdit ? 'Редактировать Филиал' : 'Добавить Новый Филиал'}</h3>
             <button onclick="closeModal('location-modal')" class="text-2xl font-bold leading-none p-1 -m-1">&times;</button>
         </div>
-        <form id="location-form" class="space-y-4">
-            <input type="hidden" id="location-id" value="${isEdit ? location.id : ''}">
+        <form id="location-form" data-location-id="${isEdit ? locationData.id : ''}" class="space-y-4">
+            
             <div>
                 <label for="location-name" class="block text-sm font-medium text-gray-700">Название *</label>
-                <input type="text" id="location-name" class="mt-1 w-full p-2 border rounded" required value="${isEdit ? location.name : ''}" placeholder="Например: Склад Дордой, Офис Центр">
+                <input type="text" id="location-name" class="mt-1 w-full p-2 border rounded" required 
+                       value="${isEdit && locationData.name ? locationData.name : ''}" placeholder="Например: Склад Дордой, Офис Центр">
             </div>
             <div>
                 <label for="location-address" class="block text-sm font-medium text-gray-700">Адрес</label>
-                <input type="text" id="location-address" class="mt-1 w-full p-2 border rounded" value="${isEdit ? (location.address || '') : ''}" placeholder="Город, улица, дом">
+                <input type="text" id="location-address" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.address ? locationData.address : ''}" placeholder="Город, улица, дом">
+            </div>
+
+            <div class="border-t pt-4">
+                <label for="location-phone" class="block text-sm font-medium text-gray-700">Телефон филиала</label>
+                <input type="text" id="location-phone" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.phone ? locationData.phone : ''}" placeholder="+996 555 123456">
+            </div>
+            <div>
+                <label for="location-whatsapp" class="block text-sm font-medium text-gray-700">Ссылка WhatsApp</label>
+                <input type="text" id="location-whatsapp" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.whatsapp_link ? locationData.whatsapp_link : ''}" placeholder="https://wa.me/996555123456">
+            </div>
+            <div>
+                <label for="location-instagram" class="block text-sm font-medium text-gray-700">Ссылка Instagram</label>
+                <input type="text" id="location-instagram" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.instagram_link ? locationData.instagram_link : ''}" placeholder="https://instagram.com/...">
+            </div>
+            <div>
+                <label for="location-map" class="block text-sm font-medium text-gray-700">Ссылка на Карту (2GIS, Google)</label>
+                <input type="text" id="location-map" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.map_link ? locationData.map_link : ''}" placeholder="https://go.2gis.com/...">
             </div>
             <div class="flex gap-4 mt-6 border-t pt-4">
                 <button type="button" onclick="closeModal('location-modal')" class="w-full bg-gray-200 py-2 rounded hover:bg-gray-300 text-gray-800">Отмена</button>
@@ -2010,7 +2034,6 @@ function openLocationModal(location = null) {
     // --- Добавляем слушатель submit к ТОЛЬКО ЧТО созданной форме ---
     const formElement = document.getElementById('location-form');
     if (formElement) {
-        // Удаляем старые слушатели перед добавлением нового
         formElement.replaceWith(formElement.cloneNode(true));
         document.getElementById('location-form').addEventListener('submit', handleSaveLocation);
         console.log("[Modal Listener OK] Added submit to #location-form");
@@ -2024,47 +2047,61 @@ function openLocationModal(location = null) {
 }
 
 // --- Сохранение данных Филиала (вызывается из модального окна) ---
-async function handleSaveLocation(e) {
-    e.preventDefault(); // Предотвращаем стандартную отправку
-    console.log("[Save] handleSaveLocation: Start");
-    showLoader(); // Показываем лоадер
+// index.html (ПОЛНОСТЬЮ ЗАМЕНЯЕТ handleSaveLocation)
 
-    // Считываем ID (для определения режима - создание/редактирование)
-    const locationId = document.getElementById('location-id')?.value;
-    const isEdit = !!locationId; // true, если ID есть
-    const url = isEdit ? `/api/locations/${locationId}` : '/api/locations'; // Определяем URL
-    const method = isEdit ? 'PATCH' : 'POST'; // Определяем метод
+async function handleSaveLocation(e) {
+    e.preventDefault(); 
+    console.log("[Save] handleSaveLocation: Start");
+    showLoader(); 
+
+    const form = e.target;
+    const locationId = form.dataset.locationId;
+    const isEdit = !!locationId; 
+    
+    // ИСПРАВЛЕНИЕ: Используем /api/locations
+    const url = isEdit ? `/api/locations/${locationId}` : '/api/locations'; 
+    const method = isEdit ? 'PATCH' : 'POST'; 
 
     // Собираем данные из полей формы
     const payload = {
         name: document.getElementById('location-name')?.value.trim(),
-        address: document.getElementById('location-address')?.value.trim() || null // Отправляем null если поле адреса пустое
+        address: document.getElementById('location-address')?.value.trim() || null,
+        // --- НОВЫЕ ПОЛЯ ---
+        phone: document.getElementById('location-phone')?.value.trim() || null,
+        whatsapp_link: document.getElementById('location-whatsapp')?.value.trim() || null,
+        instagram_link: document.getElementById('location-instagram')?.value.trim() || null,
+        map_link: document.getElementById('location-map')?.value.trim() || null
+        // --- КОНЕЦ НОВЫХ ПОЛЕЙ ---
     };
 
-    // Валидация: проверяем, что название не пустое
     if (!payload.name) {
          hideLoader();
          alert("Название филиала не может быть пустым.");
-         return; // Прерываем сохранение
+         return; 
      }
 
     try {
-        // Отправляем запрос на сервер
         console.log(`[Save] handleSaveLocation: Sending ${method} to ${url}`, payload);
-        const result = await apiFetch(url, { method: method, body: JSON.stringify(payload) });
+        
+        // ИСПРАВЛЕНИЕ: Используем apiFetch
+        const result = await apiFetch(url, { 
+            method: method, 
+            body: JSON.stringify(payload) 
+        });
+        
         console.log("[Save] handleSaveLocation: Server response", result);
-
-        // Обработка успеха
         alert(isEdit ? 'Данные филиала успешно обновлены!' : 'Новый филиал успешно создан!');
-        closeModal('location-modal'); // Закрываем модальное окно
-        await fetchAndRenderLocations(); // Обновляем список филиалов на странице
+        closeModal('location-modal'); 
+        
+        // ИСПРАВЛЕНИЕ: Обновляем кэш companyLocations
+        companyLocations = await apiFetch('/api/locations'); 
+        
+        await fetchAndRenderLocations(); 
 
-    } catch(err) { // Обработка ошибок (от валидации или от apiFetch)
+    } catch(err) { 
         console.error("[Save] handleSaveLocation: Error", err);
         alert(`Ошибка сохранения данных филиала: ${err.message}`);
-        // Оставляем модальное окно открытым для исправления
     } finally {
-        // --- Скрываем лоадер в любом случае ---
         hideLoader();
         console.log("[Save] handleSaveLocation: End");
     }
@@ -7286,64 +7323,80 @@ function handleCalcClientSearch(e) {
 }
 
 // --- Загрузка и отображение заказов клиента ДЛЯ РАСЧЕТА ---
+// ПОЛНОСТЬЮ ЗАМЕНИТЬ ЭТУ ФУНКЦИЮ
 async function loadClientOrdersForCalculation(clientId) {
-    console.log(`[Calculate Modal] Загрузка заказов для клиента ID: ${clientId}`);
     const ordersListDiv = document.getElementById('calc-orders-list');
-    const step2Div = document.getElementById('calc-step-2-orders');
-    const step3Div = document.getElementById('calc-step-3-calculation');
-    const step4Div = document.getElementById('calc-step-4-actions');
+    if (!ordersListDiv) return; 
 
-    if (!ordersListDiv || !step2Div || !step3Div || !step4Div) return; // Проверка
-
-    ordersListDiv.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка заказов...</p>';
-    step2Div.classList.remove('hidden'); // Показываем блок выбора заказов
-    step3Div.classList.add('hidden');    // Скрываем блок расчета
-    step4Div.classList.add('hidden');    // Скрываем блок действий
+    ordersListDiv.innerHTML = '<p class="text-gray-500">Загрузка заказов...</p>';
+    document.getElementById('calc-step-2-orders').classList.remove('hidden');
+    document.getElementById('calc-step-3-calculation').classList.add('hidden');
+    document.getElementById('calc-step-4-actions').classList.add('hidden');
 
     try {
-        // Формируем URL для получения заказов ТОЛЬКО этого клиента и НЕ выданных
         const params = new URLSearchParams({ client_id: clientId });
-        // Добавляем все статусы, кроме "Выдан"
-        orderStatuses.filter(s => s !== 'Выдан').forEach(s => params.append('statuses', s));
+        
+        // --- ЭТО ИСПРАВЛЕНИЕ ---
+        // Мы жестко задаем список статусов, которые нужно запросить.
+        // (Берем их из твоего нового файла 3-etap/index.html, строка 309)
+        const statusesToFetch = [
+            "В обработке", "Ожидает выкупа", "Выкуплен", 
+            "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"
+        ];
+        // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-        // Выполняем запрос к API (используем существующий эндпоинт GET /api/orders)
-        const clientOrders = await apiFetch(`/api/orders?${params.toString()}`);
+        // Добавляем их в URL
+        if (statusesToFetch.length > 0) {
+            statusesToFetch.forEach(s => params.append('statuses', s));
+        }
+
+        // Теперь запрос будет /api/orders?client_id=...&statuses=...&statuses=...
+        const data = await apiFetch(`/api/orders?${params.toString()}`); 
+        
+        const clientOrders = data.orders; 
 
         if (!clientOrders || clientOrders.length === 0) {
-            ordersListDiv.innerHTML = '<p class="text-gray-500">У этого клиента нет заказов для расчета (кроме выданных).</p>';
+            ordersListDiv.innerHTML = '<p class="text-gray-500">У этого клиента нет заказов (кроме выданных).</p>';
             return;
         }
 
-        // Генерируем HTML для списка заказов с чекбоксами
+        // Рендерим список заказов (этот код у тебя уже должен быть)
         ordersListDiv.innerHTML = clientOrders.map(order => `
-            <div class="flex items-center justify-between py-1">
+            <div class="flex items-center justify-between py-1 border-b last:border-b-0">
                 <div class="flex items-center">
                     <input type="checkbox" id="calc-order-${order.id}" value="${order.id}"
                            class="calc-order-checkbox h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                           data-track-code="${order.track_code}"
-                           data-order-json='${JSON.stringify(order)}'> <label for="calc-order-${order.id}" class="ml-3 block text-sm text-gray-900">
+                           data-track-code="${order.track_code}">
+                    <label for="calc-order-${order.id}" class="ml-3 block text-sm text-gray-900">
                         ${order.track_code} <span class="text-xs text-gray-500">(${order.status})</span>
                     </label>
                 </div>
-                <span class="text-xs text-blue-600">
+                <span class="text-xs text-blue-600 font-medium">
                     ${order.calculated_weight_kg ? `Вес: ${order.calculated_weight_kg} кг` : ''}
                     ${order.calculated_final_cost_som ? ` / Цена: ${order.calculated_final_cost_som.toFixed(0)} сом` : ''}
                 </span>
             </div>
         `).join('');
 
-        // Добавляем обработчики на чекбоксы заказов ПОСЛЕ их создания
         ordersListDiv.querySelectorAll('.calc-order-checkbox').forEach(cb => {
-            // Удаляем старый слушатель перед добавлением нового
-            const newCb = cb.cloneNode(true);
-            cb.parentNode.replaceChild(newCb, cb);
-            newCb.addEventListener('change', handleCalculationCheckboxChange);
+            cb.addEventListener('change', handleCalculationCheckboxChange);
         });
-        console.log(`[Calculate Modal] Заказы (${clientOrders.length}) загружены и отображены.`);
 
     } catch (error) {
-        console.error("!!! [Calculate Modal] Ошибка загрузки заказов:", error);
-        ordersListDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки заказов: ${error.message}</p>`;
+        // Этот блок 'catch' мы уже исправляли, он должен быть в порядке
+        const errorMessage = error.message || 'Неизвестная ошибка';
+        console.error("!!! [Calculate Modal] Ошибка загрузки заказов:", errorMessage);
+        
+        let displayError = errorMessage;
+        if (errorMessage.includes('[{')) {
+            try {
+                // Пытаемся распарсить ошибку Pydantic
+                const errors = JSON.parse(errorMessage.substring(errorMessage.indexOf('[{')));
+                displayError = `Ошибка валидации (422): ${errors[0]?.msg || 'Неверные данные'}`;
+            } catch(e) { /* Оставляем как есть */ }
+        }
+        
+        ordersListDiv.innerHTML = `<p class="text-red-500 font-semibold">Ошибка загрузки заказов: ${displayError}</p>`;
     }
 }
 
@@ -7624,163 +7677,125 @@ async function saveCalculation() {
 
 // === КОНЕЦ: Логика модального окна Расчета ===
 
-// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ RENDER ---
+// =================================================================
+// МОДУЛЬ: НАСТРОЙКИ (Владелец)
+// =================================================================
+
+// Кэш для настроек
+let companySettings = {}; // { key: value, ... }
+
 // --- Рендеринг вкладки "Настройки" ---
-function renderSettingsTab() {
+async function renderSettingsTab() {
     console.log("[Render] renderSettingsTab: Start");
     const pane = document.getElementById('tab-settings');
-    if (!pane) {
-        console.warn("[Render] renderSettingsTab: Pane #tab-settings not found.");
-        return;
-    }
+    if (!pane) return;
 
-    // Определяем ключи настроек, которые хотим показать Владельцу
-    const settingKeys = [
-        { key: 'china_warehouse_address', label: 'Адрес склада в Китае', placeholder: 'Адрес склада в Китае, используйте {{client_code}} для подстановки кода', type: 'textarea' },
-        { key: 'address_instruction_pdf_link', label: 'Ссылка на PDF с инструкцией', placeholder: 'https://.../instruction.pdf', type: 'text' }, // НОВОЕ ПОЛЕ
-        { key: 'bishkek_office_address', label: 'Адрес офиса в Бишкеке', placeholder: 'Город, улица, дом', type: 'text' },
-        { key: 'contact_phone', label: 'Контактный телефон', placeholder: '+996...', type: 'text' },
-        { key: 'whatsapp_link', label: 'Ссылка WhatsApp', placeholder: 'https://wa.me/996...', type: 'text' },
-        { key: 'instagram_link', label: 'Ссылка Instagram', placeholder: 'https://instagram.com/...', type: 'text' },
-        { key: 'map_link', label: 'Ссылка на карту (2ГИС и т.п.)', placeholder: 'https://go.2gis.com/...', type: 'text' }
-    ];
-
-    // Генерируем HTML для полей ввода
-    const fieldsHtml = settingKeys.map(item => `
-        <div class="mb-4">
-            <label for="setting-${item.key}" class="block text-sm font-medium text-gray-700">${item.label}</label>
-            ${item.type === 'textarea' ? `
-                <textarea id="setting-${item.key}" name="${item.key}" rows="4" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="${item.placeholder || ''}"></textarea>
-            ` : `
-                <input type="${item.type || 'text'}" id="setting-${item.key}" name="${item.key}" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="${item.placeholder || ''}">
-            `}
-            ${item.key === 'china_warehouse_address' ? '<p class="mt-1 text-xs text-gray-500">Используйте <code>{{client_code}}</code> или <code>{client_code}</code> для подстановки кода клиента.</p>' : ''}
-            ${item.key === 'address_instruction_pdf_link' ? '<p class="mt-1 text-xs text-gray-500">Эта ссылка будет показана в боте под адресом склада.</p>' : ''}
-        </div>
-    `).join('');
-
-    // Генерируем основной HTML вкладки
+    // Генерируем HTML для вкладки
     pane.innerHTML = `
-        <div class="bg-white p-6 rounded-lg shadow-md max-w-3xl mx-auto">
-            <h2 class="text-2xl font-bold mb-6 text-gray-800">Настройки компании</h2>
-            <form id="settings-form">
-                ${fieldsHtml}
-                <div class="mt-6 pt-4 border-t">
-                    <button type="submit" class="w-full sm:w-auto px-6 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition-colors">Сохранить настройки</button>
+        <div class="bg-white p-6 rounded-lg shadow-md max-w-2xl mx-auto">
+            <h2 class="text-2xl font-bold mb-4">Настройки Компании (для Бота и ЛК)</h2>
+            <form id="settings-form" class="space-y-6">
+                
+                <div>
+                    <label for="setting-china-address" class="block text-sm font-medium text-gray-700">Адрес склада в Китае</label>
+                    <p class="text-xs text-gray-500 mb-1">Используйте <code>{{client_code}}</code> для подстановки кода клиента.</p>
+                    <textarea id="setting-china-address" data-key="china_warehouse_address" class="setting-input w-full p-2 border rounded-md h-24 font-mono"></textarea>
+                </div>
+                
+                <div>
+                    <label for="setting-pdf-link" class="block text-sm font-medium text-gray-700">Ссылка на PDF с инструкцией</label>
+                    <p class="text-xs text-gray-500 mb-1">Полная ссылка (https://...) для кнопки в боте.</p>
+                    <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
+                </div>
+                
+                <div class="border-t pt-4">
+                    <button type="submit" class="w-full bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700">Сохранить Настройки</button>
                 </div>
             </form>
-            <div id="settings-save-status" class="mt-4 text-sm"></div> </div>
+        </div>
     `;
 
-    // --- Добавляем слушатель к форме ---
-    const formElement = document.getElementById('settings-form');
-    if (formElement) {
-        // Удаляем старый слушатель перед добавлением нового
-        formElement.replaceWith(formElement.cloneNode(true));
+    // Привязываем слушатель к форме
+    const form = document.getElementById('settings-form');
+    if (form) {
+        form.replaceWith(form.cloneNode(true)); // Очищаем старые
         document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
         console.log("[Listener OK] Added submit to #settings-form");
-    } else {
-        console.error("!!! renderSettingsTab: #settings-form not found.");
     }
 
-    // --- Загружаем и отображаем текущие настройки ---
-    fetchAndRenderSettings();
-
-    console.log("[Render] renderSettingsTab: End");
+    // Загружаем и отображаем текущие настройки
+    await fetchAndRenderSettings();
 }
 
-// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ FETCH ---
-// --- Загрузка и отображение настроек компании ---
+// --- Загрузка и отображение Настроек ---
 async function fetchAndRenderSettings() {
     console.log("[Fetch] fetchAndRenderSettings: Start");
-    const formElement = document.getElementById('settings-form');
-    const statusDiv = document.getElementById('settings-save-status');
-    if (!formElement || !statusDiv) return;
-
-    statusDiv.textContent = 'Загрузка текущих настроек...';
     showLoader();
-
     try {
-        // Запрашиваем настройки ТЕКУЩЕЙ компании
-        if (!currentCompany || !currentCompany.id) {
-             throw new Error("Не удалось определить ID текущей компании.");
-        }
-        // Определяем ключи, которые хотим запросить
-        const keysToFetch = Array.from(formElement.elements)
-                                .map(el => el.name)
-                                .filter(Boolean); // Получаем имена всех полей формы
+        const settingsList = await apiFetch('/api/settings'); // Получаем список [{key: k, value: v}, ...]
+        
+        // Преобразуем список в удобный объект (кэш)
+        companySettings = settingsList.reduce((acc, setting) => {
+            acc[setting.key] = setting.value;
+            return acc;
+        }, {});
+        
+        console.log("[Fetch] fetchAndRenderSettings: Settings loaded:", companySettings);
 
-        const response = await apiFetch(`/api/settings`, { params: { company_id: currentCompany.id, keys: keysToFetch } });
-
-        if (!response || !Array.isArray(response)) {
-            throw new Error("Не удалось получить настройки с сервера.");
-        }
-
-        console.log("[Fetch] fetchAndRenderSettings: Received settings:", response);
-
-        // Заполняем поля формы полученными значениями
-        response.forEach(setting => {
-            const inputElement = formElement.elements[setting.key];
-            if (inputElement) {
-                inputElement.value = setting.value || ''; // Ставим пустую строку, если значение null
+        // Заполняем поля ввода
+        document.querySelectorAll('.setting-input').forEach(input => {
+            const key = input.dataset.key;
+            if (companySettings.hasOwnProperty(key)) {
+                input.value = companySettings[key] || '';
             }
         });
 
-        statusDiv.textContent = ''; // Убираем сообщение о загрузке
-        console.log("[Fetch] fetchAndRenderSettings: Settings loaded into form.");
-
-    } catch (error) {
-        console.error("!!! [Fetch] fetchAndRenderSettings: Error", error);
-        statusDiv.textContent = `Ошибка загрузки настроек: ${error.message}`;
+    } catch (e) {
+        console.error("[Fetch] fetchAndRenderSettings: Error", e);
+        alert(`Ошибка загрузки настроек: ${e.message}`);
     } finally {
         hideLoader();
     }
 }
 
-// --- ДОБАВИТЬ НОВУЮ ФУНКЦИЮ SAVE ---
-// --- Сохранение настроек компании ---
+// --- Сохранение Настроек ---
 async function handleSaveSettings(e) {
-    e.preventDefault(); // Предотвращаем стандартную отправку
+    e.preventDefault();
     console.log("[Save] handleSaveSettings: Start");
-    const formElement = document.getElementById('settings-form');
-    const statusDiv = document.getElementById('settings-save-status');
-    if (!formElement || !statusDiv) return;
-
-    statusDiv.textContent = 'Сохранение настроек...';
-    statusDiv.className = 'mt-4 text-sm text-blue-600 animate-pulse'; // Стиль для процесса сохранения
     showLoader();
-
-    // Собираем данные из полей формы в нужный формат для API ([{key: k, value: v}, ...])
-    const payload = [];
-    // Проходим по всем элементам формы (input, textarea)
-    for (const element of formElement.elements) {
-        // Убеждаемся, что у элемента есть имя (key) и он не кнопка
-        if (element.name && element.type !== 'submit') {
-            payload.push({
-                key: element.name,
-                value: element.value || null // Отправляем null, если поле пустое
-            });
+    
+    // Собираем данные из всех полей с классом 'setting-input'
+    const settingsToSave = {};
+    document.querySelectorAll('.setting-input').forEach(input => {
+        const key = input.dataset.key;
+        if (key) {
+            settingsToSave[key] = input.value.trim() || null;
         }
-    }
-
-    console.log("[Save] handleSaveSettings: Payload to send:", payload);
+    });
+    
+    const payload = {
+        settings: settingsToSave
+    };
 
     try {
-        // Отправляем PATCH запрос на /api/settings
-        // company_id будет определен на бэкенде по Владельцу (employee)
-        const response = await apiFetch(`/api/settings`, {
-            method: 'PATCH',
+        console.log("[Save] handleSaveSettings: Sending payload:", payload);
+        const updatedSettingsList = await apiFetch('/api/settings', {
+            method: 'PUT',
             body: JSON.stringify(payload)
         });
+        
+        // Обновляем кэш
+        companySettings = updatedSettingsList.reduce((acc, setting) => {
+            acc[setting.key] = setting.value;
+            return acc;
+        }, {});
+        
+        console.log("[Save] handleSaveSettings: Settings saved successfully.");
+        alert("Настройки успешно сохранены!");
 
-        console.log("[Save] handleSaveSettings: Server response:", response);
-        statusDiv.textContent = response.message || 'Настройки успешно сохранены!';
-        statusDiv.className = 'mt-4 text-sm text-green-600'; // Стиль для успеха
-
-    } catch (error) { // Обработка ошибок
-        console.error("!!! [Save] handleSaveSettings: Error", error);
-        statusDiv.textContent = `Ошибка сохранения: ${error.message}`;
-        statusDiv.className = 'mt-4 text-sm text-red-600'; // Стиль для ошибки
+    } catch (err) {
+        console.error("[Save] handleSaveSettings: Error", err);
+        alert(`Ошибка сохранения настроек: ${err.message}`);
     } finally {
         hideLoader();
     }
