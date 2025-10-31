@@ -7323,80 +7323,75 @@ function handleCalcClientSearch(e) {
 }
 
 // --- Загрузка и отображение заказов клиента ДЛЯ РАСЧЕТА ---
-// ПОЛНОСТЬЮ ЗАМЕНИТЬ ЭТУ ФУНКЦИЮ
 async function loadClientOrdersForCalculation(clientId) {
+    console.log(`[Calculate Modal] Загрузка заказов для клиента ID: ${clientId}`);
     const ordersListDiv = document.getElementById('calc-orders-list');
-    if (!ordersListDiv) return; 
+    const step2Div = document.getElementById('calc-step-2-orders');
+    const step3Div = document.getElementById('calc-step-3-calculation');
+    const step4Div = document.getElementById('calc-step-4-actions');
 
-    ordersListDiv.innerHTML = '<p class="text-gray-500">Загрузка заказов...</p>';
-    document.getElementById('calc-step-2-orders').classList.remove('hidden');
-    document.getElementById('calc-step-3-calculation').classList.add('hidden');
-    document.getElementById('calc-step-4-actions').classList.add('hidden');
+    if (!ordersListDiv || !step2Div || !step3Div || !step4Div) return; // Проверка
+
+    ordersListDiv.innerHTML = '<p class="text-gray-500 animate-pulse">Загрузка заказов...</p>';
+    step2Div.classList.remove('hidden'); // Показываем блок выбора заказов
+    step3Div.classList.add('hidden');    // Скрываем блок расчета
+    step4Div.classList.add('hidden');    // Скрываем блок действий
 
     try {
+        // Формируем URL для получения заказов ТОЛЬКО этого клиента и НЕ выданных
         const params = new URLSearchParams({ client_id: clientId });
-        
-        // --- ЭТО ИСПРАВЛЕНИЕ ---
-        // Мы жестко задаем список статусов, которые нужно запросить.
-        // (Берем их из твоего нового файла 3-etap/index.html, строка 309)
-        const statusesToFetch = [
-            "В обработке", "Ожидает выкупа", "Выкуплен", 
-            "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"
-        ];
+
+        // --- ИСПРАВЛЕНИЕ: ДОБАВЛЯЕМ ID КОМПАНИИ ---
+        if (!currentCompany || !currentCompany.id) {
+            console.error("!!! [Calculate Modal] КРИТИЧЕСКАЯ ОШИБКА: Не удалось определить ID компании (currentCompany.id) для запроса заказов!");
+            ordersListDiv.innerHTML = '<p class="text-red-500">Ошибка: Не удалось определить ID компании.</p>';
+            return; // Прерываем выполнение
+        }
+        params.append('company_id', currentCompany.id);
         // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-        // Добавляем их в URL
-        if (statusesToFetch.length > 0) {
-            statusesToFetch.forEach(s => params.append('statuses', s));
-        }
+        // Добавляем все статусы, кроме "Выдан"
+        orderStatuses.filter(s => s !== 'Выдан').forEach(s => params.append('statuses', s));
 
-        // Теперь запрос будет /api/orders?client_id=...&statuses=...&statuses=...
-        const data = await apiFetch(`/api/orders?${params.toString()}`); 
-        
-        const clientOrders = data.orders; 
+        // Выполняем запрос к API (используем существующий эндпоинт GET /api/orders)
+        // Теперь URL будет содержать client_id, company_id и statuses
+        const clientOrders = await apiFetch(`/api/orders?${params.toString()}`);
 
         if (!clientOrders || clientOrders.length === 0) {
-            ordersListDiv.innerHTML = '<p class="text-gray-500">У этого клиента нет заказов (кроме выданных).</p>';
+            ordersListDiv.innerHTML = '<p class="text-gray-500">У этого клиента нет заказов для расчета (кроме выданных).</p>';
             return;
         }
 
-        // Рендерим список заказов (этот код у тебя уже должен быть)
+        // Генерируем HTML для списка заказов с чекбоксами
         ordersListDiv.innerHTML = clientOrders.map(order => `
-            <div class="flex items-center justify-between py-1 border-b last:border-b-0">
+            <div class="flex items-center justify-between py-1">
                 <div class="flex items-center">
                     <input type="checkbox" id="calc-order-${order.id}" value="${order.id}"
                            class="calc-order-checkbox h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                           data-track-code="${order.track_code}">
-                    <label for="calc-order-${order.id}" class="ml-3 block text-sm text-gray-900">
+                           data-track-code="${order.track_code}"
+                           data-order-json='${JSON.stringify(order)}'> <label for="calc-order-${order.id}" class="ml-3 block text-sm text-gray-900">
                         ${order.track_code} <span class="text-xs text-gray-500">(${order.status})</span>
                     </label>
                 </div>
-                <span class="text-xs text-blue-600 font-medium">
+                <span class="text-xs text-blue-600">
                     ${order.calculated_weight_kg ? `Вес: ${order.calculated_weight_kg} кг` : ''}
                     ${order.calculated_final_cost_som ? ` / Цена: ${order.calculated_final_cost_som.toFixed(0)} сом` : ''}
                 </span>
             </div>
         `).join('');
 
+        // Добавляем обработчики на чекбоксы заказов ПОСЛЕ их создания
         ordersListDiv.querySelectorAll('.calc-order-checkbox').forEach(cb => {
-            cb.addEventListener('change', handleCalculationCheckboxChange);
+            // Удаляем старый слушатель перед добавлением нового
+            const newCb = cb.cloneNode(true);
+            cb.parentNode.replaceChild(newCb, cb);
+            newCb.addEventListener('change', handleCalculationCheckboxChange);
         });
+        console.log(`[Calculate Modal] Заказы (${clientOrders.length}) загружены и отображены.`);
 
     } catch (error) {
-        // Этот блок 'catch' мы уже исправляли, он должен быть в порядке
-        const errorMessage = error.message || 'Неизвестная ошибка';
-        console.error("!!! [Calculate Modal] Ошибка загрузки заказов:", errorMessage);
-        
-        let displayError = errorMessage;
-        if (errorMessage.includes('[{')) {
-            try {
-                // Пытаемся распарсить ошибку Pydantic
-                const errors = JSON.parse(errorMessage.substring(errorMessage.indexOf('[{')));
-                displayError = `Ошибка валидации (422): ${errors[0]?.msg || 'Неверные данные'}`;
-            } catch(e) { /* Оставляем как есть */ }
-        }
-        
-        ordersListDiv.innerHTML = `<p class="text-red-500 font-semibold">Ошибка загрузки заказов: ${displayError}</p>`;
+        console.error("!!! [Calculate Modal] Ошибка загрузки заказов:", error);
+        ordersListDiv.innerHTML = `<p class="text-red-500">Ошибка загрузки заказов: ${error.message}</p>`;
     }
 }
 
