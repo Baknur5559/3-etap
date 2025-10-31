@@ -52,6 +52,13 @@ class Location(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False) # "Главный офис", "Склад 1"
     address = Column(String, nullable=True)
+    
+    # --- НОВЫЕ ПОЛЯ ДЛЯ КОНТАКТОВ ФИЛИАЛА ---
+    phone = Column(String, nullable=True)
+    whatsapp_link = Column(String, nullable=True)
+    instagram_link = Column(String, nullable=True)
+    map_link = Column(String, nullable=True)
+    # --- КОНЕЦ НОВЫХ ПОЛЕЙ ---
 
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="locations")
