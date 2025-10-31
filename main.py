@@ -142,6 +142,7 @@ ORDER_STATUSES = ["В обработке", "Ожидает выкупа", "Вы�
 # --- 1. НАСТРОЙКА ---
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+#TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")#
 
 if not DATABASE_URL:
     raise RuntimeError("Не найден ключ DATABASE_URL в файле .env")
@@ -155,6 +156,8 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI(title="Cargo CRM API - Multi-Tenant")
 
+# --- 2. DEPENDENCIES (Аутентификация) ---
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # Разрешаем всем
@@ -163,7 +166,110 @@ app.add_middleware(
     allow_headers=["*"], # Разрешаем все заголовки (включая наш X-Employee-ID)
 )
 
-# --- 2. DEPENDENCIES (Аутентификация) ---
+# --- ФУНКЦИИ ДЛЯ TELEGRAM УВЕДОМЛЕНИЙ (Multi-Tenant) ---
+
+async def send_telegram_message(token: str, chat_id: str, text: str):
+    """Асинхронно отправляет сообщение в Telegram, используя КОНКРЕТНЫЙ токен."""
+    if not token:
+        print("WARNING: [Notification] Передан пустой токен. Уведомление не отправлено.")
+        return
+    try:
+        bot = telegram.Bot(token=token)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=True)
+        print(f"[Notification] Сообщение успешно отправлено в chat_id {chat_id}")
+    except Exception as e:
+        print(f"!!! ОШИБКА [Notification] при отправке в chat_id {chat_id} (токен ...{token[-4:]}): {e}")
+
+async def generate_and_send_notification(db: Session, client: Client, new_status: str, track_codes: List[str]):
+    """
+    (CORRECTED) Генерирует и отправляет уведомление,
+    самостоятельно находя токен компании из Настроек БД.
+    """
+    
+    if not client.telegram_chat_id:
+        print(f"[Notification] У клиента {client.id} не привязан Telegram. Отправка отменена.")
+        return
+
+    # 1. === НОВАЯ ЛОГИКА: Получаем токен из БД ===
+    token_setting = db.query(Setting).filter(
+        Setting.company_id == client.company_id,
+        Setting.key == 'telegram_bot_token' # Ключ, который ты задаешь в админке
+    ).first()
+
+    if not token_setting or not token_setting.value:
+        print(f"WARNING: [Notification] Не найден 'telegram_bot_token' в Настройках для компании ID {client.company_id}. Уведомление не отправлено.")
+        return
+    
+    bot_token = token_setting.value
+    # === КОНЕЦ НОВОЙ ЛОГИКИ ===
+
+    # 2. Форматируем список трек-кодов
+    track_codes_str = "\n".join([f"<code>{code}</code>" for code in track_codes])
+
+    # 3. Загружаем настройки компании (адрес, телефон)
+    settings_query = db.query(Setting).filter(Setting.company_id == client.company_id)
+    address_setting = settings_query.filter(Setting.key == 'bishkek_office_address').first()
+    phone_setting = settings_query.filter(Setting.key == 'contact_phone').first()
+    
+    address = address_setting.value if address_setting and address_setting.value else "Адрес не указан"
+    phone = phone_setting.value if phone_setting and phone_setting.value else "Телефон не указан"
+    
+    # 4. Генерируем ссылку на ЛК (пока заглушка)
+    lk_link_text = "" # TODO: Заменить на реальную ссылку ЛК
+
+    # 5. Собираем сообщение
+    message = f"Здравствуйте, <b>{client.full_name}</b>! 👋\n\n"
+
+    if new_status == "Готов к выдаче":
+        orders_in_db = db.query(Order).filter(
+            Order.client_id == client.id,
+            Order.track_code.in_(track_codes)
+        ).all()
+        
+        total_cost = sum(o.calculated_final_cost_som or 0 for o in orders_in_db)
+        total_weight = sum(o.calculated_weight_kg or 0 for o in orders_in_db)
+
+        cost_str = f"К оплате: <b>{total_cost:.2f} сом</b> 💰\n\n" if total_cost > 0 else ""
+        weight_str = f"Общий вес: <b>{total_weight:.3f} кг</b> ⚖️\n\n" if total_weight > 0 else ""
+
+        message += (
+            f"Ура! Ваши заказы прибыли!\n\n"
+            f"Посылки:\n{track_codes_str}\n\n"
+            f"✅ Статус: <b>{new_status}</b> ✅\n\n"
+            f"{weight_str}"
+            f"{cost_str}"
+            f"📍 Ждём вас по адресу:\n{address}\n\n"
+            f"📞 Телефон для связи:\n<code>{phone}</code>\n"
+            f"{lk_link_text}"
+        )
+    elif new_status == "В пути":
+        message += (
+            f"Ваши заказы уже в дороге! 🚚💨\n\n"
+            f"Статус отправлений:\n{track_codes_str}\n\n"
+            f"...изменился на: ➡️ <b>{new_status}</b>\n\n"
+            f"Ожидайте следующих обновлений! {lk_link_text}"
+        )
+    elif new_status == "На складе в КР":
+        message += (
+            f"Отличные новости! 🎉 Ваши заказы прибыли на наш склад в Кыргызстане!\n\n"
+            f"Статус посылок:\n{track_codes_str}\n\n"
+            f"...изменился на: 🇰🇬 <b>{new_status}</b>\n\n"
+            f"Скоро они будут готовы к выдаче! Мы сообщим 😉\n"
+            f"{lk_link_text}"
+        )
+    else: # Стандартное уведомление
+        message += (
+            f"Есть обновление по вашим заказам! 📄\n\n"
+            f"Новый статус для посылок:\n{track_codes_str}\n\n"
+            f"➡️ <b>{new_status}</b>\n\n"
+            f"{lk_link_text}"
+        )
+
+    # 6. Отправка (используя новую функцию send_telegram_message)
+    await send_telegram_message(token=bot_token, chat_id=client.telegram_chat_id, text=message)
+
+
+
 
 def get_db():
     db = SessionLocal()
@@ -280,13 +386,27 @@ class LoginResponse(BaseModel):
     company: Optional[dict] # {id, name, company_code}
 
 # --- Модели для Управления Персоналом (Владелец Компании) ---
-class LocationCreate(BaseModel):
+
+class LocationBase(BaseModel):
     name: str
     address: Optional[str] = None
+    phone: Optional[str] = None
+    whatsapp_link: Optional[str] = None
+    instagram_link: Optional[str] = None
+    map_link: Optional[str] = None
+
+class LocationCreate(LocationBase):
+    pass
+
 class LocationUpdate(BaseModel):
     name: Optional[str] = None
     address: Optional[str] = None
-class LocationOut(LocationCreate):
+    phone: Optional[str] = None
+    whatsapp_link: Optional[str] = None
+    instagram_link: Optional[str] = None
+    map_link: Optional[str] = None
+
+class LocationOut(LocationBase):
     id: int
     company_id: int
     class Config:
@@ -393,6 +513,17 @@ class ExpenseTypeOut(ExpenseTypeBase):
         orm_mode = True
 
 # === КОНЕЦ НОВЫХ МОДЕЛЕЙ ===
+
+# --- Модели для Настроек (Settings) ---
+class SettingOut(BaseModel):
+    key: str
+    value: Optional[str]
+    class Config:
+        orm_mode = True
+
+class SettingsUpdatePayload(BaseModel):
+    # Мы будем принимать словарь {key: value, ...}
+    settings: dict[str, Optional[str]]
 
 # main.py (Добавление новой модели)
 
@@ -1228,6 +1359,60 @@ def update_role_permissions(
     
     return {"status": "ok", "message": f"Доступы для должности '{role.name}' обновлены."}
 
+# --- Эндпоинты для Настроек (Владелец) ---
+
+@app.get("/api/settings", tags=["Настройки (Владелец)"], response_model=List[SettingOut])
+def get_company_settings(
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """Получает все настройки для ТЕКУЩЕЙ компании."""
+    settings = db.query(Setting).filter(
+        Setting.company_id == employee.company_id
+    ).all()
+    return settings
+
+@app.put("/api/settings", tags=["Настройки (Владелец)"], response_model=List[SettingOut])
+def update_company_settings(
+    payload: SettingsUpdatePayload,
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """Обновляет (создает или изменяет) настройки для ТЕКУЩЕЙ компании."""
+    
+    # Загружаем существующие настройки компании
+    existing_settings_db = db.query(Setting).filter(
+        Setting.company_id == employee.company_id
+    ).all()
+    
+    # Преобразуем в словарь для быстрого доступа
+    settings_map = {s.key: s for s in existing_settings_db}
+    
+    # Проходим по настройкам, которые прислал пользователь
+    for key, value in payload.settings.items():
+        if key in settings_map:
+            # Если настройка существует, обновляем
+            settings_map[key].value = value
+        else:
+            # Если настройка новая, создаем ее
+            new_setting = Setting(
+                key=key,
+                value=value,
+                company_id=employee.company_id
+            )
+            db.add(new_setting)
+    
+    try:
+        db.commit()
+        # Перезагружаем все настройки, чтобы вернуть актуальный список
+        updated_settings = db.query(Setting).filter(
+            Setting.company_id == employee.company_id
+        ).all()
+        return updated_settings
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения настроек: {e}")
+
 # === КОНЕЦ НОВОГО КОДА ===
 
 # === НАЧАЛО НОВОГО КОДА (КЛИЕНТЫ) ===
@@ -1787,7 +1972,7 @@ def get_orders(
     client_id: Optional[int] = Query(None), # ID клиента (от бота или фильтр в админке)
     # --- Остальные параметры фильтрации ---
     party_dates: Optional[List[date]] = Query(None),
-    statuses: Optional[List[str]] = Query(None),
+    statuses: Optional[List[str]] = Query(default=None),
     location_id: Optional[int] = Query(None),
     # --- ДОБАВЛЕНО: Пытаемся получить сотрудника из заголовка, НО НЕ ТРЕБУЕМ ---
     x_employee_id: Optional[str] = Header(None), # Получаем заголовок, если он есть
@@ -1977,13 +2162,13 @@ def create_order(
 # main.py (Полностью заменяет функцию update_order)
 
 @app.patch("/api/orders/{order_id}", tags=["Заказы (Владелец)"], response_model=OrderOut)
-async def update_order( # Добавляем async для будущих уведомлений, если понадобятся
+async def update_order( # Убедись, что 'async' здесь есть
     order_id: int,
-    payload: OrderUpdate, # Используем модель OrderUpdate, которая теперь включает location_id
-    employee: Employee = Depends(get_current_active_employee), # Используем общую зависимость
+    payload: OrderUpdate,
+    employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
-    """Обновляет данные заказа ТЕКУЩЕЙ компании, включая филиал (для Владельца)."""
+    """(С ИСПРАВЛЕНИЯМИ) Обновляет данные заказа и отправляет уведомление."""
     
     # 1. Находим заказ, проверяем принадлежность к компании
     order = db.query(Order).options(joinedload(Order.client)).filter( 
@@ -1993,44 +2178,40 @@ async def update_order( # Добавляем async для будущих уве�
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден в вашей компании.")
 
-    update_data = payload.dict(exclude_unset=True) # Берем только переданные поля
-    original_status = order.status # Запоминаем для возможных уведомлений
+    update_data = payload.dict(exclude_unset=True) 
+    original_status = order.status 
 
     # 2. Обработка изменения location_id (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА)
     if 'location_id' in update_data:
         if employee.role.name != 'Владелец':
-            # Обычный сотрудник не может менять филиал, удаляем поле из данных для обновления
             del update_data['location_id']  
             print(f"[Update Order] Сотрудник ID={employee.id} не может менять филиал заказа ID={order_id}.")
         elif update_data['location_id'] != order.location_id: 
-            # Владелец меняет филиал, проверяем, существует ли новый филиал в ЕГО компании
             new_location = db.query(Location).filter(
                 Location.id == update_data['location_id'],
-                Location.company_id == employee.company_id # Проверка принадлежности филиала
+                Location.company_id == employee.company_id
             ).first()
             if not new_location:
                 raise HTTPException(status_code=404, detail="Новый филиал не найден в вашей компании.")
             print(f"[Update Order] Владелец ID={employee.id} меняет филиал заказа ID={order_id} на ID={update_data['location_id']}")
-        # Если location_id передан, но совпадает со старым, ничего не делаем
 
     # 3. Обработка смены клиента (если client_id передан)
     if 'client_id' in update_data and update_data['client_id'] != order.client_id:
         new_client = db.query(Client).filter(
             Client.id == update_data['client_id'],
-            Client.company_id == employee.company_id # Проверяем принадлежность клиента
+            Client.company_id == employee.company_id
         ).first()
         if not new_client:
              raise HTTPException(status_code=404, detail="Новый клиент не найден в вашей компании.")
-        # SQLAlchemy обновит client_id автоматически при применении update_data
         print(f"[Update Order] Заказ ID={order_id} переносится на клиента ID={update_data['client_id']}")
 
     # 4. Проверка дубликата трек-кода при изменении
     if 'track_code' in update_data and update_data['track_code'] != order.track_code:
-        if not update_data['track_code'].startswith("PENDING-"): # Игнорируем PENDING-*
+        if not update_data['track_code'].startswith("PENDING-"):
              existing_order = db.query(Order).filter(
                  Order.track_code == update_data['track_code'],
                  Order.company_id == employee.company_id,
-                 Order.id != order_id # Исключаем текущий заказ
+                 Order.id != order_id 
              ).first()
              if existing_order:
                   raise HTTPException(status_code=400, detail=f"Другой заказ с трек-кодом '{update_data['track_code']}' уже существует.")
@@ -2044,19 +2225,31 @@ async def update_order( # Добавляем async для будущих уве�
         for key, value in update_data.items():
             setattr(order, key, value)
         
-        db.commit() # Сохраняем все изменения
-        db.refresh(order) # Обновляем объект из БД
-        db.refresh(order, attribute_names=['client']) # Обновляем связанные данные клиента для ответа
+        db.commit() 
+        db.refresh(order) 
+        db.refresh(order, attribute_names=['client']) 
 
-        # [ЗАМЕТКА]: Здесь можно добавить логику отправки уведомлений, если статус изменился
-        # if 'status' in update_data and update_data['status'] != original_status:
-        #     # ... код отправки уведомления ...
+        # --- НАЧАЛО: ИСПРАВЛЕННАЯ Логика уведомлений ---
+        if 'status' in update_data and update_data['status'] != original_status:
+            new_status = update_data['status']
+            # Проверяем, что у клиента есть chat_id и статус из списка "важных"
+            if order.client and order.client.telegram_chat_id and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
+                print(f"[Notification] Статус заказа {order.id} изменился на '{new_status}'. Вызов await generate_and_send_notification...")
+                # Прямой ВЫЗОВ (await), т.к. сессия db еще жива
+                await generate_and_send_notification(
+                        db=db, 
+                        client=order.client, 
+                        new_status=new_status, 
+                        track_codes=[order.track_code]
+                )
+            else:
+                print(f"[Notification] Уведомление для заказа {order.id} не отправлено (статус: '{new_status}', chat_id: {order.client.telegram_chat_id})")
+        # --- КОНЕЦ: ИСПРАВЛЕННАЯ Логика уведомлений ---
 
         print(f"[Update Order] Заказ ID={order_id} успешно обновлен.")
-        return order # Возвращаем обновленный заказ
-
+        return order 
     except Exception as e:
-        db.rollback() # Откатываем изменения при ошибке
+        db.rollback() 
         import traceback
         print(f"!!! Ошибка БД при обновлении заказа ID={order_id}:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных при обновлении заказа: {e}")
@@ -2109,16 +2302,18 @@ def get_order_parties(
 # Эндпоинт для массовых действий (смена статуса, даты, удаление)
 
 @app.post("/api/orders/bulk_action", tags=["Заказы (Владелец)"])
-async def bulk_order_action(
+async def bulk_order_action( # Убедись, что 'async' здесь есть
     payload: BulkActionPayload,
     employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db)
 ):
-    """Выполняет массовые действия над заказами ТЕКУЩЕЙ компании."""
+    """(С ИСПРАВЛЕНИЯМИ) Выполняет массовые действия и отправляет уведомления."""
+    
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для действия.")
 
     # 1. Проверка существования и принадлежности к компании
+    # Загружаем заказы СРАЗУ с клиентами
     query = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(payload.order_ids),
         Order.company_id == employee.company_id 
@@ -2131,42 +2326,69 @@ async def bulk_order_action(
     if len(found_ids_set) != len(requested_ids_set):
         missing_ids = list(requested_ids_set - found_ids_set)
         raise HTTPException(status_code=404, detail=f"Некоторые заказы не найдены в вашей компании: {missing_ids}")
-
-    # --- Обработка различных действий ---
-
+    
+    # --- Блок IF для 'update_status' ---
     if payload.action == 'update_status':
-        if not payload.new_status or payload.new_status not in ORDER_STATUSES:
+        new_status = payload.new_status
+        if not new_status or new_status not in ORDER_STATUSES:
             raise HTTPException(status_code=400, detail="Недопустимый статус для массового обновления.")
         
-        count = query.update({"status": payload.new_status}, synchronize_session='fetch')
+        # --- ИСПРАВЛЕННАЯ Логика уведомлений (Группировка) ---
+        notifications_to_send = {}
+        # Используем УЖЕ ЗАГРУЖЕННЫЕ 'orders_to_action'
+        for order in orders_to_action:
+            # Уведомляем, только если статус ДЕЙСТВИТЕЛЬНО меняется
+            if order.status != new_status and order.client and order.client.telegram_chat_id:
+                if order.client.id not in notifications_to_send:
+                    notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
+                notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
+        
+        print(f"[Notification] Найдено {len(notifications_to_send)} клиентов для массовой рассылки.")
+        # --- КОНЕЦ Группировки ---
+
+        # Теперь обновляем в базе
+        count = query.update({"status": new_status}, synchronize_session='fetch')
         db.commit()
 
-        # [NOTE]: Здесь должна быть асинхронная логика уведомлений, если она нужна.
+        # --- ИСПРАВЛЕННАЯ Отправка (ПОСЛЕ commit) ---
+        if notifications_to_send and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
+            print(f"[Notification] Запуск {len(notifications_to_send)} задач на отправку (await)...")
+            tasks = []
+            for client_id, data in notifications_to_send.items():
+                # Создаем задачи
+                tasks.append(
+                    generate_and_send_notification(
+                        db=db, # Сессия db еще жива
+                        client=data["client"], 
+                        new_status=new_status, 
+                        track_codes=data["track_codes"]
+                    )
+                )
+            # Ждем выполнения ВСЕХ задач по отправке
+            await asyncio.gather(*tasks)
+            print(f"[Notification] Все {len(tasks)} задач по отправке завершены.")
+        else:
+             print(f"[Notification] Массовая рассылка не требуется (статус: '{new_status}' или нет клиентов).")
+        # --- КОНЕЦ Отправки ---
 
-        return {"status": "ok", "message": f"Статус '{payload.new_status}' установлен для {count} заказов."}
+        return {"status": "ok", "message": f"Статус '{new_status}' установлен для {count} заказов."}
 
+    # --- Остальные 'elif' остаются без изменений ---
     elif payload.action == 'update_party_date':
-        # Требуем пароль Владельца для смены даты
         if not payload.password or employee.password != payload.password:
             raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения смены даты партии.")
         if not payload.new_party_date:
             raise HTTPException(status_code=400, detail="Не указана новая дата партии.")
-
         count = query.update({"party_date": payload.new_party_date}, synchronize_session='fetch') 
         db.commit()
         return {"status": "ok", "message": f"Дата партии обновлена для {count} заказов."}
 
-    # --- НОВАЯ ЛОГИКА: МАССОВЫЙ ВЫКУП ---
     elif payload.action == 'buyout':
         if not payload.buyout_actual_rate or payload.buyout_actual_rate <= 0:
             raise HTTPException(status_code=400, detail="Не указан корректный реальный курс выкупа.")
-            
-        # 2. Проверяем, что все выбранные заказы имеют статус "Ожидает выкупа"
         if not all(o.status == "Ожидает выкупа" for o in orders_to_action):
             raise HTTPException(status_code=400, detail="Массовый выкуп возможен только для заказов со статусом 'Ожидает выкупа'.")
-
         try:
-            # Обновляем статус, а также сохраняем реальный курс выкупа
             count = query.update({
                 "status": "Выкуплен", 
                 "buyout_actual_rate": payload.buyout_actual_rate
@@ -2176,16 +2398,11 @@ async def bulk_order_action(
         except Exception as e:
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Ошибка базы данных при массовом выкупе: {e}")
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
     elif payload.action == 'delete':
-        # Требуем пароль Владельца для удаления
         if not payload.password or employee.password != payload.password:
             raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения удаления.")
-
         ids_to_delete = [o.id for o in orders_to_action] 
-
-        # Удаление
         query_to_delete = db.query(Order).filter(Order.id.in_(ids_to_delete))
         count = query_to_delete.delete(synchronize_session=False) 
         db.commit()
@@ -2193,9 +2410,6 @@ async def bulk_order_action(
 
     else:
         raise HTTPException(status_code=400, detail="Неизвестное массовое действие.")
-
-# === КОНЕЦ ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ bulk_order_action ===
-
 # main.py (Полностью заменяет функцию bulk_import_orders)
 
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
@@ -3366,7 +3580,6 @@ def get_past_shift_report(
     report_data = calculate_shift_report_data(db, shift)
     return report_data
 
-
 # main.py (Полностью заменяет get_summary_report)
 
 @app.get("/api/reports/summary", tags=["Отчеты"]) # Убираем response_model, т.к. возвращаем словарь
@@ -4011,6 +4224,8 @@ def get_locations_for_bot(
     return locations
 
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
+
+# --- КОНЕЦ БЛОКА УВЕДОМЛЕНИЙ ---
 
 # --- 7. УТИЛИТЫ ---
 
