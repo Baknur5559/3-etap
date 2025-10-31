@@ -1,1094 +1,806 @@
-# bot_template.py (Полная ИСПРАВЛЕННАЯ версия 2 для Варианта 1)
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# bot_template.py (Версия для multi-location архитектуры)
 
 import os
-import httpx # Для HTTP-запросов к API
-import asyncio
-import logging
-import re # Для нормализации телефона
-import sys # Для аргументов командной строки
-import argparse # Для парсинга аргументов
-
-from typing import Optional, Dict, Any, List # Добавлен List для типизации
-from dotenv import load_dotenv # Необязательно, если параметры передаются через аргументы
-
-# Используем библиотеку python-telegram-bot
+import httpx  # Используется для API запросов (регистрация)
+import re     # Используется для очистки номера телефона
+from typing import Optional
+from sqlalchemy.orm import Session
+from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, filters, ContextTypes
-from telegram.constants import ParseMode # Для HTML в сообщениях
-
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
-# Настраиваем формат вывода логов и уровень (INFO - показывать информационные сообщения)
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
+    ContextTypes
 )
-# Уменьшаем количество логов от библиотеки httpx (показываем только предупреждения и ошибки)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-# Получаем логгер для нашего бота
-logger = logging.getLogger(__name__)
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, joinedload
 
-# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (будут установлены при запуске из аргументов) ---
-BOT_TOKEN: str = ""        # Токен Telegram бота для этой компании
-COMPANY_ID: int = 0        # ID компании, к которой привязан этот бот
-ADMIN_API_URL: str = ""    # URL основного бэкенда (FastAPI)
+# --- ИЗМЕНЕНИЕ 1: Импортируем Location и Setting ---
+# Теперь мы импортируем все модели, которые нам нужны
+from models import Client, Order, Location, Setting
 
-# --- ДОБАВЛЕНО: Статусы заказов (нужны для фильтрации) ---
-ORDER_STATUSES = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче", "Выдан"]
+# --- 1. НАСТРОЙКА ---
+# Загружаем переменные окружения из .env файла
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- Клавиатуры (Меню) ---
-# Клавиатура для ОБЫЧНОГО КЛИЕНТА
-client_main_menu_keyboard = [
+# URL твоего главного API (main.py)
+ADMIN_API_URL = os.getenv('ADMIN_API_URL')
+
+# Проверка, что все переменные окружения заданы
+if not TELEGRAM_BOT_TOKEN or not DATABASE_URL or not ADMIN_API_URL:
+    print("="*50)
+    print("КРИТИЧЕСКАЯ ОШИБКА: bot_template.py")
+    print("Не найдены переменные окружения: TELEGRAM_BOT_TOKEN, DATABASE_URL или ADMIN_API_URL.")
+    print("Убедитесь, что .env файл существует и содержит эти переменные.")
+    print("="*50)
+    exit()
+
+# Настройка подключения к базе данных
+engine = create_engine(DATABASE_URL, pool_recycle=1800, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- 2. Клавиатуры (Меню) ---
+main_menu_keyboard = [
     ["👤 Мой профиль", "📦 Мои заказы"],
     ["➕ Добавить заказ", "🇨🇳 Адреса складов"],
     ["🇰🇬 Наши контакты"]
 ]
-client_main_menu_markup = ReplyKeyboardMarkup(client_main_menu_keyboard, resize_keyboard=True)
+main_menu_markup = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True)
 
-# Клавиатура для ВЛАДЕЛЬЦА
-owner_main_menu_keyboard = [
-    ["👤 Мой профиль", "📦 Все Заказы"],
-    ["👥 Клиенты", "🏢 Филиалы"],
-    ["➕ Добавить заказ", "📢 Объявление"],
-    ["🇨🇳 Адреса складов", "🇰🇬 Наши контакты"]
-]
-owner_main_menu_markup = ReplyKeyboardMarkup(owner_main_menu_keyboard, resize_keyboard=True)
+# --- 3. Состояния для диалогов (ConversationHandler) ---
+# Определяем шаги для разных диалогов
+(
+    # Диалог добавления заказа
+    ADD_ORDER_TRACK_CODE,
+    ADD_ORDER_COMMENT,
+    ADD_ORDER_LOCATION, # Новый шаг для выбора филиала
 
-# --- Состояния для ConversationHandler'ов ---
-# Определяем числовые константы для каждого шага в диалогах
-# Диалог регистрации:
-ASK_PHONE, GET_NAME = range(2)
-# Диалог добавления заказа:
-CHOOSE_LOCATION, TRACK_CODE, COMMENT = range(2, 5) # Начинаем нумерацию с 2, чтобы не пересекаться
+    # Диалог регистрации
+    REGISTER_GET_NAME
+) = range(4) # Теперь 4 состояния
 
-# --- Функции-помощники ---
+# --- 4. Функции-помощники ---
+
+def get_db() -> Session:
+    """Создает сессию базы данных."""
+    return SessionLocal()
 
 def normalize_phone_number(phone_str: str) -> str:
-    """Очищает номер телефона от лишних символов и приводит к формату 996XXXXXXXXX."""
-    if not phone_str: return "" # Возвращаем пустую строку, если на входе пусто
-    # Удаляем все символы, кроме цифр
-    digits = "".join(filter(str.isdigit, phone_str))
-    # Логика нормализации для номеров Кыргызстана
-    if len(digits) == 12 and digits.startswith("996"):
-        return digits # Уже в нужном формате (996555123456)
-    if len(digits) == 10 and digits.startswith("0"):
-        return "996" + digits[1:] # Преобразуем 0555123456 -> 996555123456
-    if len(digits) == 9:
-        return "996" + digits # Преобразуем 555123456 -> 996555123456
-    # Если формат не распознан, логируем предупреждение и возвращаем пустую строку
-    logger.warning(f"Не удалось нормализовать номер: {phone_str} -> {digits}")
-    return ""
+    """Очищает номер телефона, оставляя только цифры в формате '996...'."""
+    if not phone_str:
+        return ""
+    # Удаляем все, кроме цифр
+    digits = re.sub(r'\D', '', phone_str)
+    
+    # Приводим к стандартному 9-значному формату (без 996 или 0)
+    if len(digits) == 12 and digits.startswith("996"): # 996555123456
+        return digits[3:] # 555123456
+    if len(digits) == 10 and digits.startswith("0"): # 0555123456
+        return digits[1:] # 555123456
+    if len(digits) == 9: # 555123456
+        return digits
+    
+    # Если формат неизвестен, возвращаем как есть (или пустую строку)
+    return digits
 
-# --- Функция для работы с API ---
-async def api_request(method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
+async def get_client_from_user_id(user_id: int, db: Session) -> Optional[Client]:
     """
-    Универсальная асинхронная функция для отправки запросов к API бэкенда.
-    Args:
-        method (str): HTTP метод ('GET', 'POST', 'PATCH', 'DELETE').
-        endpoint (str): Путь к API эндпоинту (начинается с '/api/...').
-        **kwargs: Дополнительные аргументы для httpx (json, params, data, headers).
-    Returns:
-        Optional[Dict[str, Any]]: Распарсенный JSON-ответ от API или None/словарь с ошибкой.
+    Быстро находит клиента в БД по его Telegram ID.
+    Возвращает объект Client или None, если не найден.
     """
-    global ADMIN_API_URL, COMPANY_ID # Используем глобальные переменные для URL и ID компании
-    # Проверяем, установлен ли URL API
-    if not ADMIN_API_URL:
-        logger.error("ADMIN_API_URL не установлен! Невозможно выполнить API запрос.")
-        return {"error": "URL API не настроен.", "status_code": 500}
-    # Формируем полный URL
-    url = f"{ADMIN_API_URL}{endpoint}"
+    return db.query(Client).filter(Client.telegram_chat_id == str(user_id)).first()
 
-    # --- Идентификация бота/компании на стороне API ---
-    # Добавляем company_id в параметры GET или тело POST/PATCH/PUT
-    if method.upper() == 'GET':
-        params = kwargs.get('params', {})
-        # Проверяем, что company_id еще не был добавлен вручную
-        if 'company_id' not in params:
-            params['company_id'] = COMPANY_ID
-        kwargs['params'] = params
-    elif method.upper() in ['POST', 'PATCH', 'PUT']:
-        json_data = kwargs.get('json') # Не используем .get() с default={}, чтобы можно было передать None
-        if json_data is not None: # Добавляем company_id, только если тело JSON передается
-            # Проверяем, что company_id еще не был добавлен вручную
-            if 'company_id' not in json_data:
-                json_data['company_id'] = COMPANY_ID
-            kwargs['json'] = json_data
-        # Если передается 'data' вместо 'json', предполагаем, что company_id там уже есть или не нужен
-    # --------------------------------------------------------------------
+# --- 5. Основные функции бота (обработчики команд и кнопок) ---
 
-    headers = kwargs.pop('headers', {'Content-Type': 'application/json'}) # Заголовки по умолчанию
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Обработчик команды /start."""
+    user = update.effective_user
+    db = get_db()
     try:
-        # Используем httpx.AsyncClient для асинхронных запросов
-        async with httpx.AsyncClient(timeout=15.0) as client: # Увеличен таймаут до 15 сек
-            # Логируем исходящий запрос
-            logger.debug(f"API Request: {method} {url} | Headers: {headers} | Data/Params: {kwargs}")
-            # Выполняем запрос
-            response = await client.request(method, url, headers=headers, **kwargs)
-            # Логируем ответ
-            logger.debug(f"API Response: {response.status_code} for {method} {url}")
+        # 1. Ищем клиента по Telegram ID
+        client = await get_client_from_user_id(user.id, db)
+        
+        if client:
+            # 2. Если клиент найден, приветствуем
+            await update.message.reply_html(
+                f"👋 Здравствуйте, <b>{client.full_name}</b>!\n\n"
+                "Рад вас снова видеть! Используйте меню ниже для навигации.",
+                reply_markup=main_menu_markup
+            )
+            return ConversationHandler.END # Завершаем диалог
+        else:
+            # 3. Если не найден, просим номер телефона
+            await update.message.reply_text(
+                "Здравствуйте! 🌟\n\n"
+                "Чтобы я мог вас узнать, пожалуйста, отправьте мне ваш номер телефона "
+                "(тот, который вы указывали при регистрации).",
+                reply_markup=ReplyKeyboardRemove() # Убираем клавиатуру
+            )
+            # Не завершаем диалог, ждем ответа (текста или имени)
+            return None 
+    finally:
+        db.close()
 
-            # Проверяем статус ответа, если >400, вызывается исключение HTTPStatusError
-            response.raise_for_status()
-
-            # Обработка успешного ответа
-            if response.status_code == 204: # No Content (например, для DELETE)
-                return {"status": "ok"} # Возвращаем условный успех
-
-            # Пытаемся декодировать JSON, если есть тело ответа
-            if response.content:
-                try:
-                    return response.json()
-                except Exception as json_err:
-                    logger.error(f"API Error: Failed to decode JSON response from {url}. Status: {response.status_code}. Content: {response.text[:200]}...", exc_info=True)
-                    return {"error": "Ошибка чтения ответа от сервера.", "status_code": 500}
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client) -> None:
+    """Показывает информацию о профиле клиента."""
+    
+    # Пытаемся сгенерировать ссылку на ЛК через API
+    lk_url = None
+    try:
+        # Используем httpx для асинхронного запроса к API
+        async with httpx.AsyncClient() as http_client:
+            # Используем POST, как указано в main.py
+            response = await http_client.post(f"{ADMIN_API_URL}/api/clients/{client.id}/generate_lk_link")
+            if response.status_code == 200:
+                lk_url = response.json().get("link")
             else:
-                 # Успешный ответ без тела
-                 return {"status": "ok"}
-
-    except httpx.HTTPStatusError as e:
-        # Ошибка от API (4xx, 5xx) - бэкенд вернул ошибку
-        error_detail = f"Ошибка API ({e.response.status_code})"
-        try:
-            # Пытаемся извлечь сообщение 'detail' из JSON-ответа ошибки
-            error_data = e.response.json()
-            error_detail = error_data.get("detail", str(error_data))
-        except Exception:
-            # Если ответ не JSON, берем текстовое содержимое или стандартное сообщение
-            error_detail = e.response.text or str(e)
-        logger.error(f"API Error ({e.response.status_code}) for {method} {url}: {error_detail}")
-        # Возвращаем словарь с ошибкой
-        return {"error": error_detail, "status_code": e.response.status_code}
-    except httpx.RequestError as e:
-        # Ошибка сети (недоступен сервер, таймаут DNS и т.д.)
-        logger.error(f"Network Error for {method} {url}: {e}")
-        return {"error": "Ошибка сети при обращении к серверу. Попробуйте позже.", "status_code": 503} # Service Unavailable
+                print(f"Ошибка API (generate_lk_link): {response.text}")
     except Exception as e:
-        # Любые другие неожиданные ошибки
-        logger.error(f"Unexpected Error during API request to {url}: {e}", exc_info=True) # Логируем полный traceback
-        return {"error": "Внутренняя ошибка бота при запросе к серверу.", "status_code": 500}
+        print(f"Ошибка при генерации ссылки на ЛК для клиента {client.id}: {e}")
 
-# bot_template.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ функцию start)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обработчик команды /start.
-    Проверяет, привязан ли Telegram пользователя к клиенту в ЭТОЙ компании через API.
-    Если да - показывает главное меню (клиента или владельца).
-    Если нет - запрашивает номер телефона.
-    Возвращает следующее состояние для ConversationHandler.
-    """
-    user = update.effective_user
-    chat_id = str(user.id) # ID чата пользователя
-    logger.info(f"Команда /start от пользователя {user.full_name} (ID: {chat_id}) для компании {COMPANY_ID}")
-
-    # Делаем запрос к API для идентификации пользователя по Chat ID
-    api_response = await api_request(
-        "POST",
-        "/api/bot/identify_user", # Эндпоинт, который мы создали в main.py
-        json={"telegram_chat_id": chat_id, "company_id": COMPANY_ID} # Отправляем ID чата и ID компании
+    # Формируем текст профиля
+    text = (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"<b>✨ ФИО:</b> {client.full_name}\n"
+        f"<b>📞 Телефон:</b> {client.phone}\n"
+        f"<b>⭐️ Ваш код:</b> {client.client_code_prefix or ''}{client.client_code_num or 'НЕ УКАЗАН'}\n\n"
+        f"<i>Пожалуйста, всегда указывайте этот код при оформлении заказов на наш склад.</i>"
     )
 
-    # Анализируем ответ API
-    if api_response and "error" not in api_response:
-        # Успех: API нашел клиента и вернул его данные
-        client_data = api_response.get("client")
-        is_owner = api_response.get("is_owner", False) # Получаем флаг Владельца
+    # Создаем кнопку, только если ссылка успешно получена
+    keyboard = []
+    if lk_url:
+        keyboard.append([InlineKeyboardButton("Перейти в Личный Кабинет (ЛК)", url=lk_url)])
 
-        # Проверка, что данные клиента получены
-        if not client_data or not client_data.get("id"):
-             logger.error(f"Ошибка API /api/bot/identify_user: Не получены данные клиента в успешном ответе. Ответ: {api_response}")
-             await update.message.reply_text("Произошла ошибка при получении данных вашего профиля. Попробуйте /start позже.", reply_markup=ReplyKeyboardRemove())
-             return ConversationHandler.END # Завершаем диалог при ошибке
-
-        # Сохраняем важные данные в user_data для использования в других функциях
-        context.user_data['client_id'] = client_data.get("id")
-        context.user_data['is_owner'] = is_owner
-        context.user_data['full_name'] = client_data.get("full_name")
-        logger.info(f"Пользователь {chat_id} идентифицирован как ClientID: {client_data.get('id')}, IsOwner: {is_owner}")
-
-        # Выбираем правильную клавиатуру
-        markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-        # Добавляем пометку для Владельца
-        role_text = " (Владелец)" if is_owner else ""
-        # Отправляем приветственное сообщение
-        await update.message.reply_html(
-            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас снова видеть! Используйте меню.",
-            reply_markup=markup
-        )
-        # Завершаем диалог, так как пользователь идентифицирован
-        return ConversationHandler.END
-    elif api_response and api_response.get("status_code") == 404:
-        # Ошибка 404 от API: Пользователь с таким Chat ID не найден в этой компании
-        logger.info(f"Пользователь {chat_id} не найден по Chat ID для компании {COMPANY_ID}. Запрашиваем телефон.")
-        # Просим пользователя отправить номер телефона
-        await update.message.reply_text(
-            "Здравствуйте! 🌟\n\nПохоже, мы еще не знакомы или ваш Telegram не привязан."
-            "\nПожалуйста, отправьте ваш номер телефона (тот, что вы использовали при регистрации в карго).",
-            # Добавляем кнопку "Отправить мой номер", которая запросит контакт у пользователя
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("📱 Отправить мой номер", request_contact=True)]], # request_contact=True - магия Telegram
-                resize_keyboard=True, one_time_keyboard=True # Клавиатура под размер, исчезает после нажатия
-            )
-        )
-        # Переходим в состояние ASK_PHONE, ожидая получения контакта
-        return ASK_PHONE
-    else:
-        # Любая другая ошибка API (500, 400 и т.д.) или ошибка сети
-        error_msg = api_response.get("error", "Неизвестная ошибка сервера.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове /api/bot/identify_user (Chat ID): {error_msg}")
-        # Сообщаем пользователю об ошибке
-        await update.message.reply_text(
-            f"Произошла ошибка при проверке ваших данных: {error_msg}\nПожалуйста, попробуйте позже, нажав /start.",
-            reply_markup=ReplyKeyboardRemove() # Убираем клавиатуру
-            )
-        # Завершаем диалог при ошибке
-        return ConversationHandler.END
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обработчик получения контакта (номера телефона) от пользователя.
-    Вызывается, когда пользователь нажимает кнопку "📱 Отправить мой номер".
-    Пытается найти клиента по номеру через API.
-    Если найден - привязывает Telegram и показывает меню.
-    Если не найден - предлагает зарегистрироваться, переходя в состояние GET_NAME.
-    Возвращает следующее состояние для ConversationHandler.
-    """
-    user = update.effective_user
-    chat_id = str(user.id)
-    contact = update.message.contact # Получаем объект контакта
-    # Проверяем, что контакт действительно получен
-    if not contact:
-        logger.warning(f"Сообщение от {chat_id} не содержит контакта, хотя ожидался.")
-        await update.message.reply_text("Не удалось получить ваш номер. Попробуйте еще раз.", reply_markup=ReplyKeyboardRemove())
-        return ASK_PHONE # Остаемся в состоянии ожидания телефона
-
-    phone_number = contact.phone_number
-    # Нормализуем номер к формату 996...
-    normalized_phone = normalize_phone_number(phone_number)
-    # Проверяем результат нормализации
-    if not normalized_phone:
-         await update.message.reply_text(f"Не удалось распознать номер телефона: {phone_number}. Попробуйте отправить его текстом (начиная с 0 или 996).", reply_markup=ReplyKeyboardRemove())
-         return ASK_PHONE # Остаемся в состоянии ожидания телефона
-
-    logger.info(f"Получен контакт от {user.full_name} (ID: {chat_id}): {phone_number} -> {normalized_phone}")
-
-    # Пытаемся найти или зарегистрировать клиента по НОМЕРУ ТЕЛЕФОНА через API
-    api_response = await api_request(
-        "POST",
-        "/api/bot/identify_user", # Используем тот же эндпоинт
-        json={"telegram_chat_id": chat_id, "phone_number": normalized_phone, "company_id": COMPANY_ID}
+    await update.message.reply_html(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else main_menu_markup
     )
 
-    # Анализируем ответ API
-    if api_response and "error" not in api_response:
-        # Успех: Клиент найден по номеру, API привязал Chat ID
-        client_data = api_response.get("client")
-        is_owner = api_response.get("is_owner", False)
-        # Проверка данных клиента
-        if not client_data or not client_data.get("id"):
-             logger.error(f"Ошибка API /api/bot/identify_user (Phone): Не получены данные клиента. Ответ: {api_response}")
-             await update.message.reply_text("Ошибка при получении данных профиля после привязки. Попробуйте /start.", reply_markup=ReplyKeyboardRemove())
-             return ConversationHandler.END
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client) -> None:
+    """Показывает список активных (не "Выдан") заказов клиента."""
+    db = get_db()
+    try:
+        # Загружаем клиента и все его заказы
+        client_with_orders = db.query(Client).options(
+            joinedload(Client.orders)
+        ).filter(Client.id == client.id).one()
+        
+        # Фильтруем только активные заказы
+        active_orders = [order for order in client_with_orders.orders if order.status != "Выдан"]
+        
+        if not active_orders:
+            await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=main_menu_markup)
+            return
 
-        # Сохраняем данные в user_data
-        context.user_data['client_id'] = client_data.get("id")
-        context.user_data['is_owner'] = is_owner
-        context.user_data['full_name'] = client_data.get("full_name")
-        logger.info(f"Пользователь {chat_id} успешно привязан к ClientID: {client_data.get('id')}, IsOwner: {is_owner}")
+        message = "📦 <b>Ваши текущие заказы:</b>\n\n"
+        # Сортируем (например, по дате создания, новые вверху)
+        for order in sorted(active_orders, key=lambda o: o.created_at, reverse=True):
+            message += f"<b>Трек:</b> <code>{order.track_code}</code>\n"
+            message += f"<b>Статус:</b> {order.status}\n"
+            if order.comment:
+                message += f"<b>Примечание:</b> {order.comment}\n"
+            message += "──────────────\n"
+            
+        await update.message.reply_html(message, reply_markup=main_menu_markup)
+    finally:
+        db.close()
 
-        # Выбираем и показываем меню
-        markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-        role_text = " (Владелец)" if is_owner else ""
-        await update.message.reply_html(
-            f"🎉 Отлично, <b>{client_data.get('full_name')}</b>{role_text}! Ваш аккаунт успешно привязан.\n\nИспользуйте меню.",
-            reply_markup=markup
+# --- ИЗМЕНЕНИЕ: Функция "Адреса складов" ---
+# Теперь она берет данные из БД (таблица settings)
+async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client, db: Session) -> None:
+    """Показывает адрес склада, подставляя код клиента."""
+    try:
+        # 1. Формируем код клиента
+        client_code = f"{client.client_code_prefix or ''}{client.client_code_num or 'ВАШ_КОД'}"
+        if client_code == 'ВАШ_КОД':
+             print(f"Внимание: У клиента {client.full_name} (ID: {client.id}) не настроен код клиента (prefix/num).")
+
+        # 2. Ищем настройку адреса в БД (для компании этого клиента)
+        address_setting = db.query(Setting).filter(
+            Setting.company_id == client.company_id,
+            Setting.key == 'china_warehouse_address' # Ключ, который ты вводишь в админке
+        ).first()
+
+        if not address_setting or not address_setting.value:
+            # Если настройка не найдена или пустая
+            raise Exception("Адрес склада не настроен в админ-панели (Настройки -> Адрес склада в Китае).")
+
+        # 3. Подставляем код клиента в шаблон адреса
+        # {{client_code}} будет заменен на реальный код
+        final_address_text = address_setting.value.replace("{{client_code}}", client_code)
+
+        # 4. Ищем PDF-инструкцию (необязательно)
+        pdf_setting = db.query(Setting).filter(
+            Setting.company_id == client.company_id,
+            Setting.key == 'instruction_pdf_link' # Ключ из админки
+        ).first()
+
+        # 5. Формируем сообщение
+        text = (
+            f"🇨🇳 <b>Адрес нашего склада в Китае</b>\n\n"
+            f"Используйте этот адрес для всех ваших покупок.\n"
+            f"<i>Обязательно скопируйте его полностью, вместе с вашим уникальным кодом <b>{client_code}</b>!</i>\n\n"
+            f"👇 Просто нажмите на адрес ниже, чтобы скопировать:\n\n"
+            f"<code>{final_address_text}</code>"
         )
-        # Успешно, завершаем диалог
-        return ConversationHandler.END
-    elif api_response and api_response.get("status_code") == 404:
-        # Ошибка 404 от API: Клиент с таким номером НЕ НАЙДЕН в этой компании
-        logger.info(f"Клиент с номером {normalized_phone} не найден для компании {COMPANY_ID}. Предлагаем регистрацию.")
-        # Сохраняем номер телефона для следующего шага регистрации
-        context.user_data['phone_to_register'] = normalized_phone
-        # Просим ввести имя
-        await update.message.reply_html( # Используем HTML для форматирования
-            f"Клиент с номером <code>{normalized_phone}</code> не найден. Хотите зарегистрироваться?\n\n"
-            "Отправьте ваше <b>полное имя (ФИО)</b>.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove() # Убираем кнопки
-        )
-        # Переходим в состояние GET_NAME, ожидая ввода имени
-        return GET_NAME
-    else:
-        # Любая другая ошибка API или сети
-        error_msg = api_response.get("error", "Неизвестная ошибка сервера.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове /api/bot/identify_user (Phone): {error_msg}")
+        
+        keyboard = []
+        if pdf_setting and pdf_setting.value:
+            keyboard.append([InlineKeyboardButton("📄 Скачать инструкцию (PDF)", url=pdf_setting.value)])
+        
+        await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else main_menu_markup)
+
+    except Exception as e:
+        print(f"Ошибка в china_addresses: {e}")
         await update.message.reply_text(
-            f"Произошла ошибка при проверке номера: {error_msg}\nПожалуйста, попробуйте позже, нажав /start.",
-            reply_markup=ReplyKeyboardRemove()
-            )
-        # Завершаем диалог при ошибке
-        return ConversationHandler.END
-
-async def register_via_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обработчик получения имени пользователя для регистрации.
-    Вызывается ConversationHandler'ом, когда бот находится в состоянии GET_NAME.
-    Отправляет запрос на создание клиента через API.
-    """
-    user = update.effective_user
-    chat_id = str(user.id)
-    full_name = update.message.text # Получаем введенное имя
-
-    # Получаем номер телефона, сохраненный на предыдущем шаге
-    phone_to_register = context.user_data.get('phone_to_register')
-    # Проверяем, есть ли номер (на всякий случай)
-    if not phone_to_register:
-        logger.error(f"Ошибка регистрации для {chat_id}: Не найден phone_to_register в user_data.")
-        await update.message.reply_text("Произошла внутренняя ошибка. Пожалуйста, попробуйте начать сначала с /start.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    # Простая валидация имени (не пустое)
-    if not full_name or len(full_name) < 2:
-         await update.message.reply_text("Пожалуйста, введите корректное полное имя (ФИО).")
-         return GET_NAME # Остаемся в состоянии ожидания имени
-
-    logger.info(f"Попытка регистрации нового клиента: Имя='{full_name}', Телефон='{phone_to_register}', Компания={COMPANY_ID}, ChatID={chat_id}")
-
-    # --- Вызываем API для СОЗДАНИЯ клиента ---
-    # Бэкенд сам сгенерирует код клиента и проверит дубликат телефона еще раз
-    api_response = await api_request(
-        "POST",
-        "/api/clients", # Используем стандартный эндпоинт создания клиента
-        json={
-            "full_name": full_name,
-            "phone": phone_to_register, # Передаем нормализованный номер
-            "company_id": COMPANY_ID,   # Передаем ID компании
-            "telegram_chat_id": chat_id # Сразу привязываем Telegram
-            # client_code_prefix и client_code_num не передаем, бэкенд сгенерирует
-        }
-    )
-
-    # Анализируем ответ API
-    if api_response and "error" not in api_response and "id" in api_response:
-        # Успех: Клиент создан
-        client_data = api_response # Ответ POST /api/clients - это созданный клиент
-        # Проверка полученных данных
-        if not client_data.get("id"):
-             logger.error(f"Ошибка API POST /api/clients: Не получен ID нового клиента. Ответ: {api_response}")
-             await update.message.reply_text("Ошибка сервера при регистрации. Попробуйте /start позже.", reply_markup=ReplyKeyboardRemove())
-             return ConversationHandler.END
-
-        # Сохраняем данные нового клиента в user_data
-        context.user_data['client_id'] = client_data.get("id")
-        context.user_data['is_owner'] = False # Новый клиент точно не Владелец
-        context.user_data['full_name'] = client_data.get("full_name")
-        # Очищаем временные данные регистрации
-        context.user_data.pop('phone_to_register', None)
-        logger.info(f"Новый клиент успешно зарегистрирован: ID={client_data.get('id')}")
-
-        # Отправляем сообщение об успехе
-        await update.message.reply_html(
-            f"✅ Регистрация успешна, <b>{full_name}</b>!\n\n"
-            f"Ваш код: <b>{client_data.get('client_code_prefix', '')}{client_data.get('client_code_num', '')}</b>\n\n"
-            "Теперь используйте меню.",
-            reply_markup=client_main_menu_markup # Показываем меню клиента
+            f"Произошла ошибка при получении адреса склада.\n"
+            f"Пожалуйста, убедитесь, что ваш профиль клиента (Префикс/Номер Кода) и настройки компании (Адрес склада) заполнены в админ-панели.",
+            reply_markup=main_menu_markup
         )
-        # Завершаем диалог
-        return ConversationHandler.END
-    else:
-        # Ошибка при создании клиента на бэкенде
-        error_msg = api_response.get("error", "Неизвестная ошибка регистрации.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове POST /api/clients для регистрации: {error_msg}")
-        await update.message.reply_text(
-            f"К сожалению, произошла ошибка при регистрации: {error_msg}\n"
-            "Возможно, клиент с таким телефоном уже существует. Попробуйте /start снова.",
-            reply_markup=ReplyKeyboardRemove()
+
+# --- ИЗМЕНЕНИЕ: Функция "Наши контакты" ---
+# Теперь она показывает выбор филиалов
+async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE, client: Client, db: Session) -> None:
+    """
+    Показывает контакты. 
+    Если филиал один - показывает сразу. 
+    Если филиалов несколько - предлагает выбор.
+    """
+    try:
+        # 1. Запрашиваем филиалы этой компании из БД
+        locations = db.query(Location).filter(
+            Location.company_id == client.company_id,
+            # (Можно добавить фильтр, если не все филиалы надо показывать)
+        ).order_by(Location.name).all() # Сортируем по имени
+
+        if not locations:
+            await update.message.reply_text("Ошибка: Не удалось найти контакты филиалов. Обратитесь к администратору.", reply_markup=main_menu_markup)
+            return
+
+        # 2. Если у компании только ОДИН филиал
+        if len(locations) == 1:
+            loc = locations[0]
+            text = f"🇰🇬 <b>{loc.name}</b>\n\n"
+            if loc.address:
+                text += f"📍 <b>Адрес:</b> {loc.address}\n"
+            if loc.phone:
+                text += f"📞 <b>Телефон:</b> <code>{loc.phone}</code>\n"
+            
+            keyboard = []
+            if loc.whatsapp_link:
+                keyboard.append([InlineKeyboardButton("💬 Написать в WhatsApp", url=loc.whatsapp_link)])
+            if loc.instagram_link:
+                keyboard.append([InlineKeyboardButton("📸 Наш Instagram", url=loc.instagram_link)])
+            if loc.map_link:
+                keyboard.append([InlineKeyboardButton("🗺️ Показать на карте", url=loc.map_link)])
+            
+            await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else main_menu_markup)
+
+        # 3. Если у компании НЕСКОЛЬКО филиалов
+        else:
+            keyboard = []
+            for loc in locations:
+                # Создаем кнопку с callback_data вида "loc_contact_{ID_ФИЛИАЛА}"
+                keyboard.append([InlineKeyboardButton(f"📍 {loc.name}", callback_data=f"loc_contact_{loc.id}")])
+            
+            await update.message.reply_text(
+                "🇰🇬 Пожалуйста, выберите филиал, чьи контакты вы хотите посмотреть:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        # Завершаем диалог при ошибке
-        return ConversationHandler.END
+            
+    except Exception as e:
+        print(f"Ошибка в bishkek_contacts: {e}")
+        await update.message.reply_text("Произошла ошибка при загрузке контактов.", reply_markup=main_menu_markup)
 
-# --- ОБРАБОТЧИКИ ДИАЛОГА ДОБАВЛЕНИЯ ЗАКАЗА ---
+# --- 6. Функции-Обработчики (Callbacks) для Инлайн-Кнопок ---
 
-async def add_order_start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Начало диалога добавления заказа: выбор филиала."""
-    client_id = context.user_data.get('client_id')
-    # Проверка, идентифицирован ли пользователь
-    if not client_id:
-        await update.message.reply_text("Ошибка: Сначала нужно идентифицироваться. Нажмите /start.")
-        return ConversationHandler.END # Завершаем, если клиент не найден
-
-    logger.info(f"Пользователь {client_id} начинает добавление заказа для компании {COMPANY_ID}.")
-
-    # Получаем список филиалов для текущей компании
-    api_response = await api_request("GET", "/api/locations", params={'company_id': COMPANY_ID})
-
-    # Проверяем ответ API
-    if not api_response or "error" in api_response or not isinstance(api_response, list) or not api_response:
-        error_msg = api_response.get("error", "Не удалось загрузить филиалы.") if api_response else "Нет ответа от сервера."
-        logger.error(f"Ошибка загрузки филиалов для company_id={COMPANY_ID}: {error_msg}")
-        await update.message.reply_text(f"Ошибка: {error_msg}")
-        return ConversationHandler.END # Завершаем при ошибке
-
-    locations = api_response # Список филиалов
-    # Сохраняем ID и имена филиалов в user_data для последующей проверки
-    context.user_data['available_locations'] = {loc['id']: loc['name'] for loc in locations}
-
-    # Создаем инлайн-клавиатуру с кнопками филиалов
-    keyboard = [
-        # Создаем по 2 кнопки в ряд для компактности
-        [InlineKeyboardButton(loc['name'], callback_data=f"loc_{loc['id']}") for loc in locations[i:i+2]]
-        for i in range(0, len(locations), 2)
-    ]
-    # Добавляем кнопку отмены в отдельный ряд
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_add_order")])
-
-    # Отправляем сообщение с запросом выбора филиала
-    await update.message.reply_text(
-        "Шаг 1/3: Выберите филиал, к которому относится заказ:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    # Переходим в состояние CHOOSE_LOCATION, ожидая нажатия инлайн-кнопки
-    return CHOOSE_LOCATION
-
-async def location_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора филиала (нажатие Inline кнопки)."""
-    query = update.callback_query # Получаем объект CallbackQuery
-    await query.answer() # Отвечаем на callback, чтобы убрать часики у кнопки
-
-    # Извлекаем ID филиала из callback_data (например, 'loc_7' -> '7')
-    location_id_str = query.data.split('_')[1]
+# --- НОВАЯ ФУНКЦИЯ: Обработчик нажатия на кнопку филиала ---
+async def location_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Срабатывает, когда пользователь нажимает на кнопку выбора филиала (loc_contact_ID).
+    """
+    query = update.callback_query
+    await query.answer() # Подтверждаем нажатие кнопки
 
     try:
-        chosen_location_id = int(location_id_str) # Преобразуем ID в число
-        # Проверяем, есть ли такой ID в списке доступных филиалов, сохраненном ранее
-        available_locations = context.user_data.get('available_locations', {})
-        if chosen_location_id not in available_locations:
-            logger.warning(f"Пользователь {update.effective_user.id} выбрал неверный location_id: {chosen_location_id}")
-            await query.edit_message_text(text="Ошибка: Выбран неверный филиал.")
-            return ConversationHandler.END # Завершаем при ошибке
+        # Извлекаем ID филиала из callback_data (например, "loc_contact_123")
+        location_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка: Неверный ID филиала.")
+        return
 
-        # Сохраняем выбранный ID филиала в user_data
-        context.user_data['chosen_location_id'] = chosen_location_id
-        # Получаем имя филиала для отображения
-        location_name = available_locations.get(chosen_location_id, f"ID {chosen_location_id}")
+    db = get_db()
+    try:
+        # Получаем клиента, чтобы проверить, что он из той же компании
+        client = await get_client_from_user_id(query.from_user.id, db)
+        if not client:
+            await query.edit_message_text("Ошибка: Ваш профиль не найден. Нажмите /start")
+            return
+        
+        # Находим филиал в БД
+        loc = db.query(Location).filter(
+            Location.id == location_id,
+            Location.company_id == client.company_id
+        ).first()
 
-        logger.info(f"Пользователь {update.effective_user.id} выбрал филиал {location_name} (ID: {chosen_location_id})")
+        if not loc:
+            await query.edit_message_text("Ошибка: Филиал не найден.")
+            return
+        
+        # Формируем сообщение (такое же, как для одного филиала)
+        text = f"🇰🇬 <b>{loc.name}</b>\n\n"
+        if loc.address:
+            text += f"📍 <b>Адрес:</b> {loc.address}\n"
+        if loc.phone:
+            text += f"📞 <b>Телефон:</b> <code>{loc.phone}</code>\n"
+        
+        keyboard = []
+        if loc.whatsapp_link:
+            keyboard.append([InlineKeyboardButton("💬 Написать в WhatsApp", url=loc.whatsapp_link)])
+        if loc.instagram_link:
+            keyboard.append([InlineKeyboardButton("📸 Наш Instagram", url=loc.instagram_link)])
+        if loc.map_link:
+            keyboard.append([InlineKeyboardButton("🗺️ Показать на карте", url=loc.map_link)])
+        
+        # Добавляем кнопку "Назад"
+        keyboard.append([InlineKeyboardButton("⬅️ Назад к выбору филиала", callback_data="loc_contact_back")])
 
-        # Редактируем исходное сообщение, убирая кнопки выбора филиалов
-        await query.edit_message_text(text=f"Филиал '{location_name}' выбран.")
-        # Отправляем НОВОЕ сообщение с запросом трек-кода и обычной клавиатурой "Отмена"
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Шаг 2/3: Теперь введите трек-код заказа:",
-            # Клавиатура только с кнопкой "Отмена"
-            reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True)
+        # Редактируем сообщение, показывая контакты
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
         )
-        # Переходим в состояние TRACK_CODE, ожидая ввода трек-кода
-        return TRACK_CODE
-    except (ValueError, IndexError, KeyError) as e: # Ловим ошибки парсинга или доступа к данным
-        logger.error(f"Ошибка обработки выбора филиала: {e}. Callback data: {query.data}", exc_info=True)
-        await query.edit_message_text(text="Произошла ошибка при выборе филиала. Попробуйте снова.")
-        return ConversationHandler.END # Завершаем при ошибке
+    except Exception as e:
+        print(f"Ошибка в location_contact_callback: {e}")
+        # Если не можем отредактировать, можем отправить новое сообщение
+        try:
+            await context.bot.send_message(query.from_user.id, "Произошла ошибка при показе контактов.")
+        except Exception:
+            pass
+    finally:
+        db.close()
 
-async def received_track_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получен трек-код от пользователя."""
-    track_code = update.message.text.strip() # Получаем текст и убираем пробелы
-    # Простая валидация (не пустой и минимальная длина)
-    if not track_code or len(track_code) < 3: # Пример минимальной длины - 3 символа
-        await update.message.reply_text("Трек-код кажется некорректным или слишком коротким. Попробуйте ввести еще раз:")
-        return TRACK_CODE # Остаемся в том же состоянии, ожидая повторного ввода
+# --- НОВАЯ ФУНКЦИЯ: Обработчик кнопки "Назад" ---
+async def location_contact_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Срабатывает, когда пользователь нажимает "Назад" (loc_contact_back).
+    Просто заново показывает список филиалов.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    db = get_db()
+    try:
+        client = await get_client_from_user_id(query.from_user.id, db)
+        if not client:
+            await query.edit_message_text("Ошибка: Ваш профиль не найден. Нажмите /start")
+            return
+        
+        # Заново получаем список филиалов
+        locations = db.query(Location).filter(Location.company_id == client.company_id).order_by(Location.name).all()
+        if not locations or len(locations) <= 1:
+             # Если филиалов вдруг не осталось или остался один, просто пишем
+             await query.edit_message_text("Ошибка: Не удалось найти список филиалов.", reply_markup=main_menu_markup)
+             return
 
-    # Сохраняем трек-код в user_data
-    context.user_data['track_code'] = track_code
-    logger.info(f"Пользователь {update.effective_user.id} ввел трек-код: {track_code}")
+        keyboard = []
+        for loc in locations:
+            keyboard.append([InlineKeyboardButton(f"📍 {loc.name}", callback_data=f"loc_contact_{loc.id}")])
+        
+        # Редактируем сообщение, снова показывая список
+        await query.edit_message_text(
+            "🇰🇬 Пожалуйста, выберите филиал, чьи контакты вы хотите посмотреть:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        print(f"Ошибка в location_contact_back_callback: {e}")
+    finally:
+        db.close()
 
-    # Создаем клавиатуру с опциями для комментария ("Пропустить", "Отмена")
-    keyboard = [
-        ["⏩ Пропустить"], # Кнопка Пропустить
-        ["Отмена"]       # Кнопка Отмена
-    ]
-    # Отправляем сообщение с запросом комментария
+
+# --- 7. Диалог добавления заказа (ConversationHandler) ---
+
+# Шаг 1: Нажата кнопка "Добавить заказ"
+async def add_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Начинает диалог добавления заказа, спрашивает филиал."""
+    db = get_db()
+    try:
+        client = await get_client_from_user_id(update.effective_user.id, db)
+        if not client:
+             await update.message.reply_text("Ошибка: Ваш профиль не найден. Нажмите /start", reply_markup=main_menu_markup)
+             return ConversationHandler.END
+
+        # Запрашиваем филиалы компании клиента
+        locations = db.query(Location).filter(Location.company_id == client.company_id).order_by(Location.name).all()
+
+        if not locations:
+            await update.message.reply_text("Ошибка: В вашей компании не настроено ни одного филиала. Добавление заказа невозможно.", reply_markup=main_menu_markup)
+            return ConversationHandler.END
+        
+        if len(locations) == 1:
+            # Если филиал один, не спрашиваем, а сразу сохраняем
+            context.user_data['location_id'] = locations[0].id
+            await update.message.reply_text(
+                f"📦 Ваш заказ будет добавлен в филиал: {locations[0].name}.\n\n"
+                "Пожалуйста, введите <b>трек-код</b> вашего нового заказа.",
+                reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True),
+                parse_mode='HTML'
+            )
+            return ADD_ORDER_TRACK_CODE # Переходим к вводу трек-кода
+        
+        else:
+            # Если филиалов несколько, предлагаем выбор
+            keyboard = [[KeyboardButton(loc.name)] for loc in locations]
+            keyboard.append([KeyboardButton("Отмена")])
+            
+            await update.message.reply_text(
+                "📦 Пожалуйста, выберите филиал, в который придет ваш заказ:",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            )
+            # Сохраняем список филиалов в user_data для проверки
+            context.user_data['locations_map'] = {loc.name: loc.id for loc in locations}
+            return ADD_ORDER_LOCATION # Переходим к выбору филиала
+
+    finally:
+        db.close()
+
+# Шаг 2 (Если филиалов > 1): Получен филиал
+async def add_order_received_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает название филиала, проверяет и сохраняет ID."""
+    location_name = update.message.text
+    locations_map = context.user_data.get('locations_map')
+
+    if not locations_map or location_name not in locations_map:
+        await update.message.reply_text(
+            "Пожалуйста, выберите филиал из предложенных кнопок.",
+            # (Можно отправить клавиатуру еще раз, если нужно)
+        )
+        return ADD_ORDER_LOCATION # Остаемся на этом же шаге
+
+    # Сохраняем ID филиала и удаляем карту из user_data
+    context.user_data['location_id'] = locations_map[location_name]
+    del context.user_data['locations_map']
+
     await update.message.reply_text(
-        "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
+        f"Отлично! Заказ будет добавлен в: {location_name}.\n\n"
+        "Теперь введите <b>трек-код</b>.",
+        reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True),
+        parse_mode='HTML'
+    )
+    return ADD_ORDER_TRACK_CODE # Переходим к следующему шагу
+
+# Шаг 3: Получен трек-код
+async def add_order_received_track_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает трек-код и спрашивает комментарий."""
+    track_code = update.message.text
+    if not track_code or len(track_code) < 3:
+        await update.message.reply_text(
+            "Это не похоже на трек-код. Пожалуйста, введите корректный трек-код.",
+            reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
+        )
+        return ADD_ORDER_TRACK_CODE # Остаемся на этом шаге
+        
+    context.user_data['track_code'] = track_code
+    
+    keyboard = [
+        [KeyboardButton("⏩ Пропустить")],
+        [KeyboardButton("Отмена")]
+    ]
+    await update.message.reply_text(
+        "Отлично! Теперь введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
-    # Переходим в состояние COMMENT, ожидая комментария или нажатия кнопки
-    return COMMENT
+    return ADD_ORDER_COMMENT # Переходим к следующему шагу
 
-async def skip_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Пользователь нажал 'Пропустить' на шаге ввода комментария."""
-    context.user_data['comment'] = None # Устанавливаем комментарий в None
-    logger.info(f"Пользователь {update.effective_user.id} пропустил ввод комментария.")
-    # Сразу вызываем функцию сохранения заказа
-    # save_order_from_bot сама завершит диалог (вернет ConversationHandler.END)
-    return await save_order_from_bot(update, context)
+# Шаг 4 (Финальный): Получен комментарий
+async def add_order_received_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает комментарий и сохраняет заказ."""
+    context.user_data['comment'] = update.message.text
+    await save_order_from_bot(update, context) # Вызываем функцию сохранения
+    return ConversationHandler.END # Завершаем диалог
 
-async def received_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получен комментарий от пользователя."""
-    comment = update.message.text # Получаем текст комментария
-    context.user_data['comment'] = comment # Сохраняем комментарий
-    logger.info(f"Пользователь {update.effective_user.id} ввел комментарий: {comment}")
-    # Сразу вызываем функцию сохранения заказа
-    # save_order_from_bot сама завершит диалог (вернет ConversationHandler.END)
-    return await save_order_from_bot(update, context)
+# Шаг 4 (Альтернативный): Комментарий пропущен
+async def add_order_skip_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пропускает комментарий и сохраняет заказ."""
+    context.user_data['comment'] = None
+    await save_order_from_bot(update, context) # Вызываем функцию сохранения
+    return ConversationHandler.END # Завершаем диалог
 
-async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет введенные данные заказа через API."""
-    # Получаем все необходимые данные из user_data
-    client_id = context.user_data.get('client_id')
-    location_id = context.user_data.get('chosen_location_id')
-    track_code = context.user_data.get('track_code')
-    comment = context.user_data.get('comment') # Может быть None
-    is_owner = context.user_data.get('is_owner', False)
-    # Определяем правильную клавиатуру для ответа
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
+# Функция сохранения заказа (вызывается из add_order_received_comment и add_order_skip_comment)
+async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Финальная функция, сохраняющая заказ в БД."""
+    db = get_db()
+    try:
+        client = await get_client_from_user_id(update.effective_user.id, db)
+        if not client:
+            await update.message.reply_text("Произошла ошибка, ваш профиль не найден. Попробуйте /start", reply_markup=main_menu_markup)
+            return
 
-    # Проверка на случай, если что-то пошло не так в диалоге и данных не хватает
-    if not all([client_id, location_id, track_code]):
-         await update.message.reply_text("Ошибка: Не хватает данных для сохранения заказа. Попробуйте добавить заказ снова.", reply_markup=markup)
-         logger.error(f"Ошибка сохранения заказа: Не хватает данных. client={client_id}, loc={location_id}, track={track_code}")
-         # Очищаем временные данные перед выходом
-         context.user_data.pop('chosen_location_id', None)
-         context.user_data.pop('track_code', None)
-         context.user_data.pop('comment', None)
-         context.user_data.pop('available_locations', None)
-         return ConversationHandler.END # Завершаем диалог с ошибкой
+        # Извлекаем все данные из user_data
+        track_code = context.user_data.get('track_code')
+        comment = context.user_data.get('comment')
+        location_id = context.user_data.get('location_id')
+        company_id = client.company_id
+        
+        if not track_code or not location_id or not company_id:
+             await update.message.reply_text("Произошла внутренняя ошибка (не найден трек-код или филиал). Попробуйте снова.", reply_markup=main_menu_markup)
+             return
 
-    # Формируем payload для отправки на эндпоинт POST /api/orders
-    payload = {
-        "client_id": client_id,
-        "location_id": location_id, # ID выбранного филиала
-        "track_code": track_code,
-        "comment": comment, # Комментарий (может быть null)
-        "purchase_type": "Доставка", # Заказы из бота - всегда Доставка
-        "company_id": COMPANY_ID # Передаем ID компании из глобальной переменной
-        # party_date бэкенд установит сам
-    }
-    logger.info(f"Отправка запроса на создание заказа: {payload}")
-    # Выполняем запрос к API
-    api_response = await api_request("POST", "/api/orders", json=payload)
-
-    # Анализируем ответ API
-    if api_response and "error" not in api_response and "id" in api_response:
-        # Успех: Заказ создан
-        order_data = api_response
-        logger.info(f"Заказ ID {order_data.get('id')} успешно создан для клиента {client_id}")
+        # --- Проверка на дубликат трек-кода в компании ---
+        existing_order = db.query(Order).filter(
+            Order.company_id == company_id,
+            Order.track_code == track_code
+        ).first()
+        
+        if existing_order:
+            await update.message.reply_html(
+                f"❗️ <b>Ошибка!</b>\n\n"
+                f"Заказ с трек-кодом <code>{track_code}</code> уже существует в системе.",
+                reply_markup=main_menu_markup
+            )
+            return
+        
+        # Создаем заказ
+        new_order = Order(
+            track_code=track_code,
+            comment=comment,
+            client_id=client.id,
+            company_id=company_id,
+            location_id=location_id,
+            purchase_type="Доставка", # Заказы из бота - всегда "Доставка"
+            status="В обработке"
+        )
+        db.add(new_order)
+        db.commit()
+        
         await update.message.reply_html(
             f"✅ Готово! Ваш заказ с трек-кодом <code>{track_code}</code> успешно добавлен.",
-            reply_markup=markup # Показываем основное меню
+            reply_markup=main_menu_markup
         )
-    else:
-        # Ошибка при создании заказа
-        error_msg = api_response.get("error", "Не удалось сохранить заказ.") if api_response else "Нет ответа от сервера."
-        logger.error(f"Ошибка сохранения заказа для клиента {client_id}: {error_msg}")
-        await update.message.reply_text(f"Ошибка сохранения заказа: {error_msg}", reply_markup=markup)
+    except Exception as e:
+        print(f"Ошибка в save_order_from_bot: {e}")
+        await update.message.reply_text("Произошла ошибка при сохранении заказа.", reply_markup=main_menu_markup)
+    finally:
+        context.user_data.clear() # Очищаем user_data
+        db.close()
 
-    # Очистка временных данных диалога добавления заказа
-    context.user_data.pop('chosen_location_id', None)
-    context.user_data.pop('track_code', None)
-    context.user_data.pop('comment', None)
-    context.user_data.pop('available_locations', None)
-    # Завершаем диалог
+# Отмена диалога
+async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отменяет любой диалог и возвращает в главное меню."""
+    await update.message.reply_text("Действие отменено.", reply_markup=main_menu_markup)
+    context.user_data.clear()
     return ConversationHandler.END
 
-# --- ОБРАБОТЧИК КОМАНД МЕНЮ (вне диалогов) ---
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка текстовых сообщений (команды меню). Запускается, если сообщение не было перехвачено диалогом."""
+
+# --- 8. Диалог Регистрации ---
+
+# Шаг 2 (Регистрация): Получено имя
+async def register_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает ФИО и регистрирует нового клиента."""
+    full_name = update.message.text
+    phone = context.user_data.get('phone_to_register')
+    user = update.effective_user
+
+    if not phone or not full_name:
+        await update.message.reply_text(
+            "Произошла ошибка (не найден телефон или имя). Попробуйте снова отправить /start и ваш номер телефона.",
+            reply_markup=main_menu_markup
+        )
+        return ConversationHandler.END
+
+    db = get_db()
+    try:
+        # --- ЗАПРОС К API ДЛЯ РЕГИСТРАЦИИ ---
+        # Мы НЕ создаем клиента в боте, мы просим API (main.py) его создать.
+        # Это гарантирует, что код клиента (client_code_num) будет сгенерирован правильно.
+        
+        payload = {
+            "full_name": full_name,
+            "phone": phone,
+            # (API сам назначит префикс по умолчанию, если нужно)
+        }
+        
+        new_client_data = None
+        async with httpx.AsyncClient() as http_client:
+            # Используем эндпоинт /api/clients (POST)
+            response = await http_client.post(f"{ADMIN_API_URL}/api/clients", json=payload)
+            
+            if response.status_code == 200:
+                new_client_data = response.json()
+            elif response.status_code == 400: # Дубликат телефона
+                error_data = response.json()
+                raise Exception(error_data.get("detail", "Клиент с таким телефоном уже существует."))
+            else: # Другие ошибки API
+                error_data = response.json()
+                raise Exception(error_data.get("detail", f"Неизвестная ошибка API (Статус {response.status_code})"))
+
+        if not new_client_data or 'id' not in new_client_data:
+            raise Exception("API не вернул данные нового клиента.")
+
+        # 2. Находим только что созданного клиента в БД, чтобы привязать Telegram ID
+        client_to_update = db.query(Client).filter(Client.id == new_client_data['id']).first()
+        if client_to_update:
+            client_to_update.telegram_chat_id = str(user.id)
+            db.commit()
+            
+            await update.message.reply_html(
+                f"✅ Регистрация прошла успешно, <b>{full_name}</b>!\n\n"
+                f"Ваш уникальный код клиента: <b>{client_to_update.client_code_prefix}{client_to_update.client_code_num}</b>\n\n"
+                "Теперь вы можете пользоваться всеми функциями бота.",
+                reply_markup=main_menu_markup
+            )
+        else:
+             raise Exception("Не удалось найти созданного клиента в БД для привязки Telegram.")
+            
+    except Exception as e:
+        print(f"Ошибка в register_get_name: {e}")
+        await update.message.reply_text(
+            f"Произошла ошибка при регистрации: {e}\n\n"
+            "Пожалуйста, попробуйте еще раз или свяжитесь с администратором.",
+            reply_markup=main_menu_markup
+        )
+    finally:
+        context.user_data.clear()
+        db.close()
+
+    return ConversationHandler.END
+
+
+# --- 9. Главный обработчик текстовых сообщений ---
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Обрабатывает все текстовые сообщения, которые не являются командами или частью диалога."""
     user = update.effective_user
     text = update.message.text
-    client_id = context.user_data.get('client_id')
-    is_owner = context.user_data.get('is_owner', False)
-    chat_id = update.effective_chat.id
-
-    # --- Проверка идентификации ---
-    if not client_id:
-        logger.warning(f"Сообщение '{text}' от неидентифицированного пользователя {chat_id}.")
-        await update.message.reply_text("Пожалуйста, сначала представьтесь. Нажмите /start.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    logger.info(f"Обработка команды меню от {user.full_name} (ClientID: {client_id}, IsOwner: {is_owner}): '{text}'")
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    # --- Обработка общих команд меню ---
-    if text == "👤 Мой профиль":
-        logger.info(f"Вызов функции profile для client_id={client_id}")
-        await profile(update, context)
-    elif text == "📦 Мои заказы" and not is_owner: # "Мои заказы" только для клиента
-        logger.info(f"Вызов функции my_orders для client_id={client_id}")
-        await my_orders(update, context)
-    # Команда "➕ Добавить заказ" обрабатывается ConversationHandler'ом, поэтому здесь ее нет
-    elif text == "🇨🇳 Адреса складов":
-        logger.info(f"Вызов функции china_addresses для client_id={client_id}")
-        await china_addresses(update, context)
-    elif text == "🇰🇬 Наши контакты":
-        logger.info(f"Вызов функции bishkek_contacts для company_id={COMPANY_ID}")
-        await bishkek_contacts(update, context)
-
-    # --- Обработка команд меню Владельца ---
-    elif is_owner:
-        if text == "📦 Все Заказы":
-             logger.info(f"Вызов функции owner_all_orders для company_id={COMPANY_ID}")
-             await owner_all_orders(update, context)
-        elif text == "👥 Клиенты":
-             logger.info(f"Вызов функции owner_clients для company_id={COMPANY_ID}")
-             await owner_clients(update, context)
-        elif text == "🏢 Филиалы":
-             logger.info(f"Вызов функции owner_locations для company_id={COMPANY_ID}")
-             await owner_locations(update, context)
-        elif text == "📢 Объявление":
-             logger.info(f"Вызов функции owner_broadcast_start для company_id={COMPANY_ID}")
-             await owner_broadcast_start(update, context)
-        # Если команда Владельца не распознана
-        else:
-             logger.warning(f"Неизвестная команда Владельца: '{text}' от {client_id}")
-             await update.message.reply_text("Неизвестная команда.", reply_markup=markup)
-
-    # --- Обработка неизвестных команд для клиента ---
-    else:
-        logger.warning(f"Неизвестная команда Клиента: '{text}' от {client_id}")
-        await update.message.reply_text("Неизвестная команда. Пожалуйста, используйте кнопки меню.", reply_markup=markup)
-
-# --- РЕАЛИЗАЦИЯ ФУНКЦИЙ-ЗАГЛУШЕК (с await) ---
-# bot_template.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ функцию profile)
-
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает профиль клиента (или владельца), запрашивая данные через API."""
-    user = update.effective_user
-    chat_id = str(user.id)
-    client_id = context.user_data.get('client_id')
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    if not client_id:
-        logger.warning(f"Попытка вызова profile без client_id для chat_id={chat_id}")
-        await update.message.reply_text("Ошибка: Не удалось определить ваш профиль. Попробуйте /start.", reply_markup=markup)
-        return
-
-    logger.info(f"Запрос профиля для клиента {client_id}")
-    await update.message.reply_text("Загрузка данных профиля...", reply_markup=markup) # Сообщение о загрузке
-
-    # --- Шаг 1: Запрос данных клиента ---
-    api_response_client = await api_request("GET", f"/api/clients/{client_id}", params={'company_id': COMPANY_ID})
-
-    if not api_response_client or "error" in api_response_client:
-        error_msg = api_response_client.get("error", "Не удалось загрузить профиль.") if api_response_client else "Нет ответа от сервера."
-        logger.error(f"Ошибка API при запросе профиля клиента {client_id}: {error_msg}")
-        # --- ИЗМЕНЕНИЕ: Отправляем ошибку и выходим ---
-        await update.message.reply_text(f"Ошибка загрузки профиля: {error_msg}")
-        return # Выходим при ошибке
-
-    client = api_response_client # Данные клиента получены
-
-    # --- Шаг 2: Формирование и отправка текста профиля ---
-    role_text = " (Владелец)" if is_owner else ""
-    text = (
-        f"👤 <b>Ваш профиль</b>{role_text}\n\n"
-        f"<b>✨ ФИО:</b> {client.get('full_name', '?')}\n"
-        f"<b>📞 Телефон:</b> {client.get('phone', '?')}\n"
-        f"<b>⭐️ Ваш код:</b> {client.get('client_code_prefix', '')}{client.get('client_code_num', 'Нет кода')}\n"
-        f"<b>📊 Статус:</b> {client.get('status', 'Розница')}\n"
-        f"\n<i>Используйте код при оформлении заказов на склад.</i>"
-    )
-    # Отправляем основной текст профиля БЕЗ инлайн-кнопки пока
-    await update.message.reply_html(text, reply_markup=markup) # Отправляем с основной клавиатурой
-    logger.info(f"Профиль для клиента {client_id} отправлен.")
-
-    # --- Шаг 3: ОТДЕЛЬНЫЙ Запрос ссылки на ЛК ---
-    logger.info(f"Запрос ссылки ЛК для клиента {client_id}")
-    # Передаем company_id в теле POST, так как GET не сработал (?)
-    api_response_link = await api_request("POST", f"/api/clients/{client_id}/generate_lk_link", json={'company_id': COMPANY_ID})
-    lk_url = None
-    if api_response_link and "error" not in api_response_link:
-        lk_url = api_response_link.get("link")
-        logger.info(f"Ссылка ЛК для клиента {client_id} получена: {lk_url}")
-    else:
-        error_msg_link = api_response_link.get("error", "Нет ответа") if api_response_link else "Нет ответа"
-        logger.warning(f"Не удалось сгенерировать ссылку на ЛК для клиента {client_id}: {error_msg_link} (Статус: {api_response_link.get('status_code') if api_response_link else 'N/A'})")
-        # Сообщать об ошибке генерации ЛК пользователю необязательно
-
-    # --- Шаг 4: Отправка инлайн-кнопки ЛК (если ссылка есть) ОТДЕЛЬНЫМ сообщением ---
-    if lk_url:
-        keyboard = [[InlineKeyboardButton("Перейти в Личный Кабинет", url=lk_url)]]
-        reply_markup_inline = InlineKeyboardMarkup(keyboard)
-        # Отправляем сообщение только с кнопкой
-        await update.message.reply_text("Ссылка на ваш Личный Кабинет:", reply_markup=reply_markup_inline)
-        logger.info(f"Кнопка ЛК отправлена клиенту {client_id}")
-
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает активные заказы ОБЫЧНОГО КЛИЕНТА, запрашивая данные через API."""
-    user = update.effective_user
-    chat_id = str(user.id)
-    client_id = context.user_data.get('client_id')
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    # Эта функция только для обычных клиентов
-    if is_owner:
-        logger.warning(f"Владелец {client_id} попытался вызвать 'Мои заказы' вместо 'Все заказы'.")
-        await update.message.reply_text("Для просмотра всех заказов компании используйте кнопку '📦 Все Заказы'.", reply_markup=markup)
-        return
-    if not client_id:
-        logger.warning(f"Попытка вызова my_orders без client_id для chat_id={chat_id}")
-        await update.message.reply_text("Ошибка: Не удалось определить ваш профиль. Попробуйте /start.", reply_markup=markup)
-        return
-
-    logger.info(f"Запрос 'Мои заказы' для клиента {client_id}")
-    await update.message.reply_text("Загрузка ваших активных заказов...", reply_markup=markup)
-
-    # --- Запрос активных заказов клиента ---
-    # Формируем параметры: ID клиента и все статусы, кроме "Выдан"
-    params = {'client_id': client_id}
-    # Передаем список статусов в параметрах URL
-    statuses_param = [s for s in ORDER_STATUSES if s != "Выдан"]
-    # Добавляем company_id
-    params['company_id'] = COMPANY_ID
-
-    # Выполняем GET запрос к /api/orders
-    # Передаем статусы как отдельные параметры ?statuses=Статус1&statuses=Статус2...
-    api_response = await api_request("GET", "/api/orders", params={'client_id': client_id, 'statuses': statuses_param, 'company_id': COMPANY_ID})
-
-    # Проверяем ответ API
-    if not api_response or "error" in api_response or not isinstance(api_response, list):
-        error_msg = api_response.get("error", "Не удалось загрузить заказы.") if api_response else "Нет ответа от сервера."
-        logger.error(f"Ошибка API при запросе заказов клиента {client_id}: {error_msg}")
-        await update.message.reply_text(f"Ошибка: {error_msg}")
-        return
-
-    active_orders = api_response # Ответ - это список заказов
-
-    if not active_orders:
-        await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=markup)
-        return
-
-    # --- Формирование сообщения со списком заказов ---
-    message = "📦 <b>Ваши текущие заказы:</b>\n\n"
-    # Сортируем по ID (или дате создания), новые вверху
-    for order in sorted(active_orders, key=lambda o: o.get('id', 0), reverse=True):
-        message += f"<b>Трек:</b> <code>{order.get('track_code', '?')}</code>\n"
-        message += f"<b>Статус:</b> {order.get('status', '?')}\n"
-        comment = order.get('comment')
-        if comment:
-            # Экранируем HTML-символы в комментарии на всякий случай
-            import html
-            message += f"<b>Примечание:</b> {html.escape(comment)}\n"
-
-        # Добавим вес и стоимость, если они рассчитаны
-        calc_weight = order.get('calculated_weight_kg')
-        calc_cost = order.get('calculated_final_cost_som')
-        if calc_weight is not None and calc_cost is not None:
-             message += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
-
-        message += "──────────────\n"
-
-    # Ограничение длины сообщения Telegram (4096 символов)
-    if len(message) > 4000:
-         message = message[:4000] + "\n... (список слишком длинный)"
-
-    # Отправляем сообщение
-    await update.message.reply_html(message, reply_markup=markup)
-    logger.info(f"Список активных заказов ({len(active_orders)}) отправлен клиенту {client_id}")
-
-# bot_template.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ china_addresses)
-
-async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает адрес склада в Китае, подставляя код клиента и добавляя кнопку инструкции."""
-    user = update.effective_user
-    chat_id = str(user.id)
-    client_id = context.user_data.get('client_id')
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    if not client_id:
-        await update.message.reply_text("Ошибка: Не удалось определить профиль.", reply_markup=markup)
-        return
-
-    logger.info(f"Запрос адреса склада Китая для клиента {client_id}")
-    processing_message = await update.message.reply_text("Загрузка адреса склада...", reply_markup=markup)
-
-    client_unique_code = "ВАШ_КОД" # Значение по умолчанию
-    address_text_template = "Адрес склада не настроен в системе."
-    instruction_link = None # Ссылка на PDF
+    db = get_db()
 
     try:
-        # --- Запрос 1: Данные клиента (для кода) ---
-        api_response_client = await api_request("GET", f"/api/clients/{client_id}", params={'company_id': COMPANY_ID})
-        if api_response_client and "error" not in api_response_client:
-            client = api_response_client
-            client_code_num = client.get('client_code_num')
-            client_code_prefix = client.get('client_code_prefix', 'PREFIX')
-            if client_code_num:
-                client_unique_code = f"{client_code_prefix}-{client_code_num}" # Используем дефис для читаемости
-            logger.info(f"Код клиента {client_id} получен: {client_unique_code}")
-        else:
-            logger.warning(f"Не удалось получить данные клиента {client_id} для кода.")
-
-        # --- Запрос 2: Адрес склада И ССЫЛКА НА ИНСТРУКЦИЮ из настроек ---
-        keys_to_fetch = ['china_warehouse_address', 'address_instruction_pdf_link'] # Запрашиваем оба ключа
-        api_response_settings = await api_request("GET", "/api/settings", params={'company_id': COMPANY_ID, 'keys': keys_to_fetch})
-
-        if api_response_settings and "error" not in api_response_settings and isinstance(api_response_settings, list):
-            settings_dict = {s.get('key'): s.get('value') for s in api_response_settings}
-            logger.info(f"Настройки адреса/инструкции для компании {COMPANY_ID} получены: {settings_dict}")
-
-            # Извлекаем адрес
-            address_value = settings_dict.get('china_warehouse_address')
-            if address_value:
-                address_text_template = address_value
+        # 1. Проверяем, привязан ли уже пользователь
+        client_already_linked = await get_client_from_user_id(user.id, db)
+        
+        if client_already_linked:
+            # --- Если пользователь привязан, обрабатываем кнопки меню ---
+            if text == "👤 Мой профиль":
+                await profile(update, context, client_already_linked)
+            elif text == "📦 Мои заказы":
+                await my_orders(update, context, client_already_linked)
+            elif text == "🇨🇳 Адреса складов":
+                # --- ИЗМЕНЕНИЕ ---
+                await china_addresses(update, context, client_already_linked, db)
+            elif text == "🇰🇬 Наши контакты":
+                # --- ИЗМЕНЕНИЕ ---
+                await bishkek_contacts(update, context, client_already_linked, db)
             else:
-                logger.warning(f"Настройка 'china_warehouse_address' не найдена или пуста для компании {COMPANY_ID}.")
+                # Ответ на неизвестный текст
+                await update.message.reply_text(
+                    "Я не понимаю эту команду. Пожалуйста, используйте кнопки меню.",
+                    reply_markup=main_menu_markup
+                )
+            return ConversationHandler.END # Завершаем диалог (на всякий случай)
 
-            # Извлекаем ссылку на инструкцию
-            instruction_link = settings_dict.get('address_instruction_pdf_link')
-            if instruction_link:
-                 logger.info(f"Ссылка на инструкцию найдена: {instruction_link}")
-            else:
-                 logger.info(f"Ссылка на инструкцию ('address_instruction_pdf_link') не найдена для компании {COMPANY_ID}.")
+        # --- Если пользователь НЕ привязан, пытаемся его найти или зарегистрировать ---
+        
+        # 2. Пытаемся распознать текст как номер телефона
+        normalized_phone = normalize_phone_number(text)
+        
+        if not normalized_phone or len(normalized_phone) < 9:
+            # Текст не похож на телефон
+            await update.message.reply_text(
+                "Неверный формат номера. Попробуйте еще раз (например, 0555123456 или 996555123456)."
+            )
+            return None # Остаемся в ожидании
 
+        # 3. Ищем клиента по очищенному номеру
+        client_found = db.query(Client).filter(Client.phone == normalized_phone).first()
+        
+        if client_found:
+            # --- Клиент НАЙДЕН ---
+            if client_found.telegram_chat_id:
+                # ... но уже привязан к другому Telegram
+                await update.message.reply_text(
+                    "Этот номер телефона уже привязан к другому Telegram-аккаунту. "
+                    "Если это ошибка, обратитесь к администратору."
+                )
+                return ConversationHandler.END
+            
+            # Привязываем Telegram ID к найденному клиенту
+            client_found.telegram_chat_id = str(user.id)
+            db.commit()
+            
+            await update.message.reply_html(
+                f"🎉 Отлично, <b>{client_found.full_name}</b>! Ваш аккаунт успешно привязан.\n\n"
+                "Теперь вы можете пользоваться всеми функциями. Используйте меню ниже 👇",
+                reply_markup=main_menu_markup
+            )
+            return ConversationHandler.END
+        
         else:
-            error_msg = api_response_settings.get("error", "Нет ответа") if isinstance(api_response_settings, dict) else "Неверный формат ответа"
-            logger.warning(f"Не удалось получить адрес/инструкцию для компании {COMPANY_ID} из API: {error_msg}")
-
-        # --- Формирование и отправка сообщения ---
-        # Подставляем код клиента в шаблон адреса
-        address_text = address_text_template.replace("{{client_code}}", client_unique_code).replace("{client_code}", client_unique_code)
-
-        # Формируем текст сообщения
-        text = (
-            f"🇨🇳 <b>Адрес склада в Китае</b>\n\n"
-            f"Используйте этот адрес для ваших покупок.\n\n"
-            # --- УЛУЧШЕННЫЙ ТЕКСТ ---
-            f"❗️ Ваш уникальный код: <pre>{client_unique_code}</pre>\n" # Выделяем код
-            f"<i>Обязательно указывайте его ПОЛНОСТЬЮ при оформлении заказа!</i>\n\n"
-            f"👇 Нажмите на адрес ниже, чтобы скопировать:\n\n"
-            f"<code>{address_text}</code>" # Адрес для копирования
-        )
-
-        # --- Создание инлайн-кнопки для инструкции ---
-        inline_keyboard = []
-        if instruction_link:
-            # Добавляем кнопку, если ссылка есть
-            inline_keyboard.append([InlineKeyboardButton("📄 Инструкция по заполнению адреса", url=instruction_link)])
-
-        reply_markup_inline = InlineKeyboardMarkup(inline_keyboard) if inline_keyboard else None
-
-        # Удаляем сообщение "Загрузка..."
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=processing_message.message_id)
-        except Exception as del_err:
-             logger.warning(f"Не удалось удалить сообщение 'Загрузка...': {del_err}")
-
-        # Отправляем итоговое сообщение с адресом и кнопкой (если есть)
-        await update.message.reply_html(text, reply_markup=reply_markup_inline)
-
-        # Отправляем основное меню, если была инлайн-кнопка
-        if reply_markup_inline:
-            await update.message.reply_text("Используйте основное меню:", reply_markup=markup)
+            # --- Клиент НЕ НАЙДЕН ---
+            # Начинаем регистрацию
+            context.user_data['phone_to_register'] = normalized_phone
+            await update.message.reply_text(
+                f"Клиент с номером {text} не найден. Хотите зарегистрироваться?\n\n"
+                "Пожалуйста, отправьте ваше полное имя (ФИО), чтобы мы могли вас записать."
+            )
+            return REGISTER_GET_NAME # Переходим в состояние ожидания имени
 
     except Exception as e:
-        logger.error(f"Неожиданная ошибка в china_addresses для клиента {client_id}: {e}", exc_info=True)
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=processing_message.message_id)
-        except: pass
-        await update.message.reply_text("Произошла ошибка при получении адреса склада.", reply_markup=markup)
+        print(f"Ошибка в handle_text_message: {e}")
+        await update.message.reply_text("Произошла неизвестная ошибка. Попробуйте /start", reply_markup=main_menu_markup)
+        return ConversationHandler.END
+    finally:
+        db.close()
 
-# bot_template.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ bishkek_contacts)
 
-async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает контакты офиса в Бишкеке, запрашивая данные через API."""
-    user = update.effective_user
-    chat_id = str(user.id)
-    client_id = context.user_data.get('client_id')
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
+# --- 10. Запуск Бота ---
 
-    logger.info(f"Запрос контактов Бишкека для компании {COMPANY_ID}")
-    processing_message = await update.message.reply_text("Загрузка контактов...", reply_markup=markup)
-
-    # Значения по умолчанию
-    address = "Адрес не указан"
-    phone = "Телефон не указан"
-    whatsapp_link = None
-    instagram_link = None
-    map_link = None
-
-    try:
-        # --- Запрос контактов из настроек API ---
-        keys_to_fetch = ['bishkek_office_address', 'contact_phone', 'whatsapp_link', 'instagram_link', 'map_link']
-        api_response_settings = await api_request("GET", "/api/settings", params={'company_id': COMPANY_ID, 'keys': keys_to_fetch})
-
-        if api_response_settings and "error" not in api_response_settings and isinstance(api_response_settings, list):
-            settings_dict = {s.get('key'): s.get('value') for s in api_response_settings}
-            logger.info(f"Настройки контактов для компании {COMPANY_ID} получены: {settings_dict}")
-            address = settings_dict.get('bishkek_office_address') or address
-            phone = settings_dict.get('contact_phone') or phone
-            whatsapp_link = settings_dict.get('whatsapp_link')
-            instagram_link = settings_dict.get('instagram_link')
-            map_link = settings_dict.get('map_link')
-        else:
-            error_msg = api_response_settings.get("error", "Нет ответа") if isinstance(api_response_settings, dict) else "Неверный формат ответа"
-            logger.warning(f"Не удалось получить контакты для компании {COMPANY_ID} из API: {error_msg}")
-
-        # --- Формирование текста ---
-        text = (
-            "🇰🇬 <b>Наши контакты в Бишкеке</b>\n\n"
-            f"📍 <b>Адрес:</b>\n{address}\n\n"
-            f"📞 <b>Телефон:</b>\n<code>{phone}</code> (нажмите для копирования)"
-        )
-
-        # --- Создание инлайн-кнопок ---
-        keyboard = []
-        if whatsapp_link: keyboard.append([InlineKeyboardButton("💬 WhatsApp", url=whatsapp_link)])
-        if instagram_link: keyboard.append([InlineKeyboardButton("📸 Instagram", url=instagram_link)])
-        if map_link: keyboard.append([InlineKeyboardButton("🗺️ Карта", url=map_link)])
-
-        # --- Отправка сообщения ---
-        reply_markup_inline = InlineKeyboardMarkup(keyboard) if keyboard else None
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=processing_message.message_id)
-        except Exception as del_err: logger.warning(f"Не удалось удалить сообщение 'Загрузка...': {del_err}")
-        await update.message.reply_html(text, reply_markup=reply_markup_inline)
-        if reply_markup_inline: await update.message.reply_text("Используйте основное меню:", reply_markup=markup)
-        logger.info(f"Контакты Бишкека отправлены пользователю {chat_id}")
-
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка в bishkek_contacts для компании {COMPANY_ID}: {e}", exc_info=True)
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=processing_message.message_id)
-        except: pass
-        await update.message.reply_text("Произошла ошибка при получении контактов.", reply_markup=markup)
-
-# --- Функции-заглушки для Владельца (с await) ---
-async def owner_all_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     logger.info(f"Запрос Владельца 'Все Заказы' для компании {COMPANY_ID}")
-     # TODO: Запрос к API GET /api/orders (без client_id, но с company_id)
-     await update.message.reply_text("Функция 'Все Заказы' (Владелец) в разработке.") # Используем await
-
-async def owner_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     logger.info(f"Запрос Владельца 'Клиенты' для компании {COMPANY_ID}")
-     # TODO: Запрос к API GET /api/clients (с company_id)
-     await update.message.reply_text("Функция 'Клиенты' (Владелец) в разработке.") # Используем await
-
-async def owner_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     logger.info(f"Запрос Владельца 'Филиалы' для компании {COMPANY_ID}")
-     # TODO: Запрос к API GET /api/locations (с company_id)
-     await update.message.reply_text("Функция 'Филиалы' (Владелец) в разработке.") # Используем await
-
-async def owner_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     logger.info(f"Запрос Владельца 'Сделать объявление' для компании {COMPANY_ID}")
-     # TODO: Запустить диалог для создания объявления
-     await update.message.reply_text("Функция 'Сделать объявление' (Владелец) в разработке.") # Используем await
-
-# --- ОТМЕНА ДИАЛОГА ---
-async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена любого диалога ConversationHandler."""
-    user = update.effective_user
-    logger.info(f"Пользователь {user.id} отменил диалог.")
-    # Определяем правильную клавиатуру для возврата в главное меню
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    message_text = "Действие отменено."
-
-    # Если отмена пришла из инлайн-кнопки (CallbackQuery)
-    if update.callback_query:
-        await update.callback_query.answer() # Отвечаем на callback
-        try:
-            # Пытаемся отредактировать сообщение, убрав инлайн-клавиатуру
-            await update.callback_query.edit_message_text(message_text, reply_markup=None)
-        except Exception as e:
-            # Если не получилось (сообщение старое), просто логируем
-            logger.warning(f"Не удалось отредактировать сообщение при отмене callback'а: {e}")
-        # В любом случае отправляем новое сообщение с основной клавиатурой
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Возврат в главное меню.", reply_markup=markup)
-    else: # Если отмена пришла как текстовое сообщение "Отмена" или команда /cancel
-        await update.message.reply_text(message_text, reply_markup=markup)
-
-    # Очищаем ВСЕ временные данные диалогов из user_data, чтобы избежать проблем
-    keys_to_clear = ['chosen_location_id', 'track_code', 'comment', 'phone_to_register', 'available_locations']
-    for key in keys_to_clear:
-        context.user_data.pop(key, None)
-    # Можно добавить очистку других ключей, если они используются в будущих диалогах
-    logger.debug(f"User data очищен после отмены для пользователя {user.id}")
-
-    # Завершаем диалог
-    return ConversationHandler.END
-
-# --- Основная функция запуска бота ---
 def main() -> None:
-    """Запуск бота с параметрами из командной строки."""
-    global BOT_TOKEN, COMPANY_ID, ADMIN_API_URL # Объявляем, что будем устанавливать глобальные переменные
+    """Главная функция запуска бота."""
+    
+    print("Запуск бота...")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # --- Парсинг аргументов командной строки ---
-    parser = argparse.ArgumentParser(description=f"Telegram Bot for Cargo CRM Company")
-    parser.add_argument("--token", required=True, help="Telegram Bot Token")
-    parser.add_argument("--company-id", required=True, type=int, help="Company ID this bot belongs to")
-    parser.add_argument("--api-url", required=True, help="URL of the main Cargo CRM API (e.g., http://127.0.0.1:8000)")
-    try:
-        args = parser.parse_args()
-        BOT_TOKEN = args.token
-        COMPANY_ID = args.company_id
-        ADMIN_API_URL = args.api_url.rstrip('/') # Убираем слэш в конце URL
-    except SystemExit:
-         logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Не переданы аргументы --token, --company-id, --api-url.")
-         sys.exit(1) # Завершаем работу
-    # --- Конец парсинга ---
-
-    logger.info(f"--- Запуск бота для Компании ID: {COMPANY_ID} ---")
-    logger.info(f"API URL: {ADMIN_API_URL}")
-
-    # Создание экземпляра приложения Telegram
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # --- Определение ConversationHandler'ов ---
-
-    # Диалог Регистрации/Идентификации
-    registration_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)], # Начинается с команды /start
+    # --- Диалог добавления заказа ---
+    add_order_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^➕ Добавить заказ$'), add_order_start)],
         states={
-            ASK_PHONE: [MessageHandler(filters.CONTACT, handle_contact)], # Ожидаем контакт
-            GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_via_name)], # Ожидаем имя
+            ADD_ORDER_LOCATION: [
+                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_order_received_location)
+            ],
+            ADD_ORDER_TRACK_CODE: [
+                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_order_received_track_code)
+            ],
+            ADD_ORDER_COMMENT: [
+                MessageHandler(filters.Regex('^⏩ Пропустить$'), add_order_skip_comment),
+                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_order_received_comment)
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel_dialog), MessageHandler(filters.Regex('^Отмена$'), cancel_dialog)],
-        per_user=True, per_chat=True, name="registration", persistent=False,
     )
-
-    # Диалог Добавления Заказа
-    add_order_conv = ConversationHandler(
-        # Точка входа: текстовое сообщение "➕ Добавить заказ"
-        entry_points=[MessageHandler(filters.Regex('^➕ Добавить заказ$'), add_order_start_conv)],
+    
+    # --- Диалог регистрации / обработки телефона ---
+    registration_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+        ],
         states={
-            CHOOSE_LOCATION: [CallbackQueryHandler(location_chosen, pattern='^loc_')], # Выбор филиала
-            TRACK_CODE: [
-                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog), # Отмена
-                MessageHandler(filters.TEXT & ~filters.COMMAND, received_track_code) # Ввод трек-кода
-                ],
-            COMMENT: [
-                MessageHandler(filters.Regex('^⏩ Пропустить$'), skip_comment), # Пропуск комментария
-                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),       # Отмена
-                MessageHandler(filters.TEXT & ~filters.COMMAND, received_comment) # Ввод комментария
+            REGISTER_GET_NAME: [
+                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, register_get_name)
             ],
         },
         fallbacks=[
-             CommandHandler('cancel', cancel_dialog), # Команда /cancel
-             MessageHandler(filters.Regex('^Отмена$'), cancel_dialog), # Текст "Отмена"
-             CallbackQueryHandler(cancel_dialog, pattern='^cancel_add_order$') # Инлайн-кнопка отмены
+            CommandHandler('cancel', cancel_dialog),
+            MessageHandler(filters.Regex('^Отмена$'), cancel_dialog)
         ],
-        per_user=True, per_chat=True, name="add_order", persistent=False,
     )
 
-    # --- Добавление обработчиков в приложение ---
-    # Сначала добавляем обработчики диалогов, они имеют приоритет
-    application.add_handler(registration_conv)
+# Регистрируем СНАЧАЛА диалоги (более конкретные, как "Добавить заказ")
     application.add_handler(add_order_conv)
+    
+    # Регистрируем ПОТОМ /start и общий текст (менее конкретные)
+    application.add_handler(registration_conv)
 
-    # Затем добавляем обработчик для ВСЕХ ОСТАЛЬНЫХ текстовых сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    # Регистрируем обработчики инлайн-кнопок (они не конфликтуют)
+    application.add_handler(CallbackQueryHandler(location_contact_callback, pattern=r'^loc_contact_\d+$'))
+    application.add_handler(CallbackQueryHandler(location_contact_back_callback, pattern=r'^loc_contact_back$'))
 
-    # Обработчик команды /cancel вне диалогов
-    application.add_handler(CommandHandler('cancel', cancel_dialog))
-
-    # Запуск бота
-    logger.info("Бот готов к работе и запускает опрос...")
+    print(f"Бот {ADMIN_API_URL} запущен и готов к работе...")
     application.run_polling()
-    logger.info("Бот остановлен.")
 
-# Точка входа при запуске скрипта: python bot_template.py ...
 if __name__ == "__main__":
     main()
