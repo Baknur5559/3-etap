@@ -3,7 +3,7 @@
 import os
 from datetime import date, datetime, time, timedelta
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, func, or_, String, cast, Date as SQLDate
 from sqlalchemy.orm import sessionmaker, Session, joinedload
@@ -282,6 +282,24 @@ def get_current_company_employee(employee: Employee = Depends(get_current_active
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Это действие доступно только сотрудникам компании.")
     return employee
+
+
+# --- НОВАЯ ЗАВИСИМОСТЬ: Для управления Клиентами ---
+def get_client_manager(employee: Employee = Depends(get_current_active_employee)):
+    """
+    Проверяет, что сотрудник (не SuperAdmin) принадлежит компании
+    И имеет право 'manage_clients'.
+    """
+    if employee.company_id is None:
+        raise HTTPException(status_code=403, detail="Это действие доступно только сотрудникам компании.")
+
+    # Проверяем, есть ли у него нужные права
+    permissions = {p.codename for p in employee.role.permissions}
+    if 'manage_clients' not in permissions:
+         raise HTTPException(status_code=403, detail="У вас нет прав на управление клиентами.")
+
+    return employee
+# --- КОНЕЦ НОВОЙ ЗАВИСИМОСТИ ---
 
 
 # --- 3. Pydantic МОДЕЛИ ---
@@ -1412,7 +1430,7 @@ class BotIdentifyPayload(BaseModel):
 
 @app.get("/api/clients", tags=["Клиенты (Владелец)"], response_model=List[ClientOut])
 def get_clients(
-    employee: Employee = Depends(get_current_company_employee), # Проверка прав владельца
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Получает ВСЕХ клиентов ТЕКУЩЕЙ компании."""
@@ -1426,7 +1444,7 @@ def get_clients(
 @app.post("/api/clients", tags=["Клиенты (Владелец)"], response_model=ClientOut)
 def create_client(
     payload: ClientCreate,
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     # Проверка на дубликат телефона ВНУТРИ компании
@@ -1466,7 +1484,7 @@ def create_client(
 def update_client(
     client_id: int,
     payload: ClientUpdate,
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Обновляет данные клиента ТЕКУЩЕЙ компании."""
@@ -1499,7 +1517,7 @@ def update_client(
 @app.delete("/api/clients/{client_id}", tags=["Клиенты (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
 def delete_client(
     client_id: int,
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Удаляет клиента ТЕКУЩЕЙ компании."""
@@ -1530,7 +1548,7 @@ def delete_client(
 @app.get("/api/clients/search", tags=["Клиенты (Владелец)"], response_model=List[ClientOut])
 def search_clients(
     q: str = Query(..., min_length=1), # Запрос должен быть не пустым
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Ищет клиентов по имени, телефону или коду ВНУТРИ ТЕКУЩЕЙ компании."""
@@ -1551,7 +1569,7 @@ def search_clients(
 @app.post("/api/clients/{client_id}/generate_lk_link", tags=["Клиенты (Владелец)"], response_model=GenerateLKLinkResponse)
 def generate_lk_link_for_client(
     client_id: int,
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Генерирует ссылку на личный кабинет для клиента ТЕКУЩЕЙ компании."""
@@ -1589,7 +1607,7 @@ class BulkImportResponse(BaseModel):
 @app.post("/api/clients/bulk_import", tags=["Клиенты (Владелец)"], response_model=BulkImportResponse)
 def bulk_import_clients(
     clients_data: List[BulkClientItem], # FastAPI автоматически распарсит JSON-массив
-    employee: Employee = Depends(get_company_owner),
+    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
     db: Session = Depends(get_db)
 ):
     """Массовый импорт клиентов из списка (например, из Excel) для ТЕКУЩЕЙ компании."""
@@ -1806,7 +1824,7 @@ class OrderUpdate(BaseModel):
 class OrderOut(OrderBase):
     id: int
     company_id: int
-    client: ClientOut # Вложенная модель клиента
+    client: Optional[ClientOut] = None # Вложенная модель (ТЕПЕРЬ ОПЦИОНАЛЬНО)
     created_at: datetime
     issued_at: Optional[datetime] # Поля для выданных
     weight_kg: Optional[float]
@@ -1835,14 +1853,14 @@ class BulkOrderImportPayload(BaseModel):
 
 # Используется для смены статуса, даты, удаления
 class BulkActionPayload(BaseModel):
-    action: str # 'update_status', 'update_party_date', 'delete', 'buyout', 'revert'
+    action: str # 'update_status', 'update_party_date', 'delete', 'buyout', 'revert', 'assign_client'
     order_ids: List[int]
     # Опциональные поля в зависимости от action
     new_status: Optional[str] = None
     new_party_date: Optional[date] = None
     buyout_actual_rate: Optional[float] = None
-    # Добавляем пароль для опасных операций (удаление, смена даты)
     password: Optional[str] = None # Будем проверять пароль Владельца
+    client_id: Optional[int] = None # <-- ДОБАВЛЕНО: Для назначения клиента
 
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
@@ -1872,7 +1890,8 @@ class IssuePayload(BaseModel):
 
 @app.get("/api/orders", tags=["Заказы (Владелец)", "Telegram Bot"], response_model=List[OrderOut])
 def get_orders(
-    company_id: int = Query(...), 
+    company_id: int = Query(...),
+    unclaimed_only: Optional[bool] = Query(False), 
     client_id: Optional[int] = Query(None), 
     
     # --- НОВОЕ: Добавлен поиск и лимит ---
@@ -1974,6 +1993,13 @@ def get_orders(
     # Фильтр по филиалу (если он был определен для сотрудника/Владельца)
     if target_location_id is not None:
         query = query.filter(Order.location_id == target_location_id)
+
+    # --- НОВЫЙ ФИЛЬТР "НЕВОСТРЕБОВАННЫЕ" ---
+    if unclaimed_only:
+        # Ищем заказы БЕЗ клиента (client_id is NULL)
+        query = query.filter(Order.client_id == None) 
+        print(f"[Get Orders] Применен фильтр 'Только невостребованные'")
+    # --- КОНЕЦ ФИЛЬТРА ---
 
     # Фильтр по датам партий
     if party_dates:
@@ -2232,13 +2258,14 @@ def get_order_parties(
 # Эндпоинт для массовых действий (смена статуса, даты, удаление)
 
 @app.post("/api/orders/bulk_action", tags=["Заказы (Владелец)"])
-async def bulk_order_action( # Убедись, что 'async' здесь есть
+def bulk_order_action(
     payload: BulkActionPayload,
+    background_tasks: BackgroundTasks, # <-- ИЗМЕНЕНО (убран async, добавлен tasks)
     employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db)
 ):
     """(С ИСПРАВЛЕНИЯМИ) Выполняет массовые действия и отправляет уведомления."""
-    
+
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для действия.")
 
@@ -2256,33 +2283,30 @@ async def bulk_order_action( # Убедись, что 'async' здесь ест�
     if len(found_ids_set) != len(requested_ids_set):
         missing_ids = list(requested_ids_set - found_ids_set)
         raise HTTPException(status_code=404, detail=f"Некоторые заказы не найдены в вашей компании: {missing_ids}")
-    
+
     # --- Блок IF для 'update_status' ---
     if payload.action == 'update_status':
         new_status = payload.new_status
         if not new_status or new_status not in ORDER_STATUSES:
             raise HTTPException(status_code=400, detail="Недопустимый статус для массового обновления.")
-        
-        # --- ИСПРАВЛЕННАЯ Логика уведомлений (Группировка) ---
+
+        # --- Логика уведомлений (Группировка) ---
         notifications_to_send = {}
-        # Используем УЖЕ ЗАГРУЖЕННЫЕ 'orders_to_action'
         for order in orders_to_action:
-            # Уведомляем, только если статус ДЕЙСТВИТЕЛЬНО меняется
             if order.status != new_status and order.client and order.client.telegram_chat_id:
                 if order.client.id not in notifications_to_send:
                     notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
                 notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
-        
+
         print(f"[Notification] Найдено {len(notifications_to_send)} клиентов для массовой рассылки.")
         # --- КОНЕЦ Группировки ---
 
-        # Теперь обновляем в базе
         count = query.update({"status": new_status}, synchronize_session='fetch')
         db.commit()
 
-        # --- ИСПРАВЛЕННАЯ Отправка (ПОСЛЕ commit) ---
+        # --- Отправка (ПОСЛЕ commit) ---
         if notifications_to_send and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
-            print(f"[Notification] Запуск {len(notifications_to_send)} задач на отправку (await)...")
+            print(f"[Notification] Запуск {len(notifications_to_send)} задач на отправку...")
             tasks = []
             for client_id, data in notifications_to_send.items():
                 # Создаем задачи
@@ -2293,16 +2317,17 @@ async def bulk_order_action( # Убедись, что 'async' здесь ест�
                         track_codes=data["track_codes"]
                     )
                 )
-            # Ждем выполнения ВСЕХ задач по отправке
-            await asyncio.gather(*tasks)
-            print(f"[Notification] Все {len(tasks)} задач по отправке завершены.")
+            # ИСПОЛЬЗУЕМ BACKGROUND_TASKS для асинхронной отправки из синхронной функции
+            for task in tasks:
+                background_tasks.add_task(asyncio.run, task) # (Простой способ запустить async из sync)
+            print(f"[Notification] Все {len(tasks)} задач по отправке добавлены в фон.")
         else:
              print(f"[Notification] Массовая рассылка не требуется (статус: '{new_status}' или нет клиентов).")
         # --- КОНЕЦ Отправки ---
 
         return {"status": "ok", "message": f"Статус '{new_status}' установлен для {count} заказов."}
 
-    # --- Остальные 'elif' остаются без изменений ---
+    # --- Остальные 'elif' ---
     elif payload.action == 'update_party_date':
         if not payload.password or employee.password != payload.password:
             raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения смены даты партии.")
@@ -2328,6 +2353,46 @@ async def bulk_order_action( # Убедись, что 'async' здесь ест�
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Ошибка базы данных при массовом выкупе: {e}")
 
+    # --- НАШ НОВЫЙ БЛОК 'assign_client' ---
+    elif payload.action == 'assign_client':
+        new_client_id = payload.client_id
+
+        # Получаем статус из payload
+        new_status = payload.new_status
+        if not new_status or new_status not in ORDER_STATUSES or new_status == "Выдан":
+            # Если статус не передан или некорректен, ставим "В пути" по умолчанию
+            new_status = "В пути" 
+
+        if not new_client_id:
+            raise HTTPException(status_code=400, detail="Не указан ID клиента для назначения.")
+
+        client = db.query(Client).filter(Client.id == new_client_id, Client.company_id == employee.company_id).first()
+        if not client:
+            raise HTTPException(status_code=404, detail="Клиент, которому вы пытаетесь назначить заказ, не найден.")
+
+        for order in orders_to_action:
+            if order.client_id is not None:
+                raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} уже назначен клиенту ID {order.client_id}.")
+
+        # Назначаем клиента И меняем статус на ВЫБРАННЫЙ
+        count = query.update(
+            {"client_id": new_client_id, "status": new_status}, 
+            synchronize_session='fetch'
+        )
+        db.commit()
+
+        # Отправляем уведомление новому клиенту в фоне
+        track_codes = [o.track_code for o in orders_to_action]
+        background_tasks.add_task(
+            generate_and_send_notification,
+            client=client,
+            new_status=new_status, # <-- Используем new_status
+            track_codes=track_codes
+        )
+
+        return {"status": "ok", "message": f"{count} заказов успешно назначены клиенту {client.full_name} (статус '{new_status}')."}
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
     elif payload.action == 'delete':
         if not payload.password or employee.password != payload.password:
             raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения удаления.")
@@ -2339,7 +2404,6 @@ async def bulk_order_action( # Убедись, что 'async' здесь ест�
 
     else:
         raise HTTPException(status_code=400, detail="Неизвестное массовое действие.")
-# main.py (Полностью заменяет функцию bulk_import_orders)
 
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
 def bulk_import_orders(
@@ -2408,6 +2472,7 @@ def bulk_import_orders(
              continue
 
         # Поиск/создание клиента
+        # Поиск клиента (БЕЗ СОЗДАНИЯ)
         client = None
         client_identifier = ""
         if item.client_code:
@@ -2423,21 +2488,11 @@ def bulk_import_orders(
              cleaned_phone = re.sub(r'\D', '', str(item.phone))
              if not client_identifier: client_identifier = f"тел. '{cleaned_phone}'"
              if cleaned_phone: client = clients_by_phone.get(cleaned_phone)
+
+        # (БЛОК СОЗДАНИЯ "НЕИЗВЕСТНОГО КЛИЕНТА" УДАЛЕН)
+
         if not client:
-             # --- ИСПРАВЛЕНИЕ: Генерируем уникальный телефон ---
-             timestamp_ms = int(datetime.now().timestamp() * 1000)
-             unknown_client_phone = f"unknown_{employee.company_id}_{unknown_client_counter}_{timestamp_ms}"
-             # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-             client = Client(
-                 full_name=f"Неизвестный ({client_identifier or track_code})",
-                 phone=unknown_client_phone, # Используем новый уникальный телефон
-                 company_id=employee.company_id,
-             )
-             db.add(client)
-             db.flush()
-             # Не добавляем в clients_by_phone
-             warnings.append(f"Для заказа '{track_code}' не найден клиент ({client_identifier or 'нет идентификатора'}). Создан '{client.full_name}'.")
-             unknown_client_counter += 1
+            warnings.append(f"Для заказа '{track_code}' не найден клиент ({client_identifier or 'нет идентификатора'}). Заказ импортирован как 'Невостребованный'.")
 
         # Определение статуса
         order_status = "Ожидает выкупа" if item.purchase_type == "Выкуп" else "В обработке"
@@ -2445,7 +2500,7 @@ def bulk_import_orders(
         # Создание объекта Order с ОБЯЗАТЕЛЬНЫМ location_id
         new_order = Order(
             track_code=track_code,
-            client_id=client.id,
+            client_id=client.id if client else None, # <-- ГЛАВНОЕ ИЗМЕНЕНИЕ
             company_id=employee.company_id,
             location_id=import_location_id, # <-- ПРИВЯЗКА К ФИЛИАЛУ
             purchase_type=item.purchase_type or "Доставка",
@@ -3288,24 +3343,46 @@ def get_issued_orders(
     print(f"[Выдача История] Найдено {len(orders)} выданных заказов за период (с учетом фильтра).")
     return orders
 
+class RevertOrderPayload(BaseModel):
+    password: Optional[str] = None
+    revert_reason: str = Field(..., min_length=5) # Причина обязательна
+
 @app.patch("/api/orders/{order_id}/revert_status", tags=["Выдача"], response_model=OrderOut)
 def revert_order_status(
     order_id: int,
+    payload: RevertOrderPayload, # <-- Теперь она определена
     employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
     """
-    Возвращает статус выданного заказа обратно на 'Готов к выдаче'.
-    Требует права 'issue_orders'. Доступно Владельцу или сотруднику в активной смене.
+    (ИЗМЕНЕНО) Возвращает выданный заказ на 'Готов к выдаче'.
+    Требует права 'issue_orders' И пароль из настроек (если он установлен).
     """
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
     perms = {p.codename for p in employee.role.permissions}
-    if 'issue_orders' not in perms: # Требуем те же права, что и на выдачу
+    if 'issue_orders' not in perms: 
         raise HTTPException(status_code=403, detail="У вас нет прав на отмену выдачи.")
 
-    order = db.query(Order).options(joinedload(Order.shift)).filter( # Загружаем смену для проверки
+    # --- ПРОВЕРКА ПАРОЛЯ ИЗ НАСТРОЕК ---
+    required_password_setting = db.query(Setting).filter(
+        Setting.company_id == employee.company_id,
+        Setting.key == 'password_revert_order' # <-- НАШ НОВЫЙ КЛЮЧ
+    ).first()
+
+    required_password = required_password_setting.value if required_password_setting and required_password_setting.value else None
+
+    # Если пароль в настройках ЗАДАН, то мы его проверяем
+    if required_password:
+        if payload.password != required_password:
+            raise HTTPException(status_code=403, detail="Неверный пароль для возврата заказа.")
+    # Если пароль в настройках НЕ ЗАДАН (None или ""), проверка не нужна.
+
+    # --- КОНЕЦ ПРОВЕРКИ ПАРОЛЯ ---
+
+    # ИСПРАВЛЕНИЕ 500: Убираем .options(joinedload(Order.shift))
+    order = db.query(Order).filter( 
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
@@ -3315,45 +3392,42 @@ def revert_order_status(
     if order.status != "Выдан":
         raise HTTPException(status_code=400, detail="Можно вернуть только заказ со статусом 'Выдан'.")
 
-    # --- ПРОВЕРКА ВОЗМОЖНОСТИ ВОЗВРАТА ---
-    can_revert = False
-    if employee.role.name == 'Владелец':
-        can_revert = True # Владелец может всегда
-    else:
-        # Сотрудник может вернуть, только если СМЕНА, в которую была выдача, ЕЩЕ АКТИВНА
-        if order.shift and order.shift.end_time is None:
-            # И если это смена ТЕКУЩЕГО СОТРУДНИКА (доп. безопасность)
-            if order.shift.employee_id == employee.id:
-                 can_revert = True
-    
-    if not can_revert:
-         raise HTTPException(status_code=403, detail="Отмена выдачи невозможна (смена закрыта или у вас нет прав).")
-    # --- КОНЕЦ ПРОВЕРКИ ---
+    # УБРАЛИ проверку на активную смену
 
+    # --- ВОТ БЛОК TRY/EXCEPT, КОТОРЫЙ ИСПРАВЛЯЕТ ОШИБКУ ---
     try:
+        # Сохраняем причину возврата
+        existing_comment = order.comment if order.comment else ""
+
+        # --- ВАЖНО: Убедись, что 'datetime' импортирован вверху 'main.py' ---
+        # (Он у тебя уже должен быть, т.к. используется в 'on_startup' и других)
+
+        new_comment = f"[ВОЗВРАТ {datetime.now().strftime('%Y-%m-%d %H:%M')}] {payload.revert_reason}\n---\n{existing_comment}"
+
         order.status = "Готов к выдаче"
-        order.reverted_at = datetime.now() # Фиксируем время возврата
+        order.reverted_at = datetime.now() 
+        order.comment = new_comment 
+
         # Обнуляем данные о выдаче
         order.issued_at = None
         order.shift_id = None
-        order.weight_kg = None # Сбрасываем фактический вес
-        order.final_cost_som = None # Сбрасываем фактическую стоимость
+        order.weight_kg = None 
+        order.final_cost_som = None 
         order.paid_cash_som = None
         order.paid_card_som = None
         order.card_payment_type = None
-        
+
         db.commit()
         db.refresh(order)
         db.refresh(order, attribute_names=['client']) # Обновляем клиента для ответа
-        print(f"[Выдача] Статус заказа ID={order_id} возвращен на 'Готов к выдаче'. Сотрудник ID={employee.id}")
+        print(f"[Выдача] Статус заказа ID={order.id} возвращен на 'Готов к выдаче'. Сотрудник ID={employee.id}")
         return order
-        
+
     except Exception as e:
         db.rollback()
         import traceback
-        print(f"!!! Ошибка БД при возврате статуса заказа ID={order_id}:\n{traceback.format_exc()}")
+        print(f"!!! Ошибка БД при возврате статуса заказа ID={order.id}:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных при возврате статуса: {e}")
-
 # --- КОНЕЦ БЛОКА ВЫДАЧИ ---
 
 # main.py (Добавьте этот блок)
@@ -3888,16 +3962,23 @@ async def calculate_orders( # Добавляем async для уведомлен
         # --- НАЧАЛО ИСПРАВЛЕНИЯ: ОТПРАВКА УВЕДОМЛЕНИЙ ---
         # Проверяем, был ли изменен статус и есть ли
         # подготовленные уведомления
-        if payload.new_status and notifications_to_send:
-            print(f"[Calculate Orders] Отправка {len(notifications_to_send)} уведомлений о смене статуса на '{payload.new_status}'...")
+        if payload.new_status and notifications_to_send and payload.new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
+            print(f"[Calculate Orders] Запуск {len(notifications_to_send)} задач на отправку (await) о статусе '{payload.new_status}'...")
+            tasks = []
             for client_id, data in notifications_to_send.items():
-                asyncio.create_task(generate_and_send_notification(
-                    client=data["client"],
-                    new_status=payload.new_status,
-                    track_codes=data["track_codes"]
-                ))
-            print(f"[Calculate Orders] Задачи на отправку уведомлений созданы.")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                # Создаем задачи
+                tasks.append(
+                    generate_and_send_notification(
+                        client=data["client"], 
+                        new_status=payload.new_status, 
+                        track_codes=data["track_codes"]
+                    )
+                )
+            # Ждем выполнения ВСЕХ задач по отправке
+            await asyncio.gather(*tasks)
+            print(f"[Calculate Orders] Все {len(tasks)} задач по отправке завершены.")
+        else:
+            print(f"[Calculate Orders] Массовая рассылка не требуется (статус: '{payload.new_status}' или нет клиентов).")
 
         return {"status": "ok", "message": f"Расчет сохранен для {updated_count} заказов." + (f" Статус обновлен на '{payload.new_status}'." if payload.new_status else "")}
 
@@ -4155,8 +4236,8 @@ class SettingOut(BaseModel):
     key: str
     value: Optional[str]
 
-@app.get("/api/settings", tags=["Настройки", "Telegram Bot"], response_model=List[SettingOut])
-def get_company_settings(
+@app.get("/api/bot/settings", tags=["Telegram Bot"], response_model=List[SettingOut])
+def get_bot_company_settings(
     company_id: int = Query(...), # Обязательный ID компании
     keys: Optional[List[str]] = Query(None), # Необязательный список ключей для фильтрации
     db: Session = Depends(get_db)
@@ -4453,6 +4534,65 @@ def unlink_bot_user(
         logger.error(f"!!! [Bot Unlink] Ошибка БД при отвязке Chat ID {chat_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Ошибка базы данных при отвязке аккаунта.")
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
+
+# --- НОВЫЙ ЭНДПОИНТ ДЛЯ "МАГИИ" БОТА ---
+class BotClaimOrderPayload(BaseModel):
+    track_code: str
+    client_id: int
+    company_id: int
+
+@app.post("/api/bot/claim_order", tags=["Telegram Bot"], response_model=OrderOut)
+def claim_order_from_bot(
+    payload: BotClaimOrderPayload,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Ищет невостребованный заказ по трек-коду и назначает его клиенту.
+    Вызывается ботом.
+    """
+    logger.info(f"[Bot Claim] Клиент ID={payload.client_id} пытается забрать трек-код '{payload.track_code}' в компании ID={payload.company_id}")
+
+    # 1. Проверяем клиента и компанию
+    client = db.query(Client).filter(Client.id == payload.client_id, Client.company_id == payload.company_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Клиент не найден в этой компании.")
+
+    # 2. Ищем заказ (ОН ДОЛЖЕН БЫТЬ НЕВОСТРЕБОВАННЫМ)
+    order_to_claim = db.query(Order).filter(
+        Order.track_code == payload.track_code,
+        Order.company_id == payload.company_id,
+        Order.client_id == None # <-- Ключевое условие
+    ).first()
+
+    if not order_to_claim:
+        logger.warning(f"[Bot Claim] Невостребованный заказ '{payload.track_code}' не найден.")
+        raise HTTPException(status_code=404, detail="Невостребованный заказ с таким трек-кодом не найден.")
+
+    # 3. Назначаем заказ клиенту
+    try:
+        order_to_claim.client_id = payload.client_id
+        order_to_claim.status = "В пути"
+        # Также обновляем филиал заказа на тот, что был выбран в боте (если он был)
+        # (Самокоррекция: бот не передает location_id в этом payload. 
+        # Лучше просто назначить клиента, а филиал останется тот, что при импорте)
+
+        db.commit()
+        # --- ОТПРАВКА УВЕДОМЛЕНИЯ В ФОНЕ ---
+        background_tasks.add_task(
+            generate_and_send_notification,
+            client=client,
+            new_status="В пути",
+            track_codes=[order_to_claim.track_code]
+        )
+        db.refresh(order_to_claim, attribute_names=['client']) # Загружаем клиента для ответа
+        logger.info(f"[Bot Claim] УСПЕХ: Заказ ID={order_to_claim.id} назначен клиенту ID={payload.client_id}")
+        return order_to_claim
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Bot Claim] Ошибка БД при назначении заказа: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Ошибка базы данных при назначении заказа.")
+# --- КОНЕЦ НОВОГО ЭНДПОИНТА "МАГИИ" ---
 
 # --- 7. УТИЛИТЫ ---
 
