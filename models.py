@@ -76,7 +76,7 @@ class Client(Base):
     phone = Column(String, index=True, nullable=False) 
     client_code_prefix = Column(String, default="KB")
     client_code_num = Column(Integer, nullable=True) 
-    telegram_chat_id = Column(String, unique=True, nullable=True) 
+    telegram_chat_id = Column(String, nullable=True, index=True) # <-- ИЗМЕНЕНО: unique=True УБРАНО, index=True ДОБАВЛЕНО
     status = Column(String, default="Розница")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -87,10 +87,11 @@ class Client(Base):
     company = relationship("Company", back_populates="clients")
 
     # НОВОЕ ПРАВИЛО: Код клиента и телефон должны быть уникальны ВНУТРИ ОДНОЙ КОМПАНИИ
-    __table_args__ = (
-        UniqueConstraint('phone', 'company_id', name='_phone_company_uc'),
-        UniqueConstraint('client_code_num', 'company_id', name='_client_code_company_uc'),
-    )
+__table_args__ = (
+    UniqueConstraint('phone', 'company_id', name='_phone_company_uc'),
+    UniqueConstraint('client_code_num', 'company_id', name='_client_code_company_uc'),
+    UniqueConstraint('telegram_chat_id', 'company_id', name='_telegram_chat_id_company_uc'), # <-- ДОБАВЛЕНО
+)
 
 
 # models.py (Полностью заменяет класс Order)
@@ -129,7 +130,7 @@ class Order(Base):
     # --- ИСПРАВЛЕННЫЕ И НОВЫЕ СВЯЗИ ---
 
     # Связь с клиентом (Дубликаты убраны)
-    client_id = Column(Integer, ForeignKey('clients.id'))
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=True) # <-- ИЗМЕНЕНО
     client = relationship("Client", back_populates="orders")
 
     # Связь со сменой (nullable=True для расходов Владельца)
