@@ -534,21 +534,67 @@ async def add_order_received_location(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END 
 
 async def add_order_received_track_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получен трек-код от пользователя."""
-    track_code = update.message.text.strip() 
+    """(ИЗМЕНЕНО) Получен трек-код. Ищем в 'Невостребованных'."""
+    track_code = update.message.text.strip()
     if not track_code or len(track_code) < 3: 
         await update.message.reply_text("Трек-код кажется некорректным. Попробуйте ввести еще раз:")
-        return ADD_ORDER_TRACK_CODE 
+        return ADD_ORDER_TRACK_CODE
 
-    context.user_data['track_code'] = track_code
-    logger.info(f"Пользователь {update.effective_user.id} ввел трек-код: {track_code}")
+    logger.info(f"Пользователь {update.effective_user.id} ввел трек-код: {track_code}. Поиск в невостребованных...")
 
-    keyboard = [["⏩ Пропустить"], ["Отмена"]]
-    await update.message.reply_text(
-        "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    client_id = context.user_data.get('client_id')
+    is_owner = context.user_data.get('is_owner', False)
+    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
+
+    # --- НОВАЯ ЛОГИКА: "Магия" ---
+    claim_payload = {
+        "track_code": track_code,
+        "client_id": client_id,
+        "company_id": COMPANY_ID_FOR_BOT
+    }
+
+    api_response = await api_request(
+        "POST",
+        "/api/bot/claim_order", # <-- Вызываем новый эндпоинт
+        json=claim_payload
     )
-    return ADD_ORDER_COMMENT
+
+    if api_response and "error" not in api_response and "id" in api_response:
+        # 1. УСПЕХ! Заказ найден и назначен
+        logger.info(f"МАГИЯ: Невостребованный заказ (ID: {api_response.get('id')}) назначен клиенту {client_id}")
+        await update.message.reply_html(
+            f"🎉 <b>Отличные новости!</b>\n\nМы нашли этот заказ (<code>{track_code}</code>) в нашей базе невостребованных посылок и <b>сразу добавили его вам!</b>",
+            reply_markup=markup
+        )
+        # Очищаем диалог
+        context.user_data.pop('location_id', None)
+        context.user_data.pop('available_locations', None)
+        return ConversationHandler.END
+
+    elif api_response and api_response.get("status_code") == 404:
+        # 2. Не найден (это нормально, значит это новый заказ)
+        logger.info(f"Заказ '{track_code}' не найден в невостребованных. Продолжаем обычное добавление.")
+        # Продолжаем старую логику:
+        context.user_data['track_code'] = track_code
+        keyboard = [["⏩ Пропустить"], ["Отмена"]]
+        await update.message.reply_text(
+            "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return ADD_ORDER_COMMENT
+    else:
+        # 3. Другая ошибка API
+        error_msg = api_response.get("error", "Неизвестная ошибка") if api_response else "Нет ответа"
+        logger.error(f"Ошибка при попытке 'магии' (claim_order): {error_msg}")
+        # (Продолжаем как обычно, вместо того чтобы блокировать пользователя)
+        logger.info(f"Ошибка 'магии' проигнорирована, продолжаем обычное добавление.")
+        context.user_data['track_code'] = track_code
+        keyboard = [["⏩ Пропустить"], ["Отмена"]]
+        await update.message.reply_text(
+            "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return ADD_ORDER_COMMENT
 
 async def add_order_received_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Получен комментарий от пользователя."""
@@ -774,11 +820,13 @@ async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
+
     logger.info(f"Запрос адреса склада Китая для клиента {client_id}")
-    
+   
     client_unique_code = "ВАШ_КОД"
     address_text_template = "Адрес склада не настроен в системе."
-    instruction_link = None 
+    instruction_link = None
+
 
     try:
         # 1. Получаем код клиента
@@ -791,43 +839,50 @@ async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
              logger.warning(f"Не удалось получить данные клиента {client_id} для кода.")
 
+
         # 2. Получаем настройки адреса и инструкции
-        keys_to_fetch = ['china_warehouse_address', 'address_instruction_pdf_link'] 
-        api_settings = await api_request("GET", "/api/settings", params={'keys': keys_to_fetch})
+        keys_to_fetch = ['china_warehouse_address', 'instruction_pdf_link']
+        api_settings = await api_request("GET", "/api/bot/settings", params={'keys': keys_to_fetch})
+
 
         if api_settings and "error" not in api_settings and isinstance(api_settings, list):
             settings_dict = {s.get('key'): s.get('value') for s in api_settings}
-            
-            address_value = settings_dict.get('china_warehouse_address')
-            if address_value:
-                address_text_template = address_value
-            instruction_link = settings_dict.get('address_instruction_pdf_link')
-        
+           
+        # Ищем адрес склада
+        address_value = settings_dict.get('china_warehouse_address')
+        if address_value:
+            address_text_template = address_value
+
+        # Ищем ссылку на PDF (НЕЗАВИСИМО от адреса)
+        instruction_link = settings_dict.get('instruction_pdf_link')
+       
         # 3. Формируем ответ
         final_address = address_text_template.replace("{{client_code}}", client_unique_code).replace("{client_code}", client_unique_code)
 
+
         text = (
-            f"🇨🇳 <b>Адрес склада в Китае</b>\n\n"
-            f"❗️ Ваш уникальный код: <pre>{client_unique_code}</pre>\n" 
-            f"<i>Обязательно указывайте его ПОЛНОСТЬЮ!</i>\n\n"
-            f"👇 Нажмите на адрес ниже, чтобы скопировать:\n\n"
-            f"<code>{final_address}</code>" 
+            f"🇨🇳 <b>Адрес склада в Китае</b> 🇨🇳\n\n"
+            f"❗️ Ваш уникальный код: <b>{client_unique_code}</b> ❗️\n"
+            f"<i>Обязательно указывайте его ПОЛНОСТЬЮ при оформлении заказов!</i>\n\n"
+            f"👇 Адрес для копирования (нажмите на него):\n\n"
+            f"<code>{final_address}</code>"
         )
+
 
         inline_keyboard = []
         if instruction_link:
             inline_keyboard.append([InlineKeyboardButton("📄 Инструкция по заполнению", url=instruction_link)])
-        
+       
         reply_markup_inline = InlineKeyboardMarkup(inline_keyboard) if inline_keyboard else None
-        
+       
         await update.message.reply_html(text, reply_markup=reply_markup_inline)
         if reply_markup_inline:
             await update.message.reply_text("Используйте основное меню:", reply_markup=markup)
 
+
     except Exception as e:
         logger.error(f"Ошибка в china_addresses (API): {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при получении адреса склада.", reply_markup=markup)
-
 
 async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает контакты офиса, запрашивая филиалы (через API)."""
