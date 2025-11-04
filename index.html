@@ -224,6 +224,32 @@
         </div>
     </div>
 
+    <div id="assign-client-modal" class="modal">
+    <div class="modal-content w-full max-w-lg">
+        <div class="flex justify-between items-start mb-4">
+            <h3 class="text-2xl font-bold">Назначить клиента</h3>
+            <button onclick="closeModal('assign-client-modal')" class="text-2xl font-bold">&times;</button>
+        </div>
+        <p id="assign-client-info" class="mb-4 font-semibold text-gray-700">Выбрано заказов: 0</p>
+        <div class="relative">
+            <label for="assign-client-search-input" class="block text-sm font-medium text-gray-700">Поиск клиента (имя, телефон, код)</label>
+            <input type="text" id="assign-client-search-input" autocomplete="off" placeholder="Введите имя, код или телефон..." class="w-full p-2 border rounded mt-1">
+            <div id="assign-client-search-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-lg z-30 max-h-48 overflow-y-auto"></div>
+        </div>
+        <input type="hidden" id="assign-client-selected-id">
+        <p id="assign-client-selected-info" class="hidden text-center font-semibold p-2 bg-gray-100 rounded mt-4"></p>
+        <div class="mt-4">
+            <label for="assign-client-new-status" class="block text-sm font-medium text-gray-700">Назначить статус:</label>
+            <select id="assign-client-new-status" class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500">
+                </select>
+        </div>
+        <div class="flex gap-4 mt-6 border-t pt-4">
+            <button type="button" onclick="closeModal('assign-client-modal')" class="w-full bg-gray-200 py-2 rounded hover:bg-gray-300">Отмена</button>
+            <button type="button" id="assign-client-save-btn" class="w-full bg-green-600 text-white py-2 rounded hover:bg-green-700 disabled:opacity-50" disabled>Подтвердить</button>
+        </div>
+    </div>
+</div>
+
 <script>
 // =================================================================
 // МОДУЛЬ: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И НАСТРОЙКИ (v4.1 - Rebuild)
@@ -1642,9 +1668,9 @@ function openCompanyModal(company = null) {
     const formElement = document.getElementById('modal-company-form');
     if (formElement) {
         // Удаляем старые слушатели перед добавлением нового
-        formElement.replaceWith(formElement.cloneNode(true));
-        // Добавляем слушатель к новой форме
-        document.getElementById('modal-company-form').addEventListener('submit', handleSaveCompany);
+        const newFormElement = formElement.cloneNode(true);
+        formElement.parentNode.replaceChild(newFormElement, formElement);
+        newFormElement.addEventListener('submit', handleSaveCompany);
         console.log("[Modal Listener OK] Added submit to #modal-company-form");
     } else {
         // Если форма не найдена после генерации HTML - это ошибка
@@ -2034,8 +2060,9 @@ function openLocationModal(locationData = null) {
     // --- Добавляем слушатель submit к ТОЛЬКО ЧТО созданной форме ---
     const formElement = document.getElementById('location-form');
     if (formElement) {
-        formElement.replaceWith(formElement.cloneNode(true));
-        document.getElementById('location-form').addEventListener('submit', handleSaveLocation);
+        const newFormElement = formElement.cloneNode(true);
+        formElement.parentNode.replaceChild(newFormElement, formElement);
+        newFormElement.addEventListener('submit', handleSaveLocation);
         console.log("[Modal Listener OK] Added submit to #location-form");
     } else {
         console.error("!!! openLocationModal: Form #location-form NOT FOUND after innerHTML!");
@@ -2460,8 +2487,9 @@ function openEmployeeModal(employee = null) {
     const formElement = document.getElementById('employee-form');
     if (formElement) {
         // Удаляем старые слушатели перед добавлением нового
-        formElement.replaceWith(formElement.cloneNode(true));
-        document.getElementById('employee-form').addEventListener('submit', handleSaveEmployee);
+        const newFormElement = formElement.cloneNode(true);
+        formElement.parentNode.replaceChild(newFormElement, formElement);
+        newFormElement.addEventListener('submit', handleSaveEmployee);
         console.log("[Modal Listener OK] Added submit to #employee-form");
     } else {
         console.error("!!! openEmployeeModal: Form #employee-form NOT FOUND after innerHTML!");
@@ -2694,8 +2722,9 @@ async function renderRolesTab() {
     if (addForm) {
         // Удаляем старые слушатели перед добавлением нового
         addForm.replaceWith(addForm.cloneNode(true));
-        document.getElementById('add-role-form').addEventListener('submit', handleAddRole);
-        console.log("[Listener OK] Added submit to #add-role-form");
+        const newAddForm = addForm.cloneNode(true);
+        addForm.parentNode.replaceChild(newAddForm, addForm);
+        newAddForm.addEventListener('submit', handleAddRole);
     } else {
         console.error("!!! renderRolesTab: Element #add-role-form NOT FOUND after innerHTML.");
     }
@@ -2912,8 +2941,9 @@ async function openPermissionsModal(roleId, roleName) {
         // --- Добавляем слушатель submit к ТОЛЬКО ЧТО созданной форме ---
         const formElement = document.getElementById('permissions-form');
         if (formElement) {
-            formElement.replaceWith(formElement.cloneNode(true)); // Удаляем старые
-            document.getElementById('permissions-form').addEventListener('submit', handleSavePermissions);
+            const newFormElement = formElement.cloneNode(true);
+            formElement.parentNode.replaceChild(newFormElement, formElement);
+            newFormElement.addEventListener('submit', handleSavePermissions);
             console.log("[Modal Listener OK] Added submit to #permissions-form");
         } else {
             console.error("!!! openPermissionsModal: Form #permissions-form NOT FOUND after innerHTML!");
@@ -3171,8 +3201,9 @@ function openClientModal(client = null) {
     // --- Добавляем слушатель submit к ТОЛЬКО ЧТО созданной форме ---
     const formElement = document.getElementById('client-form-inner');
     if (formElement) {
-        formElement.replaceWith(formElement.cloneNode(true)); // Удаляем старые
-        document.getElementById('client-form-inner').addEventListener('submit', handleSaveClient);
+        const newFormElement = formElement.cloneNode(true);
+        formElement.parentNode.replaceChild(newFormElement, formElement);
+        newFormElement.addEventListener('submit', handleSaveClient);
         console.log("[Modal Listener OK] Added submit to #client-form-inner");
         // Добавляем слушатель для кнопки отвязки TG, если она есть
         const unlinkBtn = document.getElementById('modal-client-unlink-tg');
@@ -3412,12 +3443,12 @@ async function handleClientExcelImport() {
             return; // Выходим, если данных нет
         }
 
-        // --- Шаг 2: Проверка наличия обязательных колонок ---
+        // --- Шаг 2: Проверка колонок (ИЗМЕНЕНО) ---
         const firstRow = jsonData[0];
-        if (!firstRow || !firstRow.hasOwnProperty('full_name') || !firstRow.hasOwnProperty('phone')) {
-             console.error("[Import] Validation failed: Missing 'full_name' or 'phone' column.");
-             resultsDiv.innerHTML = '<p class="text-red-500">Ошибка: Файл должен содержать колонки "full_name" и "phone". Проверьте названия заголовков (регистр не важен).</p>';
-             return;
+        // Теперь проверяем ТОЛЬКО наличие 'track_code'
+        if (!firstRow || !firstRow.hasOwnProperty('track_code')) {
+            resultsDiv.innerHTML = '<p class="text-red-500">Ошибка: Файл должен содержать как минимум колонку <strong>track_code</strong>.</p>';
+            hideLoader(); return;
         }
         console.log("[Import] Required columns found.");
 
@@ -3540,90 +3571,99 @@ async function renderOrdersTab() {
     }
     // --- КОНЕЦ ГЕНЕРАЦИИ ФИЛЬТРА ФИЛИАЛОВ ---
 
-    // Генерируем основной HTML для вкладки
-    pane.innerHTML = `
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            
-            <div class="lg:col-span-1 space-y-6">
-                
-                 <div class="bg-white p-6 rounded-lg shadow-md h-fit border">
-                    <h2 class="text-xl font-semibold mb-4 text-gray-800">Добавить заказ</h2>
-                    <form id="add-order-form" class="space-y-4">
-                        <div class="relative">
-                            <label for="order-client-search-input" class="block text-sm font-medium text-gray-700">Клиент (поиск)</label>
-                            <input type="text" id="order-client-search-input" autocomplete="off" placeholder="Имя, телефон или код..." class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500">
-                            <input type="hidden" id="order-selected-client-id">
-                            <div id="order-client-search-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-lg z-20 max-h-48 overflow-y-auto"></div>
-                        </div>
-                        <div> <label for="order-track-code" class="block text-sm font-medium text-gray-700">Трек-код</label> <input type="text" id="order-track-code" class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500" placeholder="Обязательно для Доставки"> </div>
-                        <div> <label for="order-party-date" class="block text-sm font-medium text-gray-700">Дата Партии</label> <input type="date" id="order-party-date" class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500"> </div>
-                        <div> <label for="order-purchase-type" class="block text-sm font-medium text-gray-700">Тип заказа</label> <select id="order-purchase-type" required class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500"> <option value="Доставка" selected>Доставка</option> <option value="Выкуп">Выкуп</option> </select> </div>
+// Генерируем основной HTML для вкладки
+pane.innerHTML = `
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <div class="lg:col-span-1 space-y-6">
+
+            <div class="bg-white p-6 rounded-lg shadow-md h-fit border">
+                <h2 class="text-xl font-semibold mb-4 text-gray-800">Добавить заказ</h2>
+                <form id="add-order-form" class="space-y-4">
+                    <div class="relative">
+                        <label for="order-client-search-input" class="block text-sm font-medium text-gray-700">Клиент (поиск)</label>
+                        <input type="text" id="order-client-search-input" autocomplete="off" placeholder="Имя, телефон или код..." class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500">
+                        <input type="hidden" id="order-selected-client-id">
+                        <div id="order-client-search-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-lg z-20 max-h-48 overflow-y-auto"></div>
+                    </div>
+                    <div> <label for="order-track-code" class="block text-sm font-medium text-gray-700">Трек-код</label> <input type="text" id="order-track-code" class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500" placeholder="Обязательно для Доставки"> </div>
+                    <div> <label for="order-party-date" class="block text-sm font-medium text-gray-700">Дата Партии</label> <input type="date" id="order-party-date" class="mt-1 w-full p-2 border rounded focus:ring-indigo-500 focus:border-indigo-500"> </div>
+                    <div> <label for="order-purchase-type" class="block text-sm font-medium text-gray-700">Тип заказа</label> <select id="order-purchase-type" required class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500"> <option value="Доставка" selected>Доставка</option> <option value="Выкуп">Выкуп</option> </select> </div>
                     ${currentUser.role === 'Владелец' && companyLocations.length > 0 ? `
                     <div>
                         <label for="order-location-select" class="block text-sm font-medium text-gray-700">Филиал *</label>
                         <select id="order-location-select" class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500">
-                                ${companyLocations.map(loc => `<option value="${loc.id}" ${loc.id === currentUser.location_id ? 'selected' : ''}>${loc.name}</option>`).join('')}
+                            ${companyLocations.map(loc => `<option value="${loc.id}" ${loc.id === currentUser.location_id ? 'selected' : ''}>${loc.name}</option>`).join('')}
                         </select>
                         <p class="text-xs text-gray-500 mt-1">Выберите филиал, к которому относится заказ.</p>
                     </div>
                     ` : ''}
-                        <div id="order-buyout-fields" class="hidden space-y-3 border-t pt-4 mt-4"> <h4 class="text-sm font-semibold text-gray-600">Данные для выкупа:</h4> <div> <label for="order-buyout-cost" class="block text-xs font-medium text-gray-600">Стоимость товара (CNY)</label> <input type="number" step="any" id="order-buyout-cost" class="mt-1 w-full p-2 border rounded text-sm"> </div> <div> <label for="order-buyout-rate" class="block text-xs font-medium text-gray-600">Курс для клиента (сом/юань)</label> <input type="number" step="any" id="order-buyout-rate" class="mt-1 w-full p-2 border rounded text-sm"> </div> <div> <label for="order-buyout-commission" class="block text-xs font-medium text-gray-600">Комиссия (%)</label> <input type="number" step="1" id="order-buyout-commission" value="10" class="mt-1 w-full p-2 border rounded text-sm"> </div> </div>
-                        <div> <label for="order-comment" class="block text-sm font-medium text-gray-700">Комментарий</label> <textarea id="order-comment" class="mt-1 w-full p-2 border rounded h-16 focus:ring-indigo-500 focus:border-indigo-500" placeholder="Цвет, размер, особенности..."></textarea> </div>
-                        <button type="submit" class="w-full bg-green-600 text-white font-bold py-2 rounded hover:bg-green-700 transition-colors duration-150">Создать Заказ</button>
-                    </form>
+                    <div id="order-buyout-fields" class="hidden space-y-3 border-t pt-4 mt-4"> <h4 class="text-sm font-semibold text-gray-600">Данные для выкупа:</h4> <div> <label for="order-buyout-cost" class="block text-xs font-medium text-gray-600">Стоимость товара (CNY)</label> <input type="number" step="any" id="order-buyout-cost" class="mt-1 w-full p-2 border rounded text-sm"> </div> <div> <label for="order-buyout-rate" class="block text-xs font-medium text-gray-600">Курс для клиента (сом/юань)</label> <input type="number" step="any" id="order-buyout-rate" class="mt-1 w-full p-2 border rounded text-sm"> </div> <div> <label for="order-buyout-commission" class="block text-xs font-medium text-gray-600">Комиссия (%)</label> <input type="number" step="1" id="order-buyout-commission" value="10" class="mt-1 w-full p-2 border rounded text-sm"> </div> </div>
+                    <div> <label for="order-comment" class="block text-sm font-medium text-gray-700">Комментарий</label> <textarea id="order-comment" class="mt-1 w-full p-2 border rounded h-16 focus:ring-indigo-500 focus:border-indigo-500" placeholder="Цвет, размер, особенности..."></textarea> </div>
+                    <button type="submit" class="w-full bg-green-600 text-white font-bold py-2 rounded hover:bg-green-700 transition-colors duration-150">Создать Заказ</button>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-lg shadow-md h-fit border">
+                <h2 class="text-xl font-semibold mb-4 text-gray-800">Импорт заказов из Excel</h2>
+                <p class="text-xs text-gray-600 mb-1">Колонки: <strong>track_code</strong>* (и <strong>client_code</strong> или <strong>phone</strong>, если нужно привязать).</p>
+                <p class="text-xs text-gray-600 mb-4">Необязательно: <strong>comment</strong>, <strong>purchase_type</strong>, <strong>buyout_item_cost_cny</strong>, <strong>buyout_rate_for_client</strong>, <strong>buyout_commission_percent</strong>.</p>
+                <div class="space-y-3 mb-4"> <label for="import-order-party-date" class="block text-sm font-medium text-gray-700">Общая Дата партии (если нет в файле)</label> <input type="date" id="import-order-party-date" class="mt-1 w-full p-2 border rounded"> </div>
+                ${currentUser.role === 'Владелец' && companyLocations.length > 0 ? `
+                <div class="space-y-3 mb-4">
+                    <label for="import-location-select" class="block text-sm font-medium text-gray-700">Импортировать в филиал *</label>
+                    <select id="import-location-select" class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500">
+                        ${companyLocations.map(loc => `<option value="${loc.id}" ${loc.id === currentUser.location_id ? 'selected' : ''}>${loc.name}</option>`).join('')}
+                    </select>
                 </div>
-                <div class="bg-white p-6 rounded-lg shadow-md h-fit border">
-                     <h2 class="text-xl font-semibold mb-4 text-gray-800">Импорт заказов из Excel</h2>
-                     <p class="text-xs text-gray-600 mb-1">Колонки: <strong>track_code</strong>*, <strong>client_code</strong> (или <strong>phone</strong>).</p> <p class="text-xs text-gray-600 mb-4">Необязательно: <strong>comment</strong>, <strong>purchase_type</strong>, <strong>buyout_item_cost_cny</strong>, <strong>buyout_rate_for_client</strong>, <strong>buyout_commission_percent</strong>.</p>
-                     <div class="space-y-3 mb-4"> <label for="import-order-party-date" class="block text-sm font-medium text-gray-700">Общая Дата партии (если нет в файле)</label> <input type="date" id="import-order-party-date" class="mt-1 w-full p-2 border rounded"> </div>
-                     ${currentUser.role === 'Владелец' && companyLocations.length > 0 ? `
-                     <div class="space-y-3 mb-4">
-                         <label for="import-location-select" class="block text-sm font-medium text-gray-700">Импортировать в филиал *</label>
-                         <select id="import-location-select" class="mt-1 w-full p-2 border rounded bg-white focus:ring-indigo-500 focus:border-indigo-500">
-                             ${companyLocations.map(loc => `<option value="${loc.id}" ${loc.id === currentUser.location_id ? 'selected' : ''}>${loc.name}</option>`).join('')}
-                         </select>
-                     </div>
-                     ` : ''}
-                     <label for="order-excel-input" class="block text-sm font-medium text-gray-700 mb-2">Выберите файл (.xlsx, .xls)</label> <input type="file" id="order-excel-input" accept=".xlsx, .xls" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer"/> <button id="import-orders-btn" class="mt-4 w-full bg-blue-600 text-white font-bold py-2 rounded-lg hover:bg-blue-700 transition-colors duration-150">Импортировать Заказы</button> <div id="order-import-results" class="mt-4 text-xs max-h-40 overflow-y-auto border p-2 bg-gray-50 rounded"></div>
-                 </div>
+                ` : ''}
+                <label for="order-excel-input" class="block text-sm font-medium text-gray-700 mb-2">Выберите файл (.xlsx, .xls)</label> 
+                <input type="file" id="order-excel-input" accept=".xlsx, .xls" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer"/> 
+                <button id="import-orders-btn" class="mt-4 w-full bg-blue-600 text-white font-bold py-2 rounded-lg hover:bg-blue-700 transition-colors duration-150">Импортировать Заказы</button> 
+                <div id="order-import-results" class="mt-4 text-xs max-h-40 overflow-y-auto border p-2 bg-gray-50 rounded"></div>
+            </div>
+            </div>
+        <div class="lg:col-span-2 bg-white p-6 rounded-lg shadow-md border">
+
+            <div id="orders-action-header" class="sticky top-0 bg-white py-3 mb-4 border-b -mx-6 px-6 flex flex-wrap justify-between items-center gap-2 z-10">
+                <div class="flex items-center gap-2 flex-wrap">
+
+                    <button id="orders-toggle-select-mode-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150" title="Включить/выключить режим выбора заказов">✅ Выбрать</button>
+
+                    <div class="relative"> <button id="orders-toggle-party-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🗳️ Партии</button> <div id="orders-party-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по партиям:</p> <div id="orders-party-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-party-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-party-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
+
+                    <div class="relative"> <button id="orders-toggle-status-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🟢 Статусы</button> <div id="orders-status-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по статусам:</p> <div id="orders-status-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-status-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-status-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
+
+
+                    ${locationFilterHtml} 
+
+
+                    <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm transition-colors duration-150" title="Экспортировать отфильтрованные заказы в Excel">📥 Экспорт</button>
+                    <button id="orders-calculate-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-blue-600 hover:bg-blue-100 text-sm transition-colors duration-150" title="Открыть окно расчета стоимости для выбранного клиента">🧮 Рассчитать</button>
+                    <button id="orders-filter-unclaimed-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-red-600 hover:bg-red-100 text-sm transition-colors duration-150" title="Показать только невостребованные заказы (без клиента)">🚩 Невостребованные</button>
+                </div>
+
+                <button id="refresh-orders-btn" title="Обновить список заказов" class="text-2xl text-gray-500 hover:text-indigo-600 transition-colors duration-150">&circlearrowright;</button>
             </div>
 
-            
-            <div class="lg:col-span-2 bg-white p-6 rounded-lg shadow-md border">
-                
-                 <div id="orders-action-header" class="sticky top-0 bg-white py-3 mb-4 border-b -mx-6 px-6 flex flex-wrap justify-between items-center gap-2 z-10">
-                    <div class="flex items-center gap-2 flex-wrap">
-                        
-                        <button id="orders-toggle-select-mode-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150" title="Включить/выключить режим выбора заказов">✅ Выбрать</button>
-                        
-                        <div class="relative"> <button id="orders-toggle-party-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🗳️ Партии</button> <div id="orders-party-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по партиям:</p> <div id="orders-party-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-party-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-party-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
-                        
-                        <div class="relative"> <button id="orders-toggle-status-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🟢 Статусы</button> <div id="orders-status-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по статусам:</p> <div id="orders-status-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-status-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-status-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
-                        
-                        
-                        ${locationFilterHtml} 
-                        
-                        
-                        <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm transition-colors duration-150" title="Экспортировать отфильтрованные заказы в Excel">📥 Экспорт</button>
-                        <button id="orders-calculate-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-blue-600 hover:bg-blue-100 text-sm transition-colors duration-150" title="Открыть окно расчета стоимости для выбранного клиента">🧮 Рассчитать</button>
-                    </div>
-                    
-                    <button id="refresh-orders-btn" title="Обновить список заказов" class="text-2xl text-gray-500 hover:text-indigo-600 transition-colors duration-150">&circlearrowright;</button>
-                 </div>
-                 
-                 <div class="mb-4"> <input type="search" id="orders-search-input" placeholder="🔍 Поиск по клиенту, телефону, трек-коду, комментарию..." class="w-full p-2 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500"> </div>
-                 
-                 <div id="orders-bulk-action-bar" class="hidden p-3 bg-indigo-50 rounded-lg mb-4 border border-indigo-200 space-y-3">
-                     <div class="flex items-center gap-4 flex-wrap"> <span id="orders-selected-count" class="font-bold text-indigo-700 text-sm">Выбрано: 0</span> <div class="flex items-center gap-2 border-l border-indigo-200 pl-3"> <label for="orders-bulk-status-select" class="text-xs font-medium text-gray-700">Статус:</label> <select id="orders-bulk-status-select" class="rounded-md border-gray-300 p-1.5 text-xs bg-white shadow-sm"></select> <button id="orders-bulk-update-status-btn" class="bg-indigo-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-indigo-700">Применить</button> </div> <div class="flex items-center gap-2 border-l border-indigo-200 pl-3"> <label for="orders-bulk-party-date-input" class="text-xs font-medium text-gray-700">Дата:</label> <input type="date" id="orders-bulk-party-date-input" class="p-1.5 border rounded text-xs bg-white shadow-sm"> <button id="orders-bulk-update-date-btn" class="bg-orange-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-orange-600">Применить</button> </div> <button id="orders-bulk-buyout-btn" class="hidden bg-purple-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-purple-700">Выкупить отмеченное</button> </div>
-                     <div class="border-t border-indigo-200 pt-2"> <button id="orders-bulk-delete-btn" class="bg-red-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-red-700">Удалить выбранное</button> </div>
-                 </div>
-                 
-                  <div id="orders-select-all-container" class="hidden flex items-center p-2 border-b"> <input type="checkbox" id="orders-select-all-checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"> <label for="orders-select-all-checkbox" class="ml-3 block text-sm font-bold text-gray-700">Выбрать все видимые заказы</label> </div>
-                 
-                 <div id="orders-list-container" class="space-y-4 mt-4"> <p class="text-gray-500 animate-pulse">Загрузка заказов...</p> </div>
+            <div class="mb-4"> <input type="search" id="orders-search-input" placeholder="🔍 Поиск по клиенту, телефону, трек-коду, комментарию..." class="w-full p-2 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500"> </div>
+
+            <div id="orders-bulk-action-bar" class="hidden p-3 bg-indigo-50 rounded-lg mb-4 border border-indigo-200 space-y-3">
+                <div class="flex items-center gap-4 flex-wrap"> 
+                    <span id="orders-selected-count" class="font-bold text-indigo-700 text-sm">Выбрано: 0</span> 
+                    <div class="flex items-center gap-2 border-l border-indigo-200 pl-3"> <label for="orders-bulk-status-select" class="text-xs font-medium text-gray-700">Статус:</label> <select id="orders-bulk-status-select" class="rounded-md border-gray-300 p-1.5 text-xs bg-white shadow-sm"></select> <button id="orders-bulk-update-status-btn" class="bg-indigo-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-indigo-700">Применить</button> </div> 
+                    <div class="flex items-center gap-2 border-l border-indigo-200 pl-3"> <label for="orders-bulk-party-date-input" class="text-xs font-medium text-gray-700">Дата:</label> <input type="date" id="orders-bulk-party-date-input" class="p-1.5 border rounded text-xs bg-white shadow-sm"> <button id="orders-bulk-update-date-btn" class="bg-orange-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-orange-600">Применить</button> </div> 
+                    <button id="orders-bulk-buyout-btn" class="hidden bg-purple-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-purple-700">Выкупить отмеченное</button> 
+                    <button id="orders-bulk-assign-client-btn" class="bg-teal-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-teal-700">👤 Назначить клиента</button> 
+                </div>
+                <div class="border-t border-indigo-200 pt-2"> <button id="orders-bulk-delete-btn" class="bg-red-600 text-white font-bold py-1.5 px-3 rounded-lg text-xs hover:bg-red-700">Удалить выбранное</button> </div>
             </div>
+
+            <div id="orders-select-all-container" class="hidden flex items-center p-2 border-b"> <input type="checkbox" id="orders-select-all-checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"> <label for="orders-select-all-checkbox" class="ml-3 block text-sm font-bold text-gray-700">Выбрать все видимые заказы</label> </div>
+
+            <div id="orders-list-container" class="space-y-4 mt-4"> <p class="text-gray-500 animate-pulse">Загрузка заказов...</p> </div>
         </div>
-    `;
+        </div>
+`;
 
     // --- Добавляем слушатели к элементам ---
     console.log("[Render] renderOrdersTab: Adding listeners...");
@@ -3662,6 +3702,8 @@ async function renderOrdersTab() {
     replaceAndListen('orders-reset-status-filter', 'click', resetOrdersStatusFilter);
     replaceAndListen('orders-export-btn', 'click', handleExportOrders);
     replaceAndListen('orders-calculate-btn', 'click', openCalculateModal);
+    setupUnclaimedFilterButton();
+    setupAssignClientButton();
     // НОВЫЙ СЛУШАТЕЛЬ ДЛЯ ФИЛЬТРА ФИЛИАЛОВ
     replaceAndListen('orders-location-filter', 'change', fetchAndRenderOrders); 
 
@@ -3951,6 +3993,10 @@ async function fetchAndRenderOrders(filters = {}) {
         orderStatuses.filter(s => s !== 'Выдан').forEach(status => params.append('statuses', status));
     }
 
+    if (filterUnclaimedOnly) {
+        params.append('unclaimed_only', 'true');
+    }
+
     // Передача выбранного location_id для Владельца
     if (currentUser.role === 'Владелец') {
         const locationFilterSelect = document.getElementById('orders-location-filter');
@@ -4024,12 +4070,13 @@ async function handleAddOrderSubmit(e) {
 
     // Собираем основной payload
     const payload = {
-        client_id: parseInt(clientId),
-        track_code: track_code,
-        party_date: party_date,
-        purchase_type: purchase_type,
-        comment: comment
-        // location_id будет добавлен ниже
+       client_id: parseInt(clientId),
+       track_code: track_code,
+       party_date: party_date,
+       purchase_type: purchase_type,
+       comment: comment,
+       company_id: currentCompany.id, // <-- ДОБАВЬ ЭТУ СТРОКУ
+       // location_id будет добавлен ниже
     };
 
     // Добавляем location_id для Владельца
@@ -4113,6 +4160,138 @@ async function handleAddOrderSubmit(e) {
 
 // === КОНЕЦ ФУНКЦИЙ ДЛЯ ФОРМЫ ДОБАВЛЕНИЯ ЗАКАЗА ===
 
+// --- НОВЫЙ БЛОК: Логика для "Невостребованных" заказов ---
+
+// Глобальный флаг для фильтра
+let filterUnclaimedOnly = false;
+
+// Фильтр "Невостребованные"
+function setupUnclaimedFilterButton() {
+     const btn = document.getElementById('orders-filter-unclaimed-btn');
+     if (btn) {
+         btn.replaceWith(btn.cloneNode(true)); // Очистка слушателя
+         document.getElementById('orders-filter-unclaimed-btn').addEventListener('click', () => {
+             filterUnclaimedOnly = !filterUnclaimedOnly; // Инвертируем флаг
+             console.log("[Filter] Toggle unclaimed filter:", filterUnclaimedOnly);
+
+             // Обновляем вид кнопки
+             btn.classList.toggle('bg-red-600', filterUnclaimedOnly);
+             btn.classList.toggle('text-white', filterUnclaimedOnly);
+             btn.classList.toggle('bg-gray-100', !filterUnclaimedOnly);
+             btn.classList.toggle('text-red-600', !filterUnclaimedOnly);
+
+             // Перезагружаем заказы (бэкенд должен будет поддержать этот фильтр)
+             fetchAndRenderOrders(); 
+         });
+     }
+}
+
+// Кнопка "Назначить клиента"
+function setupAssignClientButton() {
+     const btn = document.getElementById('orders-bulk-assign-client-btn');
+     if(btn) {
+         btn.replaceWith(btn.cloneNode(true));
+         document.getElementById('orders-bulk-assign-client-btn').addEventListener('click', openAssignClientModal);
+     }
+}
+
+// Открытие модального окна "Назначить клиента"
+function openAssignClientModal() {
+    const selectedIds = Array.from(document.querySelectorAll('.order-checkbox:checked')).map(cb => cb.dataset.orderId);
+    if (selectedIds.length === 0) {
+        alert("Сначала выберите заказы для назначения.");
+        return;
+    }
+
+    // Сброс модального окна
+    document.getElementById('assign-client-info').textContent = `Выбрано заказов: ${selectedIds.length}`;
+    document.getElementById('assign-client-search-input').value = '';
+    document.getElementById('assign-client-search-results').innerHTML = '';
+    document.getElementById('assign-client-selected-id').value = '';
+    document.getElementById('assign-client-selected-info').classList.add('hidden');
+    document.getElementById('assign-client-save-btn').disabled = true;
+
+    // --- НОВЫЙ КОД: Заполняем select статусов ---
+        const statusSelect = document.getElementById('assign-client-new-status');
+        if (statusSelect) {
+            // Заполняем всеми статусами, кроме "Выдан" (т.к. мы назначаем, а не выдаем)
+            statusSelect.innerHTML = orderStatuses
+                .filter(s => s !== 'Выдан')
+                .map(s => `<option value="${s}" ${s === 'В пути' ? 'selected' : ''}>${s}</option>`)
+                .join('');
+            // По умолчанию выбираем "В пути", как ты и предлагал
+        }
+        // --- КОНЕЦ НОВОГО КОДА ---
+
+    // Привязка слушателей
+    const searchInput = document.getElementById('assign-client-search-input');
+    const searchResults = document.getElementById('assign-client-search-results');
+    const selectedIdInput = document.getElementById('assign-client-selected-id');
+    const selectedInfo = document.getElementById('assign-client-selected-info');
+    const saveBtn = document.getElementById('assign-client-save-btn');
+
+// Поиск клиента
+const newSearchInput = searchInput.cloneNode(true);
+searchInput.parentNode.replaceChild(newSearchInput, searchInput);
+newSearchInput.addEventListener('input', (e) => {
+    handleGenericClientSearch(e.target, searchResults, (client) => {
+        e.target.value = ''; 
+        searchResults.classList.add('hidden');
+        selectedIdInput.value = client.id; 
+        selectedInfo.textContent = `Выбран клиент: ${client.full_name} (${client.client_code_prefix || ''}${client.client_code_num || '?'})`;
+        selectedInfo.classList.remove('hidden');
+        // Важно: newSaveBtn может быть не определен, если saveBtn еще не был обработан.
+        // Вместо этого просто найдем кнопку и включим ее.
+        document.getElementById('assign-client-save-btn').disabled = false;
+    });
+});
+
+// Кнопка Сохранить
+const newSaveBtn = saveBtn.cloneNode(true);
+saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+newSaveBtn.addEventListener('click', () => handleSaveClientAssignment(selectedIds));
+
+    openModal('assign-client-modal');
+}
+
+// Сохранение назначения клиента
+async function handleSaveClientAssignment(orderIds) {
+    const clientId = document.getElementById('assign-client-selected-id').value;
+    const newStatus = document.getElementById('assign-client-new-status').value; // <-- ДОБАВИТЬ
+    if (!clientId) {
+        alert("Ошибка: Клиент не выбран.");
+        return;
+    }
+
+    console.log(`[Assign Client] Назначение ${orderIds.length} заказов клиенту ID: ${clientId}`);
+    showLoader();
+
+    try {
+        // Мы используем тот же эндпоинт, что и 'update_status'
+        const response = await apiFetch('/api/orders/bulk_action', {
+            method: 'POST',
+            body: JSON.stringify({
+                action: 'assign_client', // <-- НОВОЕ ДЕЙСТВИЕ
+                order_ids: orderIds.map(id => parseInt(id)),
+                client_id: parseInt(clientId), // <-- НОВЫЙ ПАРАМЕТР
+                new_status: newStatus
+            })
+        });
+
+        alert(response.message || 'Заказы успешно назначены!');
+        closeModal('assign-client-modal');
+        toggleOrdersSelectMode(); // Выходим из режима выбора
+        await fetchAndRenderOrders(); // Обновляем список
+
+    } catch (err) {
+        alert(`Ошибка назначения: ${err.message}`);
+    } finally {
+        hideLoader();
+    }
+}
+
+// --- КОНЕЦ НОВОГО БЛОКА ---
+
 // --- Функции для Импорта Заказов ---
 
 async function handleOrderExcelImport() {
@@ -4165,9 +4344,9 @@ async function handleOrderExcelImport() {
 
         // --- Шаг 2: Проверка колонок ---
         const firstRow = jsonData[0];
-        if (!firstRow || !firstRow.hasOwnProperty('track_code') || (!firstRow.hasOwnProperty('client_code') && !firstRow.hasOwnProperty('phone'))) {
-            resultsDiv.innerHTML = '<p class="text-red-500">Ошибка: Файл должен содержать <strong>track_code</strong> и (<strong>client_code</strong> или <strong>phone</strong>).</p>';
-            hideLoader(); return;
+        if (!firstRow || !firstRow.hasOwnProperty('track_code')) {
+          resultsDiv.innerHTML = '<p class="text-red-500">Ошибка: Файл должен содержать как минимум колонку <strong>track_code</strong>.</p>';
+          hideLoader(); return;
         }
         console.log("[Import Orders] Required columns found.");
 
@@ -4986,8 +5165,9 @@ function openEditOrderModal(orderId) {
     const formElement = document.getElementById('edit-order-form');
     if (formElement) {
         // Используем replaceWith для удаления старых слушателей
-        formElement.replaceWith(formElement.cloneNode(true));
-        document.getElementById('edit-order-form').addEventListener('submit', handleSaveOrderChanges);
+        const newFormElement = formElement.cloneNode(true);
+        formElement.parentNode.replaceChild(newFormElement, formElement);
+        newFormElement.addEventListener('submit', handleSaveOrderChanges);
         console.log("[Modal Listener OK] Added submit to #edit-order-form");
     } else {
         console.error("!!! openEditOrderModal: Form #edit-order-form NOT FOUND!");
@@ -4997,8 +5177,9 @@ function openEditOrderModal(orderId) {
     const clientSearchInput = document.getElementById('modal-order-client-search');
     if (clientSearchInput) {
         // Используем replaceWith для удаления старых слушателей
-        clientSearchInput.replaceWith(clientSearchInput.cloneNode(true));
-        document.getElementById('modal-order-client-search').addEventListener('input', (e) => {
+        const newClientSearchInput = clientSearchInput.cloneNode(true);
+        clientSearchInput.parentNode.replaceChild(newClientSearchInput, clientSearchInput);
+        newClientSearchInput.addEventListener('input', (e) => {
             const resultsDiv = document.getElementById('modal-order-client-results');
             const selectedIdInput = document.getElementById('modal-order-new-client-id');
             handleGenericClientSearch(e.target, resultsDiv, (client) => {
@@ -5919,9 +6100,24 @@ async function fetchAndRenderHistory() {
             const revertBtn = e.target.closest('.revert-status-btn');
             if (revertBtn) {
                 const orderId = revertBtn.dataset.orderId;
-                if (confirm('Вы уверены, что хотите вернуть этот заказ? Оплата будет отменена.')) {
-                    handleRevertStatus(orderId);
-                }
+if (confirm('Вы уверены, что хотите вернуть этот заказ? Оплата будет отменена.')) {
+    // Проверяем, установлен ли пароль в настройках
+    const requiredPassword = companySettings['password_revert_order'];
+    let password = null;
+
+    if (requiredPassword) {
+        password = prompt("Для возврата заказа введите пароль:");
+        if (password === null) return; // Нажата "Отмена"
+    }
+
+    const reason = prompt("Укажите ПРИЧИНУ возврата (обязательно):");
+    if (!reason || reason.trim().length < 5) {
+        alert("Причина не указана или слишком короткая. Возврат отменен.");
+        return;
+    }
+
+    handleRevertStatus(orderId, password, reason); // <-- ПЕРЕДАЕМ ДАННЫЕ
+}
             }
         });
 
@@ -5942,23 +6138,34 @@ function handleHistorySearch(e) {
 }
 
 // Обработка возврата статуса
-async function handleRevertStatus(orderId) {
+async function handleRevertStatus(orderId, password, reason) { // <-- ПРИНИМАЕМ ДАННЫЕ
     console.log(`[Revert] Reverting order ID: ${orderId}`);
     showLoader(); 
     try {
+        // Формируем payload
+        const payload = {
+            password: password,
+            revert_reason: reason
+        };
+
         // Вызываем PATCH /api/orders/{id}/revert_status
-        await apiFetch(`/api/orders/${orderId}/revert_status`, { method: 'PATCH' });
-        
+        await apiFetch(`/api/orders/${orderId}/revert_status`, { 
+            method: 'PATCH',
+            body: JSON.stringify(payload) // <-- ОТПРАВЛЯЕМ PAYLOAD
+        });
+
         alert('Статус заказа успешно возвращен на "Готов к выдаче"!');
         await fetchAndRenderHistory(); // Обновляем историю в модальном окне
         await fetchAndRenderIssueList(); // Обновляем список готовых к выдаче на основной вкладке
-        
+
     } catch (error) {
         alert(`Ошибка возврата статуса: ${error.message}`);
     } finally {
         hideLoader(); 
     }
 }
+
+
 
 // --- Поиск по списку Готовых к Выдаче ---
 function handleIssueSearch(e) {
@@ -7688,21 +7895,50 @@ async function renderSettingsTab() {
     // Генерируем HTML для вкладки
     pane.innerHTML = `
         <div class="bg-white p-6 rounded-lg shadow-md max-w-2xl mx-auto">
-            <h2 class="text-2xl font-bold mb-4">Настройки Компании (для Бота и ЛК)</h2>
+            <h2 class="text-2xl font-bold mb-4">Настройки Компании</h2>
+
+            <div class="border-b border-gray-200 mb-6">
+                <nav class="-mb-px flex space-x-8" id="settings-subtabs">
+                    <button data-subtab="settings-main" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-indigo-500 text-indigo-600">Основные</button>
+                    <button data-subtab="settings-passwords" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700">Пароли</button>
+                </nav>
+            </div>
+
             <form id="settings-form" class="space-y-6">
-                
-                <div>
-                    <label for="setting-china-address" class="block text-sm font-medium text-gray-700">Адрес склада в Китае</label>
-                    <p class="text-xs text-gray-500 mb-1">Используйте <code>{{client_code}}</code> для подстановки кода клиента.</p>
-                    <textarea id="setting-china-address" data-key="china_warehouse_address" class="setting-input w-full p-2 border rounded-md h-24 font-mono"></textarea>
+
+                <div id="subtab-settings-main" class="setting-subtab-pane space-y-6">
+                    <div>
+                        <label for="setting-china-address" class="block text-sm font-medium text-gray-700">Адрес склада в Китае</label>
+                        <p class="text-xs text-gray-500 mb-1">Используйте <code>{{client_code}}</code> для подстановки кода клиента.</p>
+                        <textarea id="setting-china-address" data-key="china_warehouse_address" class="setting-input w-full p-2 border rounded-md h-24 font-mono"></textarea>
+                    </div>
+
+                    <div>
+                        <label for="setting-pdf-link" class="block text-sm font-medium text-gray-700">Ссылка на PDF с инструкцией</label>
+                        <p class="text-xs text-gray-500 mb-1">Полная ссылка (https://...) для кнопки в боте.</p>
+                        <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
+                    </div>
                 </div>
-                
-                <div>
-                    <label for="setting-pdf-link" class="block text-sm font-medium text-gray-700">Ссылка на PDF с инструкцией</label>
-                    <p class="text-xs text-gray-500 mb-1">Полная ссылка (https://...) для кнопки в боте.</p>
-                    <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
+
+                <div id="subtab-settings-passwords" class="setting-subtab-pane space-y-6 hidden">
+                    <p class="text-sm text-gray-600">Установите пароли для опасных действий. Если поле оставить <b>пустым</b>, пароль запрашиваться не будет.</p>
+
+                    <div>
+                        <label for="setting-pass-revert-order" class="block text-sm font-medium text-gray-700">Пароль на <b>Возврат</b> выданного заказа</label>
+                        <input type="text" id="setting-pass-revert-order" data-key="password_revert_order" class="setting-input w-full p-2 border rounded-md">
+                    </div>
+
+                    <div>
+                        <label for="setting-pass-delete-order" class="block text-sm font-medium text-gray-700">Пароль на <b>Удаление</b> заказа</label>
+                        <input type="text" id="setting-pass-delete-order" data-key="password_delete_order" class="setting-input w-full p-2 border rounded-md">
+                    </div>
+
+                    <div>
+                        <label for="setting-pass-delete-client" class="block text-sm font-medium text-gray-700">Пароль на <b>Удаление</b> клиента</label>
+                        <input type="text" id="setting-pass-delete-client" data-key="password_delete_client" class="setting-input w-full p-2 border rounded-md">
+                    </div>
                 </div>
-                
+
                 <div class="border-t pt-4">
                     <button type="submit" class="w-full bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700">Сохранить Настройки</button>
                 </div>
@@ -7716,6 +7952,29 @@ async function renderSettingsTab() {
         form.replaceWith(form.cloneNode(true)); // Очищаем старые
         document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
         console.log("[Listener OK] Added submit to #settings-form");
+    }
+
+    // Привязываем слушатель к под-вкладкам
+    const subtabsContainer = document.getElementById('settings-subtabs');
+    if (subtabsContainer) {
+        subtabsContainer.addEventListener('click', e => {
+            const tabButton = e.target.closest('.setting-subtab-btn');
+            if (tabButton) {
+                const tabName = tabButton.dataset.subtab;
+                // Стилизация кнопок
+                document.querySelectorAll('.setting-subtab-btn').forEach(btn => {
+                    btn.classList.remove('border-indigo-500', 'text-indigo-600');
+                    btn.classList.add('border-transparent', 'text-gray-500');
+                });
+                tabButton.classList.add('border-indigo-500', 'text-indigo-600');
+                tabButton.classList.remove('border-transparent', 'text-gray-500');
+                // Показ/скрытие панелей
+                document.querySelectorAll('.setting-subtab-pane').forEach(pane => {
+                    pane.classList.toggle('hidden', pane.id !== `subtab-${tabName}`);
+                });
+            }
+        });
+        console.log("[Listener OK] Added click to #settings-subtabs");
     }
 
     // Загружаем и отображаем текущие настройки
