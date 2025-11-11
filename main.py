@@ -1859,8 +1859,8 @@ class BulkActionPayload(BaseModel):
     new_status: Optional[str] = None
     new_party_date: Optional[date] = None
     buyout_actual_rate: Optional[float] = None
-    password: Optional[str] = None # Будем проверять пароль Владельца
-    client_id: Optional[int] = None # <-- ДОБАВЛЕНО: Для назначения клиента
+    client_id: Optional[int] = None # <-- ИСПРАВЛЕНО (было new_client_id)
+    password: Optional[str] = None
 
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
@@ -1886,19 +1886,15 @@ class IssuePayload(BaseModel):
 
 # --- Эндпоинты для Заказов ---
 
-# main.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ функцию get_orders ЕЩЕ РАЗ)
+# main.py (ЗАМЕНИТЬ ПОЛНОСТЬЮ функцию get_orders)
+from sqlalchemy.orm import contains_eager # <-- ДОБАВЬ ЭТОТ ИМПОРТ в начало файла (рядом с joinedload)
 
 @app.get("/api/orders", tags=["Заказы (Владелец)", "Telegram Bot"], response_model=List[OrderOut])
 def get_orders(
-    company_id: int = Query(...),
-    unclaimed_only: Optional[bool] = Query(False), 
+    company_id: int = Query(...), 
     client_id: Optional[int] = Query(None), 
-    
-    # --- НОВОЕ: Добавлен поиск и лимит ---
     q: Optional[str] = Query(None, description="Поиск по трек-коду, ФИО клиента или телефону"),
-    limit: Optional[int] = Query(20, description="Лимит результатов (по умолчанию 20)"),
-    # --- КОНЕЦ НОВОГО ---
-    
+    limit: Optional[int] = Query(None, description="Лимит результатов (по умолчанию нет)"), # <-- ИСПРАВЛЕНО
     party_dates: Optional[List[date]] = Query(None),
     statuses: Optional[List[str]] = Query(default=None),
     location_id: Optional[int] = Query(None),
@@ -1907,7 +1903,7 @@ def get_orders(
 ):
     """
     Получает список заказов компании с фильтрацией.
-    (Версия с поддержкой поиска 'q' для Владельца)
+    (Версия 3.1 - Убран лимит по умолчанию)
     """
     print(f"[Get Orders] Запрос для Company ID={company_id}. Employee Header: {x_employee_id}. Client ID: {client_id}. Поиск: '{q}'")
 
@@ -1916,16 +1912,18 @@ def get_orders(
     if not company:
         raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
 
-    query = db.query(Order).options(joinedload(Order.client)).filter(
+    # 1. Базовый запрос СРАЗУ с outerjoin(Client)
+    query = db.query(Order).join(
+        Client, Order.client_id == Client.id, isouter=True
+    ).filter(
         Order.company_id == company_id
     )
 
-    # --- НОВОЕ: Логика поиска по 'q' ---
+    # --- Логика поиска по 'q' ---
     if q:
         search_term = f"%{q.lower()}%"
-        # Присоединяем Client, чтобы искать по имени/телефону
-        # Используем isouter=True на случай, если клиент был удален, а заказы остались
-        query = query.join(Client, Client.id == Order.client_id, isouter=True).filter( 
+        # Фильтруем по уже присоединенным таблицам
+        query = query.filter( 
             or_(
                 func.lower(Order.track_code).ilike(search_term),
                 func.lower(Client.full_name).ilike(search_term),
@@ -1933,8 +1931,7 @@ def get_orders(
             )
         )
         print(f"[Get Orders] Применен текстовый поиск: '{q}'")
-    # --- КОНЕЦ НОВОГО ---
-
+            
     employee: Optional[Employee] = None
     target_location_id: Optional[int] = None
 
@@ -1942,7 +1939,6 @@ def get_orders(
     if x_employee_id:
         try:
             employee_id_int = int(x_employee_id)
-            # Загружаем сотрудника, его роль и права
             employee = db.query(Employee).options(
                 joinedload(Employee.role).joinedload(Role.permissions)
             ).filter(
@@ -1955,20 +1951,16 @@ def get_orders(
             
         if employee:
             print(f"[Get Orders] Запрос идентифицирован как от сотрудника ID={employee.id} (Роль: {employee.role.name})")
-            # Владелец может фильтровать по филиалу, сотрудник видит только свой
             if employee.role.name == 'Владелец':
                 if location_id is not None:
-                    # Владелец выбрал филиал
                     loc_check = db.query(Location.id).filter(Location.id == location_id, Location.company_id == company_id).first()
                     if not loc_check: raise HTTPException(status_code=404, detail="Указанный филиал не найден.")
                     target_location_id = location_id
                     print(f"[Get Orders] Владелец фильтрует по филиалу ID={target_location_id}")
                 else:
-                    # Владелец видит все филиалы
                     print(f"[Get Orders] Владелец видит все филиалы.")
                     target_location_id = None
             else: 
-                # Обычный сотрудник видит только свой филиал
                 target_location_id = employee.location_id
                 if target_location_id is None:
                     print(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
@@ -1976,49 +1968,41 @@ def get_orders(
                 print(f"[Get Orders] Сотрудник видит свой филиал ID={target_location_id}")
         else:
             print("[Get Orders] Заголовок X-Employee-ID передан, но сотрудник не найден/не активен.")
-            # (Если заголовок был, но невалидный, можно вернуть 401,
-            # но для бота/ЛК мы продолжаем без сотрудника)
 
-    # --- Фильтрация по client_id (применяется всегда, если передан) ---
-    # (Это используется ботом для "Мои Заказы")
+    # --- Фильтрация по client_id ---
     if client_id is not None:
-        client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
-        if not client_check:
-            raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
+        if not q:
+             client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
+             if not client_check:
+                 raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
         query = query.filter(Order.client_id == client_id)
         print(f"[Get Orders] Применен фильтр по Client ID={client_id}")
 
     # --- Применяем остальные фильтры ---
-    
-    # Фильтр по филиалу (если он был определен для сотрудника/Владельца)
     if target_location_id is not None:
         query = query.filter(Order.location_id == target_location_id)
 
-    # --- НОВЫЙ ФИЛЬТР "НЕВОСТРЕБОВАННЫЕ" ---
-    if unclaimed_only:
-        # Ищем заказы БЕЗ клиента (client_id is NULL)
-        query = query.filter(Order.client_id == None) 
-        print(f"[Get Orders] Применен фильтр 'Только невостребованные'")
-    # --- КОНЕЦ ФИЛЬТРА ---
-
-    # Фильтр по датам партий
     if party_dates:
         query = query.filter(Order.party_date.in_(party_dates))
 
-    # Фильтр по статусам
     statuses_to_filter = statuses
-    # Если статусы не переданы И это запрос из админки (employee определен),
-    # то по умолчанию скрываем "Выданные"
     if not statuses_to_filter and employee:
         statuses_to_filter = [s for s in ORDER_STATUSES if s != "Выдан"]
     
-    # Применяем фильтр по статусам, если он есть
     if statuses_to_filter:
         query = query.filter(Order.status.in_(statuses_to_filter))
 
-    # --- НОВОЕ: Добавляем limit к запросу ---
-    orders = query.order_by(Order.party_date.desc().nullslast(), Order.id.desc()).limit(limit).all()
-    # --- КОНЕЦ НОВОГО ---
+    # 2. Используем contains_eager, чтобы "собрать" данные клиента из join
+    final_query = query.options(contains_eager(Order.client))
+    
+    # 3. Применяем сортировку (без лимита по умолчанию)
+    final_query = final_query.order_by(Order.party_date.desc().nullslast(), Order.id.desc())
+    
+    # ИСПРАВЛЕНИЕ: Применяем лимит, только если он явно передан
+    if limit is not None:
+        final_query = final_query.limit(limit)
+        
+    orders = final_query.all()
     
     print(f"[Get Orders] Найдено заказов: {len(orders)}")
     return orders
@@ -2127,8 +2111,9 @@ async def update_order( # Убедись, что 'async' здесь есть
 ):
     """(С ИСПРАВЛЕНИЯМИ) Обновляет данные заказа и отправляет уведомление."""
     
-    # 1. Находим заказ, проверяем принадлежность к компании
-    order = db.query(Order).options(joinedload(Order.client)).filter( 
+    # 1. Находим заказ
+    # НЕ ИСПОЛЬЗУЕМ joinedload(Order.client) здесь, т.к. он может загрузить СТАРОГО клиента
+    order = db.query(Order).filter( 
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
@@ -2137,12 +2122,12 @@ async def update_order( # Убедись, что 'async' здесь есть
 
     update_data = payload.dict(exclude_unset=True) 
     original_status = order.status 
+    original_client_id = order.client_id # Запоминаем ID старого клиента
 
     # 2. Обработка изменения location_id (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА)
     if 'location_id' in update_data:
         if employee.role.name != 'Владелец':
             del update_data['location_id']  
-            print(f"[Update Order] Сотрудник ID={employee.id} не может менять филиал заказа ID={order_id}.")
         elif update_data['location_id'] != order.location_id: 
             new_location = db.query(Location).filter(
                 Location.id == update_data['location_id'],
@@ -2150,17 +2135,19 @@ async def update_order( # Убедись, что 'async' здесь есть
             ).first()
             if not new_location:
                 raise HTTPException(status_code=404, detail="Новый филиал не найден в вашей компании.")
-            print(f"[Update Order] Владелец ID={employee.id} меняет филиал заказа ID={order_id} на ID={update_data['location_id']}")
 
     # 3. Обработка смены клиента (если client_id передан)
-    if 'client_id' in update_data and update_data['client_id'] != order.client_id:
-        new_client = db.query(Client).filter(
-            Client.id == update_data['client_id'],
-            Client.company_id == employee.company_id
-        ).first()
-        if not new_client:
-             raise HTTPException(status_code=404, detail="Новый клиент не найден в вашей компании.")
-        print(f"[Update Order] Заказ ID={order_id} переносится на клиента ID={update_data['client_id']}")
+    new_client_id = None
+    if 'client_id' in update_data:
+        new_client_id = update_data['client_id'] # Запоминаем ID нового клиента
+        if new_client_id != original_client_id:
+            new_client_check = db.query(Client.id).filter( # Проверяем только ID
+                Client.id == new_client_id,
+                Client.company_id == employee.company_id
+            ).first()
+            if not new_client_check:
+                 raise HTTPException(status_code=404, detail="Новый клиент не найден в вашей компании.")
+            print(f"[Update Order] Заказ ID={order_id} переносится на клиента ID={new_client_id}")
 
     # 4. Проверка дубликата трек-кода при изменении
     if 'track_code' in update_data and update_data['track_code'] != order.track_code:
@@ -2183,27 +2170,46 @@ async def update_order( # Убедись, что 'async' здесь есть
             setattr(order, key, value)
         
         db.commit() 
-        db.refresh(order) 
-        db.refresh(order, attribute_names=['client']) 
+        # db.refresh(order) # Не используем refresh, т.к. он не обновит связи
+        
+        # --- ИСПРАВЛЕНИЕ: ПЕРЕЗАГРУЖАЕМ ОБЪЕКТ ПОЛНОСТЬЮ ---
+        # После commit(), делаем НОВЫЙ запрос, чтобы получить
+        # обновленный заказ С ГАРАНТИРОВАННО ПОДГРУЖЕННЫМ НОВЫМ КЛИЕНТОМ
+        updated_order_with_client = db.query(Order).options(
+            joinedload(Order.client) # <-- Принудительно грузим КЛИЕНТА
+        ).filter(
+            Order.id == order_id
+        ).first()
+        
+        if not updated_order_with_client:
+             # Этого не должно случиться, но на всякий случай
+             raise HTTPException(status_code=500, detail="Ошибка: Обновленный заказ не найден после сохранения.")
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-        # --- НАЧАЛО: ИСПРАВЛЕННАЯ Логика уведомлений ---
+
+        # --- Логика уведомлений (ИСПОЛЬЗУЕМ НОВЫЙ ОБЪЕКТ) ---
         if 'status' in update_data and update_data['status'] != original_status:
             new_status = update_data['status']
-            # Проверяем, что у клиента есть chat_id и статус из списка "важных"
-            if order.client and order.client.telegram_chat_id and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
-                print(f"[Notification] Статус заказа {order.id} изменился на '{new_status}'. Вызов await generate_and_send_notification...")
-                # Прямой ВЫЗОВ (await), т.к. сессия db еще жива
+            
+            # ВАЖНО: Уведомление должно уйти НОВОМУ клиенту, если он сменился
+            client_to_notify = updated_order_with_client.client 
+            
+            if client_to_notify and client_to_notify.telegram_chat_id and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
+                print(f"[Notification] Статус заказа {updated_order_with_client.id} изменился на '{new_status}'. Вызов await generate_and_send_notification...")
                 await generate_and_send_notification(
-                        client=order.client, 
+                        client=client_to_notify, 
                         new_status=new_status, 
-                        track_codes=[order.track_code]
+                        track_codes=[updated_order_with_client.track_code]
                 )
             else:
-                print(f"[Notification] Уведомление для заказа {order.id} не отправлено (статус: '{new_status}', chat_id: {order.client.telegram_chat_id})")
-        # --- КОНЕЦ: ИСПРАВЛЕННАЯ Логика уведомлений ---
+                chat_id_debug = client_to_notify.telegram_chat_id if client_to_notify else "Нет клиента"
+                print(f"[Notification] Уведомление для заказа {updated_order_with_client.id} не отправлено (статус: '{new_status}', chat_id: {chat_id_debug})")
+        # --- КОНЕЦ Логики уведомлений ---
 
         print(f"[Update Order] Заказ ID={order_id} успешно обновлен.")
-        return order 
+        # Возвращаем объект, который мы принудительно перезагрузили
+        return updated_order_with_client 
+        
     except Exception as e:
         db.rollback() 
         import traceback
@@ -2260,17 +2266,16 @@ def get_order_parties(
 @app.post("/api/orders/bulk_action", tags=["Заказы (Владелец)"])
 def bulk_order_action(
     payload: BulkActionPayload,
-    background_tasks: BackgroundTasks, # <-- ИЗМЕНЕНО (убран async, добавлен tasks)
+    background_tasks: BackgroundTasks, # <-- Используем BackgroundTasks
     employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db)
 ):
-    """(С ИСПРАВЛЕНИЯМИ) Выполняет массовые действия и отправляет уведомления."""
+    """(Версия 3.0) Выполняет массовые действия (синхронно) и запускает уведомления в фоне."""
 
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для действия.")
 
-    # 1. Проверка существования и принадлежности к компании
-    # Загружаем заказы СРАЗУ с клиентами
+    # 1. Загружаем заказы СРАЗУ с клиентами
     query = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(payload.order_ids),
         Order.company_id == employee.company_id 
@@ -2297,7 +2302,7 @@ def bulk_order_action(
                 if order.client.id not in notifications_to_send:
                     notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
                 notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
-
+        
         print(f"[Notification] Найдено {len(notifications_to_send)} клиентов для массовой рассылки.")
         # --- КОНЕЦ Группировки ---
 
@@ -2306,21 +2311,18 @@ def bulk_order_action(
 
         # --- Отправка (ПОСЛЕ commit) ---
         if notifications_to_send and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
-            print(f"[Notification] Запуск {len(notifications_to_send)} задач на отправку...")
-            tasks = []
+            print(f"[Notification] Добавление {len(notifications_to_send)} задач в фон...")
+            
+            # ИСПРАВЛЕНИЕ: Добавляем async-функцию в BackgroundTasks ПРАВИЛЬНО
             for client_id, data in notifications_to_send.items():
-                # Создаем задачи
-                tasks.append(
-                    generate_and_send_notification(
-                        client=data["client"], 
-                        new_status=new_status, 
-                        track_codes=data["track_codes"]
-                    )
+                background_tasks.add_task(
+                    generate_and_send_notification, # <--- Наша async-функция
+                    client=data["client"], 
+                    new_status=new_status, 
+                    track_codes=data["track_codes"]
                 )
-            # ИСПОЛЬЗУЕМ BACKGROUND_TASKS для асинхронной отправки из синхронной функции
-            for task in tasks:
-                background_tasks.add_task(asyncio.run, task) # (Простой способ запустить async из sync)
-            print(f"[Notification] Все {len(tasks)} задач по отправке добавлены в фон.")
+            
+            print(f"[Notification] Все {len(notifications_to_send)} задач по отправке добавлены в фон.")
         else:
              print(f"[Notification] Массовая рассылка не требуется (статус: '{new_status}' или нет клиентов).")
         # --- КОНЕЦ Отправки ---
@@ -2353,45 +2355,64 @@ def bulk_order_action(
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Ошибка базы данных при массовом выкупе: {e}")
 
-    # --- НАШ НОВЫЙ БЛОК 'assign_client' ---
+    # --- ИСПРАВЛЕННЫЙ БЛОК 'assign_client' (v3.2) ---
     elif payload.action == 'assign_client':
-        new_client_id = payload.client_id
+        
+        # ИСПРАВЛЕНИЕ: Используем 'client_id', как ожидает твой JS
+        new_client_id = payload.client_id 
 
-        # Получаем статус из payload
         new_status = payload.new_status
         if not new_status or new_status not in ORDER_STATUSES or new_status == "Выдан":
-            # Если статус не передан или некорректен, ставим "В пути" по умолчанию
-            new_status = "В пути" 
+            new_status = "В пути" # Статус по умолчанию при назначении
 
         if not new_client_id:
-            raise HTTPException(status_code=400, detail="Не указан ID клиента для назначения.")
+            # Ошибка теперь соответствует полю Pydantic
+            raise HTTPException(status_code=400, detail="Не указан ID клиента для назначения (client_id).")
 
         client = db.query(Client).filter(Client.id == new_client_id, Client.company_id == employee.company_id).first()
         if not client:
             raise HTTPException(status_code=404, detail="Клиент, которому вы пытаетесь назначить заказ, не найден.")
 
+        # Проверяем, не назначен ли заказ УЖЕ этому клиенту
+        already_assigned_tracks = []
+        ids_to_update = []
         for order in orders_to_action:
-            if order.client_id is not None:
-                raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} уже назначен клиенту ID {order.client_id}.")
+            if order.client_id == new_client_id:
+                already_assigned_tracks.append(order.track_code)
+            else:
+                # Добавляем в список на обновление, ТОЛЬКО если он не назначен
+                ids_to_update.append(order.id)
 
-        # Назначаем клиента И меняем статус на ВЫБРАННЫЙ
-        count = query.update(
+        if not ids_to_update:
+             # Если все заказы УЖЕ принадлежат этому клиенту
+             raise HTTPException(status_code=400, detail=f"Все выбранные заказы ({already_assigned_tracks}) уже назначены этому клиенту.")
+
+        # Обновляем только те, которые еще не назначены
+        count = db.query(Order).filter(
+            Order.id.in_(ids_to_update),
+            Order.company_id == employee.company_id
+        ).update(
             {"client_id": new_client_id, "status": new_status}, 
-            synchronize_session='fetch'
+            synchronize_session=False # 'fetch' не нужен, т.к. мы знаем ID
         )
         db.commit()
 
         # Отправляем уведомление новому клиенту в фоне
-        track_codes = [o.track_code for o in orders_to_action]
-        background_tasks.add_task(
-            generate_and_send_notification,
-            client=client,
-            new_status=new_status, # <-- Используем new_status
-            track_codes=track_codes
-        )
+        track_codes = [o.track_code for o in orders_to_action if o.id in ids_to_update]
+        if track_codes: # Отправляем, только если что-то реально назначили
+            background_tasks.add_task(
+                generate_and_send_notification,
+                client=client,
+                new_status=new_status, 
+                track_codes=track_codes
+            )
 
-        return {"status": "ok", "message": f"{count} заказов успешно назначены клиенту {client.full_name} (статус '{new_status}')."}
-    # --- КОНЕЦ НОВОГО БЛОКА ---
+        message = f"{count} заказов успешно назначены клиенту {client.full_name} (статус '{new_status}')."
+        if already_assigned_tracks:
+            message += f" {len(already_assigned_tracks)} заказов были пропущены, т.к. уже принадлежали ему."
+
+        return {"status": "ok", "message": message}
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
     elif payload.action == 'delete':
         if not payload.password or employee.password != payload.password:
@@ -2404,6 +2425,7 @@ def bulk_order_action(
 
     else:
         raise HTTPException(status_code=400, detail="Неизвестное массовое действие.")
+
 
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
 def bulk_import_orders(
