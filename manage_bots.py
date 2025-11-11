@@ -29,7 +29,7 @@ CONFIG_FILE_PREFIX = "cargo_bot_" # Префикс для файлов конф�
 # %(company_code)s - Код компании (для лог файла)
 CONFIG_TEMPLATE = """
 [program:{program_name}]
-command={python_executable} {bot_script_path} --token "{bot_token}" --company-id {company_id} --api-url {api_url}
+command={python_executable} {bot_script_path}
 directory={project_dir}
 user={user}
 autostart=true
@@ -37,7 +37,7 @@ autorestart=true
 stopwaitsecs=600 ; wait 10 minutes before killing the script
 stderr_logfile=/var/log/supervisor/{program_name}_err.log
 stdout_logfile=/var/log/supervisor/{program_name}_out.log
-environment=LANG="en_US.UTF-8",LC_ALL="en_US.UTF-8" ; For Unicode support
+environment=LANG="en_US.UTF-8",LC_ALL="en_US.UTF-8",ADMIN_API_URL="{api_url}",TELEGRAM_BOT_TOKEN="{bot_token}"
 """
 
 # --- Определение модели Company (только нужные поля) ---
