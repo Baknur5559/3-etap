@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env pytho
 # -*- coding: utf-8 -*-
 # bot_template.py (Версия 6.0 - Полный переход на API + Функции Владельца)
 
