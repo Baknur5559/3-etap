@@ -1495,7 +1495,7 @@ async function renderCompaniesTab() {
     if (addBtn) {
         // Используем replaceWith(cloneNode) для удаления старых слушателей перед добавлением нового
         const newAddBtn = addBtn.cloneNode(true);
-        addBtn.parentNode.replaceChild(newAddBtn, addBtn);
+        addBtn.parentNode?.replaceChild(newAddBtn, addBtn);
         newAddBtn.addEventListener('click', () => openCompanyModal()); // Добавляем слушатель к НОВОЙ кнопке
         console.log("[Listener OK] Added click to #add-company-btn");
     } else {
@@ -1505,7 +1505,7 @@ async function renderCompaniesTab() {
     if (companyListDiv) {
          // Используем делегирование событий для кнопок Редактировать/Удалить внутри списка
          const newCompanyListDiv = companyListDiv.cloneNode(false); // Клонируем пустой контейнер
-         companyListDiv.parentNode.replaceChild(newCompanyListDiv, companyListDiv); // Заменяем старый
+         companyListDiv.parentNode?.replaceChild(newCompanyListDiv, companyListDiv); // Заменяем старый
          newCompanyListDiv.innerHTML = 'Загрузка списка компаний...'; // Восстанавливаем заглушку
          newCompanyListDiv.addEventListener('click', handleCompanyActions); // Добавляем слушатель к НОВОМУ контейнеру
          console.log("[Listener OK] Added click delegate listener to #companies-list");
@@ -2720,11 +2720,11 @@ async function renderRolesTab() {
     const rolesListDiv = document.getElementById('roles-list');
 
     if (addForm) {
-        // Удаляем старые слушатели перед добавлением нового
-        addForm.replaceWith(addForm.cloneNode(true));
+        // ИСПРАВЛЕНИЕ: Используем безопасный .parentNode?.replaceChild
         const newAddForm = addForm.cloneNode(true);
-        addForm.parentNode.replaceChild(newAddForm, addForm);
+        addForm.parentNode?.replaceChild(newAddForm, addForm);
         newAddForm.addEventListener('submit', handleAddRole);
+        console.log("[Listener OK] Added submit to #add-role-form");
     } else {
         console.error("!!! renderRolesTab: Element #add-role-form NOT FOUND after innerHTML.");
     }
@@ -2732,6 +2732,7 @@ async function renderRolesTab() {
     if (rolesListDiv) {
          // Используем делегирование событий для кнопок "Настроить"/"Удалить"
          const newRolesListDiv = rolesListDiv.cloneNode(false); // Клонируем пустой
+         // ИСПРАВЛЕНИЕ: Добавляем ?. (знак вопроса) перед replaceChild
          rolesListDiv.parentNode?.replaceChild(newRolesListDiv, rolesListDiv);
          newRolesListDiv.innerHTML = 'Загрузка списка должностей...'; // Восстанавливаем заглушку
          // Добавляем слушатель к НОВОМУ контейнеру
@@ -3625,19 +3626,20 @@ pane.innerHTML = `
         <div class="lg:col-span-2 bg-white p-6 rounded-lg shadow-md border">
 
             <div id="orders-action-header" class="sticky top-0 bg-white py-3 mb-4 border-b -mx-6 px-6 flex flex-wrap justify-between items-center gap-2 z-10">
-                <div class="flex items-center gap-2 flex-wrap">
 
-                    <button id="orders-toggle-select-mode-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150" title="Включить/выключить режим выбора заказов">✅ Выбрать</button>
+                     <div class="flex items-center gap-2 flex-wrap">
+                        
+                        <button id="orders-toggle-select-mode-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150" title="Включить/выключить режим выбора заказов">✅ Выбрать</button>
+                        
+                        <div class="relative"> <button id="orders-toggle-party-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🗳️ Партии</button> <div id="orders-party-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по партиям:</p> <div id="orders-party-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-party-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-party-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
+                        
+                        <div class="relative"> <button id="orders-toggle-status-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🟢 Статусы</button> <div id="orders-status-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по статусам:</p> <div id="orders-status-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-status-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-status-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
+                        
+                        ${locationFilterHtml} 
+                        
+                        
+                        <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm transition-colors duration-150" title="Экспортировать отфильтрованные заказы в Excel">📥 Экспорт</button>
 
-                    <div class="relative"> <button id="orders-toggle-party-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🗳️ Партии</button> <div id="orders-party-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по партиям:</p> <div id="orders-party-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-party-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-party-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
-
-                    <div class="relative"> <button id="orders-toggle-status-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors duration-150">🟢 Статусы</button> <div id="orders-status-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <p class="font-semibold mb-2 text-sm text-gray-700">Фильтр по статусам:</p> <div id="orders-status-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-status-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Применить</button> <button id="orders-reset-status-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
-
-
-                    ${locationFilterHtml} 
-
-
-                    <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm transition-colors duration-150" title="Экспортировать отфильтрованные заказы в Excel">📥 Экспорт</button>
                     <button id="orders-calculate-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-blue-600 hover:bg-blue-100 text-sm transition-colors duration-150" title="Открыть окно расчета стоимости для выбранного клиента">🧮 Рассчитать</button>
                     <button id="orders-filter-unclaimed-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-red-600 hover:bg-red-100 text-sm transition-colors duration-150" title="Показать только невостребованные заказы (без клиента)">🚩 Невостребованные</button>
                 </div>
@@ -3702,10 +3704,10 @@ pane.innerHTML = `
     replaceAndListen('orders-reset-status-filter', 'click', resetOrdersStatusFilter);
     replaceAndListen('orders-export-btn', 'click', handleExportOrders);
     replaceAndListen('orders-calculate-btn', 'click', openCalculateModal);
+    replaceAndListen('orders-location-filter', 'change', fetchAndRenderOrders);
+    // replaceAndListen('orders-filter-unclaimed-btn', 'click', handleFilterUnclaimed); удалено
     setupUnclaimedFilterButton();
     setupAssignClientButton();
-    // НОВЫЙ СЛУШАТЕЛЬ ДЛЯ ФИЛЬТРА ФИЛИАЛОВ
-    replaceAndListen('orders-location-filter', 'change', fetchAndRenderOrders); 
 
     // Поиск
     replaceAndListen('orders-search-input', 'input', handleOrdersSearch);
@@ -4166,25 +4168,17 @@ async function handleAddOrderSubmit(e) {
 let filterUnclaimedOnly = false;
 
 // Фильтр "Невостребованные"
+// Фильтр "Невостребованные"
 function setupUnclaimedFilterButton() {
      const btn = document.getElementById('orders-filter-unclaimed-btn');
      if (btn) {
          btn.replaceWith(btn.cloneNode(true)); // Очистка слушателя
-         document.getElementById('orders-filter-unclaimed-btn').addEventListener('click', () => {
-             filterUnclaimedOnly = !filterUnclaimedOnly; // Инвертируем флаг
-             console.log("[Filter] Toggle unclaimed filter:", filterUnclaimedOnly);
-
-             // Обновляем вид кнопки
-             btn.classList.toggle('bg-red-600', filterUnclaimedOnly);
-             btn.classList.toggle('text-white', filterUnclaimedOnly);
-             btn.classList.toggle('bg-gray-100', !filterUnclaimedOnly);
-             btn.classList.toggle('text-red-600', !filterUnclaimedOnly);
-
-             // Перезагружаем заказы (бэкенд должен будет поддержать этот фильтр)
-             fetchAndRenderOrders(); 
-         });
+         // ИСПРАВЛЕНО: Теперь мы вызываем handleFilterUnclaimed
+         document.getElementById('orders-filter-unclaimed-btn').addEventListener('click', handleFilterUnclaimed);
+         console.log("[Listener OK] Added click to #orders-filter-unclaimed-btn via setup function.");
      }
 }
+
 
 // Кнопка "Назначить клиента"
 function setupAssignClientButton() {
@@ -4610,6 +4604,51 @@ function handleOrdersSearch(e) {
     updateSelectAllCheckboxState();
 }
 
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ: Показать только "Невостребованные" (Неизвестный клиент) ---
+// (Вставить после handleOrdersSearch)
+function handleFilterUnclaimed() {
+    // Эта функция ищет заказы, которые сгруппированы под 'unknown'
+    // (т.е. `client_id` у них `null`), и которым `renderOrderListFromCache`
+    // присваивает `full_name: 'Неизвестный клиент'`.
+    
+    const searchString = "Неизвестный клиент";
+    console.log(`[Filter] handleFilterUnclaimed: Filtering by '${searchString}'`);
+    
+    // 1. Находим поле поиска
+    const searchInput = document.getElementById('orders-search-input');
+    if (!searchInput) return;
+
+    // 2. Вписываем в него "Неизвестный клиент"
+    searchInput.value = searchString; 
+
+    // 3. Вызываем событие 'input', чтобы запустить функцию handleOrdersSearch
+    // handleOrdersSearch найдет группу с `data-client-name="неизвестный клиент"`
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    
+    // 4. (Опционально) Скрываем панели фильтров, чтобы не мешали
+    document.getElementById('orders-status-filter-container')?.classList.add('hidden');
+    document.getElementById('orders-party-filter-container')?.classList.add('hidden');
+}
+
+// --- НОВАЯ ФУНКЦИЯ: Обновить список и сбросить поиск ---
+// (Вставить после handleFilterUnclaimed)
+async function handleRefreshOrders() {
+    console.log("[Refresh] handleRefreshOrders: Clearing search and fetching orders.");
+    // 1. Очищаем поле поиска
+    const searchInput = document.getElementById('orders-search-input');
+    if (searchInput) {
+        searchInput.value = "";
+        // Вызываем событие 'input', чтобы сбросить фильтрацию
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    
+    // 2. (Опционально) Сбрасываем фильтры статусов и партий
+    // resetOrdersStatusFilter(); // Это вызовет двойную загрузку, не надо
+    // resetOrdersPartyFilter(); // Это вызовет двойную загрузку, не надо
+    
+    // 3. Загружаем свежие данные с сервера
+    await fetchAndRenderOrders();
+}
 
 // --- Функции для Массовых Действий ---
 
@@ -5207,8 +5246,9 @@ async function handleSaveOrderChanges(e) {
     showLoader(); 
     const form = e.target;
     const orderId = form.dataset.orderId; 
+    const orderIdInt = parseInt(orderId); // Нам понадобится число
 
-    if (!orderId) { 
+    if (!orderIdInt) { 
         hideLoader(); 
         alert("Критическая ошибка: Не удалось определить ID редактируемого заказа."); 
         console.error("!!! handleSaveOrderChanges: Order ID not found in form data-attribute.");
@@ -5232,7 +5272,6 @@ async function handleSaveOrderChanges(e) {
         comment: document.getElementById('modal-order-comment')?.value.trim() || null, 
         // Поля выкупа
         buyout_item_cost_cny: parseFloat(document.getElementById('modal-order-buyout-cost')?.value) || null,
-        // ИСПРАВЛЕНИЕ: Используем || вместо ??
         buyout_commission_percent: parseFloat(document.getElementById('modal-order-buyout-commission')?.value) || 10.0, 
         buyout_rate_for_client: parseFloat(document.getElementById('modal-order-buyout-rate')?.value) || null,
         buyout_actual_rate: parseFloat(document.getElementById('modal-order-buyout-actual-rate')?.value) || null,
@@ -5245,8 +5284,6 @@ async function handleSaveOrderChanges(e) {
         if (locationSelect && locationSelect.value) {
             payload.location_id = parseInt(locationSelect.value); 
             console.log("[Save Order Changes] Sending location_id:", payload.location_id);
-        } else {
-            console.log("[Save Order Changes] Location select not found or no value selected for Owner.");
         }
     }
     // --- КОНЕЦ ЛОГИКИ LOCATION_ID ---
@@ -5261,6 +5298,8 @@ async function handleSaveOrderChanges(e) {
 
     console.log(`[Save Order Changes] Sending PATCH to /api/orders/${orderId}. Payload:`, payload);
     try {
+        // 1. Отправляем запрос. Бэкенд (с нашим фиксом в get_orders) вернет
+        //    объект updatedOrder С ПОЛНЫМИ ДАННЫМИ КЛИЕНТА.
         const updatedOrder = await apiFetch(`/api/orders/${orderId}`, {
             method: 'PATCH',
             body: JSON.stringify(payload)
@@ -5268,7 +5307,25 @@ async function handleSaveOrderChanges(e) {
         console.log("[Save Order Changes] Server response (updated order):", updatedOrder);
         alert(`Заказ #${orderId} успешно обновлен!`);
         closeModal('edit-order-modal'); 
-        await fetchAndRenderOrders(); 
+
+        // 2. ИСПРАВЛЕНИЕ: Ручное обновление кэша (вместо fetchAndRenderOrders)
+        // Находим индекс старого заказа в кэше
+        const indexToUpdate = companyOrders.findIndex(o => o.id === orderIdInt);
+        
+        if (indexToUpdate !== -1) {
+            // Если нашли, заменяем старый объект новым
+            companyOrders[indexToUpdate] = updatedOrder;
+            console.log(`[Save Order Changes] Кэш companyOrders обновлен для заказа ID: ${orderIdInt}`);
+        } else {
+            // Если не нашли (маловероятно), просто добавляем в начало
+            companyOrders.unshift(updatedOrder);
+            console.warn(`[Save Order Changes] Заказ ID: ${orderIdInt} не найден в кэше, добавлен в начало.`);
+        }
+        
+        // 3. Перерисовываем список из ОБНОВЛЕННОГО кэша
+        renderOrderListFromCache();
+        console.log("[Save Order Changes] Список перерисован из кэша.");
+        // (renderOrderListFromCache уже вызывает handleOrdersSearch, так что поиск применится)
 
     } catch (err) { 
         console.error("!!! [Save Order Changes] Error:", err);
@@ -6717,7 +6774,7 @@ function renderReportsTab() {
     if (subtabsContainer) {
         // Используем replaceWith/cloneNode для удаления старых слушателей (на всякий случай)
         const newSubtabsContainer = subtabsContainer.cloneNode(true);
-        subtabsContainer.parentNode.replaceChild(newSubtabsContainer, subtabsContainer);
+        subtabsContainer.parentNode?.replaceChild(newSubtabsContainer, subtabsContainer);
         // Добавляем слушатель к новому контейнеру
         newSubtabsContainer.addEventListener('click', e => {
             const tabButton = e.target.closest('.report-subtab-btn');
@@ -7220,7 +7277,7 @@ async function fetchAndRenderSummaryReport() {
         contentDiv.querySelectorAll('.view-shift-report-btn').forEach(btn => {
             // Используем replaceWith/cloneNode для удаления старых слушателей (на всякий случай)
             const newBtn = btn.cloneNode(true);
-            btn.parentNode.replaceChild(newBtn, btn);
+            btn.parentNode?.replaceChild(newBtn, btn);
             // Добавляем слушатель к новой кнопке
             newBtn.addEventListener('click', (e) => {
                 const shiftId = e.target.dataset.shiftId; // Получаем ID смены из data-атрибута
@@ -7710,7 +7767,7 @@ function addCalculationListeners() {
     document.querySelectorAll('.calc-weight-input').forEach(input => {
         // Удаляем старый слушатель перед добавлением нового
         const newInput = input.cloneNode(true);
-        input.parentNode.replaceChild(newInput, input);
+        input.parentNode?.replaceChild(newInput, input);
         // Добавляем слушатель к новому элементу
         newInput.addEventListener('input', () => {
              // Сбрасываем общий вес, если начали вводить индивидуальный
