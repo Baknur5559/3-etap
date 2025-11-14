@@ -86,12 +86,12 @@ class Client(Base):
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="clients")
 
-    # НОВОЕ ПРАВИЛО: Код клиента и телефон должны быть уникальны ВНУТРИ ОДНОЙ КОМПАНИИ
-__table_args__ = (
-    UniqueConstraint('phone', 'company_id', name='_phone_company_uc'),
-    UniqueConstraint('client_code_num', 'company_id', name='_client_code_company_uc'),
-    UniqueConstraint('telegram_chat_id', 'company_id', name='_telegram_chat_id_company_uc'), # <-- ДОБАВЛЕНО
-)
+# НОВОЕ ПРАВИЛО: Код клиента и телефон должны быть уникальны ВНУТРИ ОДНОЙ КОМПАНИИ
+    __table_args__ = (
+        UniqueConstraint('phone', 'company_id', name='_phone_company_uc'),
+        # Уникальность по ПРЕФИКС + НОМЕР + КОМПАНИЯ
+        UniqueConstraint('client_code_prefix', 'client_code_num', 'company_id', name='_client_prefix_num_company_uc'),
+    )
 
 
 # models.py (Полностью заменяет класс Order)
@@ -145,6 +145,9 @@ class Order(Base):
     location_id = Column(Integer, ForeignKey('locations.id'), nullable=False, index=True)
     location = relationship("Location", back_populates="orders") 
     
+    # --- НОВАЯ СВЯЗЬ (Задача 3) ---
+    history_entries = relationship("OrderHistory", back_populates="order", cascade="all, delete-orphan", order_by="OrderHistory.created_at")
+
     # --- КОНЕЦ СВЯЗЕЙ ---
 
     # Правило уникальности: Трек-код + Компания
@@ -277,3 +280,66 @@ class Setting(Base):
     company = relationship("Company", back_populates="settings")
 
     __table_args__ = (UniqueConstraint('key', 'company_id', name='_setting_key_company_uc'),)
+
+    # --- НОВЫЕ МОДЕЛИ: Рассылки и Реакции (Задача 2) ---
+
+class Broadcast(Base):
+    """
+    Хранит отправленные рассылки (объявления)
+    """
+    __tablename__ = 'broadcasts'
+    id = Column(Integer, primary_key=True, index=True)
+    text = Column(String, nullable=False) # Текст (HTML) рассылки
+    photo_file_id = Column(String, nullable=True) # ID фото в Telegram
+    sent_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # К какой компании относится рассылка
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+    company = relationship("Company") # Связь в одну сторону
+
+    # Связь с реакциями (чтобы можно было легко удалить)
+    reactions = relationship("BroadcastReaction", back_populates="broadcast", cascade="all, delete-orphan")
+
+class BroadcastReaction(Base):
+    """
+    Хранит реакции клиентов на конкретные рассылки
+    """
+    __tablename__ = 'broadcast_reactions'
+    id = Column(Integer, primary_key=True)
+    
+    reaction_type = Column(String, nullable=False, index=True) # Например: "like", "dislike"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Связь с рассылкой
+    broadcast_id = Column(Integer, ForeignKey('broadcasts.id'), nullable=False)
+    broadcast = relationship("Broadcast", back_populates="reactions")
+    
+    # Связь с клиентом
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=False)
+    client = relationship("Client") # Связь в одну сторону
+
+    # Уникальность: Один клиент - одна реакция на одну рассылку
+    __table_args__ = (UniqueConstraint('broadcast_id', 'client_id', name='_broadcast_client_reaction_uc'),)
+
+# --- НОВАЯ МОДЕЛЬ: История Статусов Заказа (Задача 3) ---
+
+class OrderHistory(Base):
+    """
+    Хранит историю изменений статуса для каждого заказа.
+    """
+    __tablename__ = 'order_history'
+    id = Column(Integer, primary_key=True)
+    
+    # Статус, который был установлен
+    status = Column(String, nullable=False, index=True) 
+    
+    # Когда это произошло
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # ID сотрудника, который изменил статус (если это было сделано из админки)
+    employee_id = Column(Integer, ForeignKey('employees.id'), nullable=True)
+    employee = relationship("Employee") # Связь в одну сторону
+
+    # Связь с заказом
+    order_id = Column(Integer, ForeignKey('orders.id', ondelete="CASCADE"), nullable=False, index=True)
+    order = relationship("Order", back_populates="history_entries")
