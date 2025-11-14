@@ -7975,6 +7975,12 @@ async function renderSettingsTab() {
                         <p class="text-xs text-gray-500 mb-1">Полная ссылка (https://...) для кнопки в боте.</p>
                         <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
                     </div>
+
+                <div>
+                    <label for="setting-client-code-start" class="block text-sm font-medium text-gray-700">Начальный номер для кодов клиентов</label>
+                    <p class="text-xs text-gray-500 mb-1">Новые клиенты (созданные в админке или боте) будут получать код, начиная с этого номера (например: 1001, 1400).</p>
+                    <input type="number" id="setting-client-code-start" data-key="client_code_start" class="setting-input w-full p-2 border rounded-md" placeholder="1001">
+                </div>
                 </div>
 
                 <div id="subtab-settings-passwords" class="setting-subtab-pane space-y-6 hidden">
