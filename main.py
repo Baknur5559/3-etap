@@ -1,7 +1,7 @@
 # main.py (ИСПРАВЛЕННАЯ ВЕРСЯ 3.0)
 
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status, Query, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import asyncio
 import telegram
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton # <-- ДОБАВЛЕНО
 import httpx
 import traceback
 import re
@@ -35,7 +36,9 @@ ORDER_STATUSES = ["В обработке", "Ожидает выкупа", "Вы�
 # --- Импортируем ВСЕ наши НОВЫE модели ---
 from models import (
     Base, Company, Location, Client, Order, Role, Permission, Employee,
-    ExpenseType, Shift, Expense, Setting
+    ExpenseType, Shift, Expense, Setting,
+    Broadcast, BroadcastReaction, OrderHistory, # <-- ДОБАВЛЕНО
+    role_permissions_table
 )
 # Импортируем Session и List для типизации
 from sqlalchemy.orm import Session
@@ -48,8 +51,8 @@ from typing import List, Optional # Убедись, что List импортир
 
 async def generate_and_send_notification(client: Client, new_status: str, track_codes: List[str]):
     """
-    (ИСПРАВЛЕНО) Отправляет уведомление, ИСПОЛЬЗУЯ ТОКЕН КОМПАНИИ.
-    (ВЕРСИЯ С ФИЛИАЛОМ, ЭМОДЗИ и СОБСТВЕННОЙ СЕССИЕЙ DB)
+    (ИСПРАВЛЕНО - Задача 3-Б) Отправляет уведомление, ИСПОЛЬЗУЯ ТОКЕН КОМПАНИИ.
+    (ВЕРСИЯ С ИСТОРИЕЙ СТАТУСОВ, ФИЛИАЛОМ, ЭМОДЗИ и СОБСТВЕННОЙ СЕССИЕЙ DB)
     """
     
     # --- НОВОЕ: Создаем свою сессию ---
@@ -62,6 +65,31 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             print(f"INFO: У клиента {client.full_name} (ID: {client.id}) нет telegram_chat_id. Уведомление не отправлено.")
             return # Выходим, если ID чата нет
         track_codes_str = "\n".join([f"<code>{code}</code>" for code in track_codes])
+
+        # --- (Задача 3-Б) Получаем историю статусов ---
+        history_str = ""
+        if track_codes:
+            first_track_code = track_codes[0]
+            # Ищем ОДИН заказ, чтобы получить его ID
+            order_for_history = db.query(Order.id).filter(
+                Order.track_code == first_track_code,
+                Order.client_id == client.id,
+                Order.company_id == client.company_id
+            ).first()
+            
+            if order_for_history:
+                history_entries = db.query(OrderHistory).filter(
+                    OrderHistory.order_id == order_for_history.id
+                ).order_by(OrderHistory.created_at.asc()).all()
+                
+                if history_entries:
+                    history_str = "\n<b>⏳ История статусов:</b>\n"
+                    bishkek_tz = timezone(timedelta(hours=6)) # UTC+6
+                    for entry in history_entries:
+                        bishkek_date = entry.created_at.astimezone(bishkek_tz)
+                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
+                        history_str += f"<i>- {hist_date}: {entry.status}</i>\n"
+        # --- Конец (Задача 3-Б) ---
 
         # --- Получаем токен бота ИЗ КОМПАНИИ клиента (Используем нашу 'db') ---
         company_bot_token = None
@@ -112,7 +140,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 total_cost += order.calculated_final_cost_som or 0
                 total_weight += order.calculated_weight_kg or 0
 
-        # --- Формирование сообщения (без изменений) ---
+        # --- Формирование сообщения (с `history_str`) ---
         message = f"Здравствуйте, <b>{client.full_name}</b>! 👋\n\n"
         
         if new_status == "Готов к выдаче":
@@ -123,7 +151,8 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"🎉🎉🎉 <b>ПОСЫЛКИ НА МЕСТЕ!</b> 🎉🎉🎉\n\n"
                 f"Спешим сообщить, что ваши заказы уже прибыли в наш филиал <b>'{location_name}'</b> и очень ждут вас!\n\n"
                 f"<b>Трек-коды:</b>\n{track_codes_str}\n\n"
-                f"<b>Статус:</b> ✅ <b>{new_status}</b> ✅\n\n"
+                f"<b>Статус:</b> ✅ <b>{new_status}</b> ✅\n" # <-- Убрал \n\n
+                f"{history_str}\n" # <-- ДОБАВЛЕНО
                 f"{weight_str}"
                 f"{cost_str}"
                 f"📍 <b>Забрать можно здесь:</b>\n{location_address}\n\n" 
@@ -135,7 +164,8 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             message += (
                 f"Ваши заказы уже мчатся к вам! 🚚💨\n\n"
                 f"<b>Статус отправлений:</b>\n{track_codes_str}\n\n"
-                f"...изменился на: ➡️ <b>{new_status}</b>\n\n"
+                f"...изменился на: ➡️ <b>{new_status}</b>\n" # <-- Убрал \n\n
+                f"{history_str}\n" # <-- ДОБАВЛЕНО
                 f"Мы сообщим, как только они прибудут! 🥳\nСледить за заказами можно в <a href='{lk_link}'>личном кабинете</a>."
             )
         
@@ -143,7 +173,8 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             message += (
                 f"Отличные новости! 🤩 Ваши заказы прибыли на наш склад в Кыргызстане!\n\n"
                 f"<b>Статус посылок:</b>\n{track_codes_str}\n\n"
-                f"...изменился на: 🇰🇬 <b>{new_status}</b> 🇰🇬\n\n"
+                f"...изменился на: 🇰🇬 <b>{new_status}</b> 🇰🇬\n" # <-- Убрал \n\n
+                f"{history_str}\n" # <-- ДОБАВЛЕНО
                 f"Сейчас мы их сортируем и скоро они будут готовы к выдаче! 🚀\n"
                 f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
             )
@@ -152,7 +183,8 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             message += (
                 f"Обновление по вашим заказам! 📄\n\n"
                 f"<b>Новый статус для:</b>\n{track_codes_str}\n\n"
-                f"➡️ <b>{new_status}</b>\n\n"
+                f"➡️ <b>{new_status}</b>\n" # <-- Убрал \n\n
+                f"{history_str}\n" # <-- ДОБАВЛЕНО
                 f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
             )
         # --- Конец формирования сообщения ---
@@ -202,15 +234,60 @@ app.add_middleware(
 
 # --- ФУНКЦИИ ДЛЯ TELEGRAM УВЕДОМЛЕНИЙ (Multi-Tenant) ---
 
-async def send_telegram_message(token: str, chat_id: str, text: str):
-    """Асинхронно отправляет сообщение в Telegram, используя КОНКРЕТНЫЙ токен."""
+async def send_telegram_message(
+    token: str, 
+    chat_id: str, 
+    text: str, 
+    photo_id: Optional[str] = None,
+    broadcast_id: Optional[int] = None # <-- ДОБАВЛЕНО
+):
+    """
+    Асинхронно отправляет сообщение (или фото с подписью) в Telegram, 
+    используя КОНКРЕТНЫЙ токен.
+    Если передан broadcast_id, добавляет кнопки реакций.
+    """
     if not token:
         print("WARNING: [Notification] Передан пустой токен. Уведомление не отправлено.")
         return
+
+    # --- ДОБАВЛЕНО: Создание кнопок реакций ---
+    reply_markup = None
+    if broadcast_id:
+        keyboard = [
+            [
+                InlineKeyboardButton("👍", callback_data=f"react_{broadcast_id}_like"),
+                InlineKeyboardButton("👎", callback_data=f"react_{broadcast_id}_dislike"),
+                # (Можно добавить больше кнопок)
+                # InlineKeyboardButton("🔥", callback_data=f"react_{broadcast_id}_fire"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
     try:
         bot = telegram.Bot(token=token)
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=True)
-        print(f"[Notification] Сообщение успешно отправлено в chat_id {chat_id}")
+        
+        if photo_id:
+            # Если есть photo_id, отправляем фото с подписью
+            await bot.send_photo(
+                chat_id=chat_id, 
+                photo=photo_id, 
+                caption=text, 
+                parse_mode='HTML',
+                reply_markup=reply_markup # <-- ДОБАВЛЕНО
+            )
+            print(f"[Notification] ФОТО+Текст успешно отправлено в chat_id {chat_id}")
+        else:
+            # Если нет, отправляем просто текст
+            await bot.send_message(
+                chat_id=chat_id, 
+                text=text, 
+                parse_mode='HTML', 
+                disable_web_page_preview=True,
+                reply_markup=reply_markup # <-- ДОБАВЛЕНО
+            )
+            print(f"[Notification] Сообщение успешно отправлено в chat_id {chat_id}")
+
     except Exception as e:
         print(f"!!! ОШИБКА [Notification] при отправке в chat_id {chat_id} (токен ...{token[-4:]}): {e}")
 
@@ -926,50 +1003,86 @@ def delete_company(
     employee: Employee = Depends(get_super_admin),
     db: Session = Depends(get_db)
 ):
-    """Удаляет компанию и все связанные с ней данные."""
+    """(ИСПРАВЛЕНО) Удаляет компанию и ВСЕ связанные с ней данные."""
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Компания не найдена.")
 
-    # ПРОВЕРКА: Нельзя удалить компанию, если у нее есть сотрудники
-    # (кроме автоматически созданного Владельца)
-    employee_count = db.query(Employee).filter(Employee.company_id == company_id).count()
-    if employee_count > 1: # Больше, чем 1 (владелец)
-         raise HTTPException(status_code=400, detail=f"Нельзя удалить компанию '{company.name}', т.к. в ней {employee_count} сотрудников. Сначала удалите их.")
-    elif employee_count == 1:
-        # Удаляем единственного сотрудника (владельца)
-        owner = db.query(Employee).filter(Employee.company_id == company_id).first()
-        if owner:
-            db.delete(owner)
+    print(f"[Delete Company] Super-Admin {employee.id} удаляет компанию {company.name} (ID: {company_id})")
 
-    # ДОБАВИТЬ: Удаление связанных данных (филиалы, роли, клиенты, заказы и т.д.)
-    # Это важно, чтобы не оставлять "мусор" в базе.
-    # Мы сделаем это каскадным удалением в models.py позже, сейчас просто удалим саму компанию.
+    try:
+        # --- НАЧИНАЕМ КАСКАДНОЕ УДАЛЕНИЕ (от "детей" к "родителям") ---
+        # Важно соблюдать порядок из-за FOREIGN KEY
+        
+        # 1. Удаляем Заказы (Orders) - они ссылаются на Клиентов, Смены, Филиалы
+        print(f"  > Удаление {db.query(Order).filter(Order.company_id == company_id).count()} заказов...")
+        db.query(Order).filter(Order.company_id == company_id).delete(synchronize_session=False)
 
-    # Находим и удаляем роли этой компании
-    roles_to_delete = db.query(Role).filter(Role.company_id == company_id).all()
-    for role in roles_to_delete:
-        db.delete(role)
+        # 2. Удаляем Клиентов (Clients)
+        print(f"  > Удаление {db.query(Client).filter(Client.company_id == company_id).count()} клиентов...")
+        db.query(Client).filter(Client.company_id == company_id).delete(synchronize_session=False)
 
-    # Находим и удаляем филиалы этой компании
-    locations_to_delete = db.query(Location).filter(Location.company_id == company_id).all()
-    for loc in locations_to_delete:
-        db.delete(loc)
+        # 3. Удаляем Расходы (Expenses) - они ссылаются на Смены и Типы Расходов
+        print(f"  > Удаление {db.query(Expense).filter(Expense.company_id == company_id).count()} расходов...")
+        db.query(Expense).filter(Expense.company_id == company_id).delete(synchronize_session=False)
+        
+        # 4. Удаляем Смены (Shifts) - они ссылаются на Сотрудников и Филиалы
+        print(f"  > Удаление {db.query(Shift).filter(Shift.company_id == company_id).count()} смен...")
+        db.query(Shift).filter(Shift.company_id == company_id).delete(synchronize_session=False)
 
-    # Находим и удаляем настройки этой компании
-    settings_to_delete = db.query(Setting).filter(Setting.company_id == company_id).all()
-    for setting in settings_to_delete:
-        db.delete(setting)
+        # 5. Удаляем Сотрудников (Employees) - они ссылаются на Роли и Филиалы
+        print(f"  > Удаление {db.query(Employee).filter(Employee.company_id == company_id).count()} сотрудников...")
+        db.query(Employee).filter(Employee.company_id == company_id).delete(synchronize_session=False)
 
-    # Находим и удаляем типы расходов
-    exp_types_to_delete = db.query(ExpenseType).filter(ExpenseType.company_id == company_id).all()
-    for exp_type in exp_types_to_delete:
-        db.delete(exp_type)
+        # 6. Удаляем Роли (Roles)
+        print(f"  > Удаление {db.query(Role).filter(Role.company_id == company_id).count()} ролей...")
+        
+        # --- (НОВЫЙ БЛОК) СНАЧАЛА удаляем связи в role_permissions ---
+        # Находим все ID ролей, которые мы собираемся удалить
+        roles_to_delete_ids_query = db.query(Role.id).filter(Role.company_id == company_id)
+        
+        # Создаем SQL-команду на удаление из M2M таблицы
+        delete_perms_stmt = role_permissions_table.delete().where(
+            role_permissions_table.c.role_id.in_(roles_to_delete_ids_query.scalar_subquery())
+        )
+        db.execute(delete_perms_stmt)
+        print(f"  > Связи M2M (role_permissions) для ролей удалены.")
+        # --- (КОНЕЦ НОВОГО БЛОКА) ---
 
-    # TODO: Добавить удаление Клиентов, Заказов, Смен, Расходов этой компании
+        # Теперь, когда "дети" (связи) удалены, удаляем "родителей" (роли)
+        db.query(Role).filter(Role.company_id == company_id).delete(synchronize_session=False)
 
-    db.delete(company)
-    db.commit()
+        # 7. Удаляем Типы Расходов (ExpenseTypes)
+        print(f"  > Удаление {db.query(ExpenseType).filter(ExpenseType.company_id == company_id).count()} типов расходов...")
+        db.query(ExpenseType).filter(ExpenseType.company_id == company_id).delete(synchronize_session=False)
+
+        # 8. Удаляем Филиалы (Locations)
+        print(f"  > Удаление {db.query(Location).filter(Location.company_id == company_id).count()} филиалов...")
+        db.query(Location).filter(Location.company_id == company_id).delete(synchronize_session=False)
+
+        # 9. Удаляем Настройки (Settings)
+        print(f"  > Удаление {db.query(Setting).filter(Setting.company_id == company_id).count()} настроек...")
+        db.query(Setting).filter(Setting.company_id == company_id).delete(synchronize_session=False)
+
+        # 10. Удаляем Рассылки и Реакции (Broadcasts / BroadcastReactions)
+        print(f"  > Удаление {db.query(Broadcast).filter(Broadcast.company_id == company_id).count()} рассылок...")
+        db.query(Broadcast).filter(Broadcast.company_id == company_id).delete(synchronize_session=False)
+        # Реакции удалятся каскадно, так как мы настроили `cascade="all, delete-orphan"` в models.py
+
+        # 11. НАКОНЕЦ, удаляем саму Компанию
+        print(f"  > Удаление компании {company.name}...")
+        db.delete(company)
+        
+        # Фиксируем все удаления
+        db.commit()
+        print(f"[Delete Company] Компания ID {company_id} успешно удалена.")
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Delete Company] Ошибка БД при удалении компании {company_id}: {e}", exc_info=True)
+        # Если что-то пошло не так, возвращаем 500
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при удалении: {e}")
+
     # Возвращаем 204 No Content, так как компания удалена
     return None
 
@@ -1444,32 +1557,71 @@ def get_clients(
 @app.post("/api/clients", tags=["Клиенты (Владелец)"], response_model=ClientOut)
 def create_client(
     payload: ClientCreate,
-    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
+    employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db)
 ):
     # Проверка на дубликат телефона ВНУТРИ компании
     if db.query(Client).filter(Client.phone == payload.phone, Client.company_id == employee.company_id).first():
         raise HTTPException(status_code=400, detail="Клиент с таким телефоном уже существует в вашей компании.")
 
-    # Проверка на дубликат кода клиента ВНУТРИ компании (если указан)
-    if payload.client_code_num and db.query(Client).filter(Client.client_code_num == payload.client_code_num, Client.company_id == employee.company_id).first():
-        raise HTTPException(status_code=400, detail=f"Клиентский код {payload.client_code_num} уже занят в вашей компании.")
+    # Если префикс не указан, используем код компании или "KB"
+    if payload.client_code_prefix is None:
+        payload.client_code_prefix = employee.company.company_code or "KB"
 
-    # === ИСПРАВЛЕННАЯ ЛОГИКА АВТО-ГЕНЕРАЦИИ КОДА (с фильтром по компании) ===
+    # === ИСПРАВЛЕННАЯ ЛОГИКА АВТО-ГЕНЕРАЦИИ КОДА (С ПРИОРИТЕТОМ НАСТРОЙКИ) ===
     if payload.client_code_num is None:
-        # 1. Находим максимальный существующий код ДЛЯ ЭТОЙ КОМПАНИИ
-        max_code_result = db.query(
-            func.max(Client.client_code_num)
-        ).filter(
-            Client.company_id == employee.company_id
-        ).scalar()
+        # 1. Получаем настройку начального кода (Например, 433)
+        start_code_setting = db.query(Setting).filter(Setting.key == 'client_code_start', Setting.company_id == employee.company_id).first()
+        start_from = 1001 # Значение по умолчанию
+        if start_code_setting and start_code_setting.value:
+            try:
+                start_from = int(start_code_setting.value)
+            except ValueError:
+                pass
         
-        # 2. Устанавливаем следующий код: +1 к максимуму, или 1001, если клиентов нет
-        payload.client_code_num = (max_code_result + 1) if max_code_result else 1001 
+        # 2. Находим максимальный код, который МЕНЬШЕ, чем желаемый старт.
+        # (Это позволяет "сбросить" счетчик, игнорируя аномальные числа > 433)
+        if start_from > 0:
+            max_code_to_check = db.query(
+                func.max(Client.client_code_num)
+            ).filter(
+                Client.company_id == employee.company_id,
+                Client.client_code_num < start_from # <-- ИЩЕМ ТОЛЬКО КОДЫ МЕНЬШЕ 433
+            ).scalar()
+        else:
+             # Если настройка не задана (start_from=1001), используем безопасный способ
+             max_code_to_check = db.query(
+                func.max(Client.client_code_num)
+             ).filter(
+                 Client.company_id == employee.company_id
+             ).scalar()
+        
+        # 3. Выбираем следующий код:
+        if max_code_to_check is not None:
+             next_code = max_code_to_check + 1
+             # Мы гарантируем, что счет начнется с start_from, если max_code_to_check был меньше.
+             payload.client_code_num = max(next_code, start_from)
+        else:
+             # Если клиентов нет или все коды были > start_from, просто начинаем со старта.
+             payload.client_code_num = start_from
+
+        # --- КРИТИЧЕСКАЯ ПРОВЕРКА (УБЕДИТЬСЯ, ЧТО НОВЫЙ КОД НЕ ЯВЛЯЕТСЯ ДУБЛИКАТОМ) ---
+        # Если клиент с кодом 433 уже существует (несмотря на нашу логику), мы должны выдать 434.
+        while db.query(Client).filter(
+            Client.company_id == employee.company_id,
+            Client.client_code_num == payload.client_code_num
+        ).first():
+            payload.client_code_num += 1
+            
     # === КОНЕЦ ИСПРАВЛЕНИЯ ===
 
-    if payload.client_code_prefix is None:
-         payload.client_code_prefix = "KB" # Префикс по умолчанию
+    # Проверка на дубликат КОМБИНАЦИИ (префикс + код)
+    if payload.client_code_num and db.query(Client).filter(
+        Client.client_code_prefix == payload.client_code_prefix,
+        Client.client_code_num == payload.client_code_num, 
+        Client.company_id == employee.company_id
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Клиентский код {payload.client_code_prefix}{payload.client_code_num} уже занят в вашей компании.")
 
     new_client = Client(
         **payload.dict(),
@@ -1481,10 +1633,10 @@ def create_client(
     return new_client
 
 @app.patch("/api/clients/{client_id}", tags=["Клиенты (Владелец)"], response_model=ClientOut)
-def update_client(
+async def update_client(
     client_id: int,
     payload: ClientUpdate,
-    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
+    employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db)
 ):
     """Обновляет данные клиента ТЕКУЩЕЙ компании."""
@@ -1497,21 +1649,52 @@ def update_client(
 
     update_data = payload.dict(exclude_unset=True)
 
+    # (Задача 3А) Проверяем, изменились ли важные поля
+    notify_text = ""
+    if 'full_name' in update_data and update_data['full_name'] != client.full_name:
+        notify_text += f"– ФИО изменено на: <b>{update_data['full_name']}</b>\n"
+    if 'phone' in update_data and update_data['phone'] != client.phone:
+        notify_text += f"– Телефон изменен на: <b>{update_data['phone']}</b>\n"
+
     # Проверка на уникальность телефона при изменении
     if 'phone' in update_data and update_data['phone'] != client.phone:
         if db.query(Client).filter(Client.phone == update_data['phone'], Client.company_id == employee.company_id).first():
             raise HTTPException(status_code=400, detail="Другой клиент с таким телефоном уже существует в вашей компании.")
 
-    # Проверка на уникальность кода клиента при изменении
-    if 'client_code_num' in update_data and update_data['client_code_num'] != client.client_code_num:
-         if update_data['client_code_num'] and db.query(Client).filter(Client.client_code_num == update_data['client_code_num'], Client.company_id == employee.company_id).first():
-             raise HTTPException(status_code=400, detail=f"Клиентский код {update_data['client_code_num']} уже занят в вашей компании.")
+    # Проверка на уникальность кода клиента при изменении (Исправлено для (Префикс+Номер))
+    if 'client_code_num' in update_data or 'client_code_prefix' in update_data:
+        # Определяем новую комбинацию
+        new_prefix = update_data.get('client_code_prefix', client.client_code_prefix)
+        new_num = update_data.get('client_code_num', client.client_code_num)
 
+        # Проверяем, что комбинация не занята ДРУГИМ клиентом
+        if new_num and db.query(Client).filter(
+            Client.client_code_prefix == new_prefix,
+            Client.client_code_num == new_num,
+            Client.company_id == employee.company_id,
+            Client.id != client_id # Исключаем самого себя
+        ).first():
+             raise HTTPException(status_code=400, detail=f"Клиентский код {new_prefix}{new_num} уже занят в вашей компании.")
+
+    # Применяем обновления
     for key, value in update_data.items():
         setattr(client, key, value)
 
     db.commit()
     db.refresh(client)
+    
+    # (Задача 3А) Отправляем уведомление, ЕСЛИ БЫЛИ ИЗМЕНЕНИЯ
+    if notify_text and client.telegram_chat_id:
+        company_token = db.query(Company.telegram_bot_token).filter(Company.id == employee.company_id).scalar()
+        if company_token:
+            full_notify_text = "<b>Внимание!</b> 🔒\nВаши данные в профиле были обновлены администратором:\n\n" + notify_text
+            # Используем await, так как функция теперь async
+            await send_telegram_message(
+                token=company_token,
+                chat_id=client.telegram_chat_id,
+                text=full_notify_text
+            )
+    
     return client
 
 @app.delete("/api/clients/{client_id}", tags=["Клиенты (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
@@ -1620,7 +1803,7 @@ def bulk_import_clients(
     try:
         existing_clients_in_company = db.query(Client).filter(Client.company_id == employee.company_id).all()
         existing_phones = {c.phone for c in existing_clients_in_company} # Используем set для быстрой проверки
-        existing_codes = {c.client_code_num for c in existing_clients_in_company if c.client_code_num is not None} # Используем set
+        existing_codes = {(c.client_code_prefix, c.client_code_num) for c in existing_clients_in_company if c.client_code_num is not None} # Используем set
         print(f"[Import Clients] Загружено {len(existing_phones)} существующих телефонов и {len(existing_codes)} кодов.") # Лог загрузки
     except Exception as e_load:
         print(f"!!! [Import Clients] КРИТИЧЕСКАЯ ОШИБКА при загрузке существующих клиентов: {e_load}")
@@ -1673,9 +1856,9 @@ def bulk_import_clients(
                         try:
                             num_val = int(match_num.group(1))
                             # Проверка на дубликат кода ВНУТРИ компании (в загруженных и уже добавленных)
-                            if num_val in existing_codes:
-                                warnings.append(f"Строка {index + 1} ('{item.full_name}'): Код '{num_val}' уже занят и будет проигнорирован.")
-                                print(f"[Import Clients] Строка {index + 1}: Код {num_val} проигнорирован (дубликат).") # Лог
+                            if (temp_prefix, num_val) in existing_codes:
+                                warnings.append(f"Строка {index + 1} ('{item.full_name}'): Код '{temp_prefix}{num_val}' уже занят и будет проигнорирован.")
+                                print(f"[Import Clients] Строка {index + 1}: Код {temp_prefix}{num_val} проигнорирован (дубликат).") # Лог
                             else:
                                 parsed_num = num_val # Код уникален
                                 parsed_prefix = temp_prefix # Используем найденный или KB
@@ -1704,7 +1887,7 @@ def bulk_import_clients(
             # Обновляем множества для проверки следующих строк В ЭТОМ ЖЕ ИМПОРТЕ
             existing_phones.add(cleaned_phone)
             if parsed_num is not None:
-                 existing_codes.add(parsed_num)
+                 existing_codes.add((parsed_prefix, parsed_num))
 
             created_count += 1 # Увеличиваем счетчик успешно обработанных (но еще не сохраненных)
 
@@ -1766,6 +1949,17 @@ def bulk_import_clients(
 # === НАЧАЛО НОВОГО КОДА (ЗАКАЗЫ) ===
 
 # --- Pydantic Модели для Заказов ---
+
+# --- НОВАЯ МОДЕЛЬ (Задача 3) ---
+class OrderHistoryOut(BaseModel):
+    id: int
+    status: str
+    created_at: datetime
+    employee_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+# --- КОНЕЦ НОВОЙ МОДЕЛИ ---
 
 # Базовая модель заказа (для вывода и создания/обновления)
 class OrderBase(BaseModel):
@@ -1830,6 +2024,8 @@ class OrderOut(OrderBase):
     weight_kg: Optional[float]
     final_cost_som: Optional[float]
 
+    history_entries: List[OrderHistoryOut] = []
+
     class Config:
         orm_mode = True
 
@@ -1893,8 +2089,12 @@ from sqlalchemy.orm import contains_eager # <-- ДОБАВЬ ЭТОТ ИМПОР
 def get_orders(
     company_id: int = Query(...), 
     client_id: Optional[int] = Query(None), 
+    
+    # --- НОВОЕ: Добавлен поиск и лимит ---
     q: Optional[str] = Query(None, description="Поиск по трек-коду, ФИО клиента или телефону"),
-    limit: Optional[int] = Query(None, description="Лимит результатов (по умолчанию нет)"), # <-- ИСПРАВЛЕНО
+    limit: Optional[int] = Query(None, description="Лимит результатов (по умолчанию нет)"),
+    # --- КОНЕЦ НОВОГО ---
+    
     party_dates: Optional[List[date]] = Query(None),
     statuses: Optional[List[str]] = Query(default=None),
     location_id: Optional[int] = Query(None),
@@ -1903,7 +2103,7 @@ def get_orders(
 ):
     """
     Получает список заказов компании с фильтрацией.
-    (Версия 3.1 - Убран лимит по умолчанию)
+    (Версия с поддержкой поиска 'q' для Владельца)
     """
     print(f"[Get Orders] Запрос для Company ID={company_id}. Employee Header: {x_employee_id}. Client ID: {client_id}. Поиск: '{q}'")
 
@@ -1912,18 +2112,21 @@ def get_orders(
     if not company:
         raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
 
-    # 1. Базовый запрос СРАЗУ с outerjoin(Client)
-    query = db.query(Order).join(
-        Client, Order.client_id == Client.id, isouter=True
+    # --- ИЗМЕНЕНИЕ (Задача 3): Добавляем joinedload(Order.history_entries) ---
+    query = db.query(Order).options(
+        joinedload(Order.client),
+        joinedload(Order.history_entries) # <-- УБЕДИСЬ, ЧТО ЭТА СТРОКА ДОБАВЛЕНА
     ).filter(
         Order.company_id == company_id
     )
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-    # --- Логика поиска по 'q' ---
+    # --- НОВОЕ: Логика поиска по 'q' ---
     if q:
         search_term = f"%{q.lower()}%"
-        # Фильтруем по уже присоединенным таблицам
-        query = query.filter( 
+        # Присоединяем Client, чтобы искать по имени/телефону
+        # Используем isouter=True на случай, если клиент был удален, а заказы остались
+        query = query.join(Client, Client.id == Order.client_id, isouter=True).filter( 
             or_(
                 func.lower(Order.track_code).ilike(search_term),
                 func.lower(Client.full_name).ilike(search_term),
@@ -1931,7 +2134,8 @@ def get_orders(
             )
         )
         print(f"[Get Orders] Применен текстовый поиск: '{q}'")
-            
+    # --- КОНЕЦ НОВОГО ---
+
     employee: Optional[Employee] = None
     target_location_id: Optional[int] = None
 
@@ -1939,6 +2143,7 @@ def get_orders(
     if x_employee_id:
         try:
             employee_id_int = int(x_employee_id)
+            # Загружаем сотрудника, его роль и права
             employee = db.query(Employee).options(
                 joinedload(Employee.role).joinedload(Role.permissions)
             ).filter(
@@ -1951,16 +2156,20 @@ def get_orders(
             
         if employee:
             print(f"[Get Orders] Запрос идентифицирован как от сотрудника ID={employee.id} (Роль: {employee.role.name})")
+            # Владелец может фильтровать по филиалу, сотрудник видит только свой
             if employee.role.name == 'Владелец':
                 if location_id is not None:
+                    # Владелец выбрал филиал
                     loc_check = db.query(Location.id).filter(Location.id == location_id, Location.company_id == company_id).first()
                     if not loc_check: raise HTTPException(status_code=404, detail="Указанный филиал не найден.")
                     target_location_id = location_id
                     print(f"[Get Orders] Владелец фильтрует по филиалу ID={target_location_id}")
                 else:
+                    # Владелец видит все филиалы
                     print(f"[Get Orders] Владелец видит все филиалы.")
                     target_location_id = None
             else: 
+                # Обычный сотрудник видит только свой филиал
                 target_location_id = employee.location_id
                 if target_location_id is None:
                     print(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
@@ -1968,41 +2177,45 @@ def get_orders(
                 print(f"[Get Orders] Сотрудник видит свой филиал ID={target_location_id}")
         else:
             print("[Get Orders] Заголовок X-Employee-ID передан, но сотрудник не найден/не активен.")
+            # (Если заголовок был, но невалидный, можно вернуть 401,
+            # но для бота/ЛК мы продолжаем без сотрудника)
 
-    # --- Фильтрация по client_id ---
+    # --- Фильтрация по client_id (применяется всегда, если передан) ---
+    # (Это используется ботом для "Мои Заказы")
     if client_id is not None:
-        if not q:
-             client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
-             if not client_check:
-                 raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
+        client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
+        if not client_check:
+            raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
         query = query.filter(Order.client_id == client_id)
         print(f"[Get Orders] Применен фильтр по Client ID={client_id}")
 
     # --- Применяем остальные фильтры ---
+    
+    # Фильтр по филиалу (если он был определен для сотрудника/Владельца)
     if target_location_id is not None:
         query = query.filter(Order.location_id == target_location_id)
 
+    # Фильтр по датам партий
     if party_dates:
         query = query.filter(Order.party_date.in_(party_dates))
 
+    # Фильтр по статусам
     statuses_to_filter = statuses
+    # Если статусы не переданы И это запрос из админки (employee определен),
+    # то по умолчанию скрываем "Выданные"
     if not statuses_to_filter and employee:
         statuses_to_filter = [s for s in ORDER_STATUSES if s != "Выдан"]
     
+    # Применяем фильтр по статусам, если он есть
     if statuses_to_filter:
         query = query.filter(Order.status.in_(statuses_to_filter))
 
-    # 2. Используем contains_eager, чтобы "собрать" данные клиента из join
-    final_query = query.options(contains_eager(Order.client))
+    # --- НОВОЕ: Добавляем limit к запросу ---
+    query = query.order_by(Order.party_date.desc().nullslast(), Order.id.desc())
+    if limit:
+        query = query.limit(limit)
     
-    # 3. Применяем сортировку (без лимита по умолчанию)
-    final_query = final_query.order_by(Order.party_date.desc().nullslast(), Order.id.desc())
-    
-    # ИСПРАВЛЕНИЕ: Применяем лимит, только если он явно передан
-    if limit is not None:
-        final_query = final_query.limit(limit)
-        
-    orders = final_query.all()
+    orders = query.all()
     
     print(f"[Get Orders] Найдено заказов: {len(orders)}")
     return orders
@@ -2089,10 +2302,20 @@ def create_order(
         db.add(new_order)
         db.commit() # Сохраняем заказ
         db.refresh(new_order) # Обновляем объект из БД (чтобы получить ID и т.д.)
+        
+        # (Задача 3) Добавляем первую запись в историю
+        history_entry = OrderHistory(
+            order_id=new_order.id,
+            status=new_order.status,
+            employee_id=None # Статус при создании (может быть бот)
+        )
+        db.add(history_entry)
+        db.commit()
+        
         # Принудительно загружаем связанные данные клиента для ответа
         db.refresh(new_order, attribute_names=['client'])
         print(f"[Create Order API] Заказ ID={new_order.id} успешно создан для филиала ID={new_order.location_id}")
-        return new_order # Возвращаем созданный заказ
+        return new_order
     except Exception as e:
         db.rollback() # Откатываем транзакцию при ошибке
         import traceback
@@ -2165,12 +2388,22 @@ async def update_order( # Убедись, что 'async' здесь есть
          raise HTTPException(status_code=400, detail=f"Недопустимый статус заказа: {update_data['status']}")
          
     # 6. Применяем все собранные обновления к объекту заказа
+    # 6. Применяем все собранные обновления к объекту заказа
     try:
         for key, value in update_data.items():
             setattr(order, key, value)
         
-        db.commit() 
-        # db.refresh(order) # Не используем refresh, т.к. он не обновит связи
+        # (Задача 3) Добавляем запись в историю, ЕСЛИ СТАТУС ИЗМЕНИЛСЯ
+        if 'status' in update_data and update_data['status'] != original_status:
+            history_entry = OrderHistory(
+                order_id=order.id,
+                status=update_data['status'],
+                employee_id=employee.id
+            )
+            db.add(history_entry)
+            
+        db.commit() # Коммитим и заказ, и историю
+        # db.refresh(order)
         
         # --- ИСПРАВЛЕНИЕ: ПЕРЕЗАГРУЖАЕМ ОБЪЕКТ ПОЛНОСТЬЮ ---
         # После commit(), делаем НОВЫЙ запрос, чтобы получить
@@ -2307,6 +2540,21 @@ def bulk_order_action(
         # --- КОНЕЦ Группировки ---
 
         count = query.update({"status": new_status}, synchronize_session='fetch')
+        
+        # (Задача 3) Добавляем записи в историю
+        if count > 0:
+            history_entries = []
+            for order in orders_to_action: # Используем 'orders_to_action', которые мы уже загрузили
+                if order.status != new_status: 
+                    history_entries.append(
+                        OrderHistory(
+                            order_id=order.id,
+                            status=new_status,
+                            employee_id=employee.id
+                        )
+                    )
+            if history_entries:
+                db.bulk_save_objects(history_entries)
         db.commit()
 
         # --- Отправка (ПОСЛЕ commit) ---
@@ -2349,7 +2597,20 @@ def bulk_order_action(
                 "status": "Выкуплен", 
                 "buyout_actual_rate": payload.buyout_actual_rate
             }, synchronize_session='fetch')
-            db.commit()
+
+            # (Задача 3) Добавляем записи в историю
+            if count > 0:
+                history_entries = [
+                    OrderHistory(
+                        order_id=order.id,
+                        status="Выкуплен",
+                        employee_id=employee.id
+                    )
+                    for order in orders_to_action # 'orders_to_action' уже загружены
+                ]
+                db.bulk_save_objects(history_entries)
+
+            db.commit() # Коммитим и update, и историю
             return {"status": "ok", "message": f"Выкуп и статус 'Выкуплен' успешно применены к {count} заказам."}
         except Exception as e:
             db.rollback()
@@ -2710,7 +2971,7 @@ def close_shift(
     db: Session = Depends(get_db)
 ):
     """Закрывает ТЕКУЩУЮ АКТИВНУЮ смену в ФИЛИАЛЕ сотрудника."""
-    if closer_employee.is_super_admin:
+    if closer_employee.company_id is None:
          raise HTTPException(status_code=403, detail="Супер-админ не может закрывать смены.")
 
     # Проверяем права на закрытие смены
@@ -3275,6 +3536,15 @@ def issue_orders(
             item_data = next((item for item in payload.orders if item.order_id == order.id), None)
             if item_data: # Должен всегда находиться
                 order.status = "Выдан"
+                
+                # (Задача 3) Добавляем запись в историю
+                history_entry = OrderHistory(
+                    order_id=order.id,
+                    status="Выдан",
+                    employee_id=employee.id
+                )
+                db.add(history_entry)
+                
                 order.weight_kg = item_data.weight_kg # Фактический вес при выдаче
                 order.price_per_kg_usd = payload.price_per_kg_usd
                 order.exchange_rate_usd = payload.exchange_rate_usd
@@ -3372,39 +3642,21 @@ class RevertOrderPayload(BaseModel):
 @app.patch("/api/orders/{order_id}/revert_status", tags=["Выдача"], response_model=OrderOut)
 def revert_order_status(
     order_id: int,
-    payload: RevertOrderPayload, # <-- Теперь она определена
     employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
     """
-    (ИЗМЕНЕНО) Возвращает выданный заказ на 'Готов к выдаче'.
-    Требует права 'issue_orders' И пароль из настроек (если он установлен).
+    Возвращает статус выданного заказа обратно на 'Готов к выдаче'.
+    Требует права 'issue_orders'. Доступно Владельцу или сотруднику в активной смене.
     """
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
     perms = {p.codename for p in employee.role.permissions}
-    if 'issue_orders' not in perms: 
+    if 'issue_orders' not in perms: # Требуем те же права, что и на выдачу
         raise HTTPException(status_code=403, detail="У вас нет прав на отмену выдачи.")
 
-    # --- ПРОВЕРКА ПАРОЛЯ ИЗ НАСТРОЕК ---
-    required_password_setting = db.query(Setting).filter(
-        Setting.company_id == employee.company_id,
-        Setting.key == 'password_revert_order' # <-- НАШ НОВЫЙ КЛЮЧ
-    ).first()
-
-    required_password = required_password_setting.value if required_password_setting and required_password_setting.value else None
-
-    # Если пароль в настройках ЗАДАН, то мы его проверяем
-    if required_password:
-        if payload.password != required_password:
-            raise HTTPException(status_code=403, detail="Неверный пароль для возврата заказа.")
-    # Если пароль в настройках НЕ ЗАДАН (None или ""), проверка не нужна.
-
-    # --- КОНЕЦ ПРОВЕРКИ ПАРОЛЯ ---
-
-    # ИСПРАВЛЕНИЕ 500: Убираем .options(joinedload(Order.shift))
-    order = db.query(Order).filter( 
+    order = db.query(Order).options(joinedload(Order.shift)).filter( # Загружаем смену для проверки
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
@@ -3414,44 +3666,53 @@ def revert_order_status(
     if order.status != "Выдан":
         raise HTTPException(status_code=400, detail="Можно вернуть только заказ со статусом 'Выдан'.")
 
-    # УБРАЛИ проверку на активную смену
+    # --- ПРОВЕРКА ВОЗМОЖНОСТИ ВОЗВРАТА ---
+    can_revert = False
+    if employee.role.name == 'Владелец':
+        can_revert = True # Владелец может всегда
+    else:
+        # Сотрудник может вернуть, только если СМЕНА, в которую была выдача, ЕЩЕ АКТИВНА
+        if order.shift and order.shift.end_time is None:
+            # И если это смена ТЕКУЩЕГО СОТРУДНИКА (доп. безопасность)
+            if order.shift.employee_id == employee.id:
+                 can_revert = True
+    
+    if not can_revert:
+         raise HTTPException(status_code=403, detail="Отмена выдачи невозможна (смена закрыта или у вас нет прав).")
+    # --- КОНЕЦ ПРОВЕРКИ ---
 
-    # --- ВОТ БЛОК TRY/EXCEPT, КОТОРЫЙ ИСПРАВЛЯЕТ ОШИБКУ ---
     try:
-        # Сохраняем причину возврата
-        existing_comment = order.comment if order.comment else ""
-
-        # --- ВАЖНО: Убедись, что 'datetime' импортирован вверху 'main.py' ---
-        # (Он у тебя уже должен быть, т.к. используется в 'on_startup' и других)
-
-        new_comment = f"[ВОЗВРАТ {datetime.now().strftime('%Y-%m-%d %H:%M')}] {payload.revert_reason}\n---\n{existing_comment}"
-
         order.status = "Готов к выдаче"
-        order.reverted_at = datetime.now() 
-        order.comment = new_comment 
-
+        
+        # (Задача 3) Добавляем запись в историю
+        history_entry = OrderHistory(
+            order_id=order.id,
+            status="Готов к выдаче",
+            employee_id=employee.id
+        )
+        db.add(history_entry)
+        
+        order.reverted_at = datetime.now() # Фиксируем время возврата
         # Обнуляем данные о выдаче
         order.issued_at = None
         order.shift_id = None
-        order.weight_kg = None 
-        order.final_cost_som = None 
+        order.weight_kg = None # Сбрасываем фактический вес
+        order.final_cost_som = None # Сбрасываем фактическую стоимость
         order.paid_cash_som = None
         order.paid_card_som = None
         order.card_payment_type = None
-
+        
         db.commit()
         db.refresh(order)
         db.refresh(order, attribute_names=['client']) # Обновляем клиента для ответа
-        print(f"[Выдача] Статус заказа ID={order.id} возвращен на 'Готов к выдаче'. Сотрудник ID={employee.id}")
+        print(f"[Выдача] Статус заказа ID={order_id} возвращен на 'Готов к выдаче'. Сотрудник ID={employee.id}")
         return order
-
+        
     except Exception as e:
         db.rollback()
         import traceback
-        print(f"!!! Ошибка БД при возврате статуса заказа ID={order.id}:\n{traceback.format_exc()}")
+        print(f"!!! Ошибка БД при возврате статуса заказа ID={order_id}:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных при возврате статуса: {e}")
-# --- КОНЕЦ БЛОКА ВЫДАЧИ ---
-
 # main.py (Добавьте этот блок)
 
 # --- Эндпоинты для Отчетов (Multi-Tenant) ---
@@ -3969,6 +4230,15 @@ async def calculate_orders( # Добавляем async для уведомлен
                 # Обновляем статус, если он передан и отличается от текущего
                 if payload.new_status and payload.new_status != original_status:
                     order.status = payload.new_status
+                    
+                    # (Задача 3) Добавляем запись в историю
+                    history_entry = OrderHistory(
+                        order_id=order.id,
+                        status=payload.new_status,
+                        employee_id=employee.id
+                    )
+                    db.add(history_entry) # Добавляем в сессию
+
                     # Готовим данные для уведомления
                     if order.client and order.client.telegram_chat_id:
                         client_id = order.client.id
@@ -4196,12 +4466,27 @@ def register_client_from_bot(
         print(f"!!! [Bot Register] Ошибка: Chat ID {payload.telegram_chat_id} уже занят.")
         raise HTTPException(status_code=409, detail="Этот Telegram-аккаунт уже привязан к другому клиенту.")
 
-    # 4. Авто-генерация кода клиента (логика из /api/clients)
-    max_code_result = db.query(func.max(Client.client_code_num)).filter(
+    # 4. Авто-генерация кода клиента (с Настройкой)
+    # 1. Получаем настройку начального кода
+    start_code_setting = db.query(Setting).filter(Setting.key == 'client_code_start', Setting.company_id == payload.company_id).first()
+    start_from = 1001 # Значение по умолчанию
+    if start_code_setting and start_code_setting.value:
+        try:
+            start_from = int(start_code_setting.value)
+        except ValueError:
+            pass 
+    
+    # 2. Находим максимальный существующий код ДЛЯ ЭТОЙ КОМПАНИИ
+    max_code_result = db.query(
+        func.max(Client.client_code_num)
+    ).filter(
         Client.company_id == payload.company_id
     ).scalar()
-    new_code_num = (max_code_result + 1) if max_code_result else 1001
-    print(f"[Bot Register] Сгенерирован новый код клиента: {new_code_num}")
+    
+    # 3. Выбираем следующий код
+    next_code = (max_code_result + 1) if max_code_result else start_from
+    new_code_num = max(next_code, start_from) # Используем больший из (макс+1) или (настройки)
+    print(f"[Bot Register] Сгенерирован новый код клиента: {new_code_num} (Начальный: {start_from}, Макс: {max_code_result})")
 
     # 5. Создание клиента
     new_client = Client(
@@ -4447,6 +4732,7 @@ def identify_company_by_token(
 # --- Добавь эти Pydantic модели (например, после BotClientRegisterPayload) ---
 class BotBroadcastPayload(BaseModel):
     text: str = Field(..., min_length=1)
+    photo_file_id: Optional[str] = None # <-- ДОБАВЛЕНО
 
 class BotBroadcastResponse(BaseModel):
     status: str
@@ -4457,7 +4743,7 @@ class BotBroadcastResponse(BaseModel):
 
 # --- ДОБАВЬ ЭТОТ НОВЫЙ ЭНДПОИНТ ---
 @app.post("/api/bot/broadcast", tags=["Telegram Bot"], response_model=BotBroadcastResponse)
-async def bot_broadcast( # <--- Делаем функцию async
+async def bot_broadcast( # <--- Убедись, что 'async' здесь есть
     payload: BotBroadcastPayload,
     # Требуем, чтобы запрос делал Владелец
     employee: Employee = Depends(get_company_owner), 
@@ -4478,16 +4764,34 @@ async def bot_broadcast( # <--- Делаем функцию async
 
     bot_token = company.telegram_bot_token
 
-    # 2. Находим всех клиентов компании с привязанным Telegram
+    # 2. СОХРАНЯЕМ РАССЫЛКУ В БД (ШАГ 2)
+    try:
+        new_broadcast = Broadcast(
+            text=payload.text,
+            photo_file_id=payload.photo_file_id,
+            company_id=company_id
+        )
+        db.add(new_broadcast)
+        db.commit()
+        db.refresh(new_broadcast)
+        broadcast_id = new_broadcast.id # Получаем ID новой рассылки
+        print(f"[Broadcast] Рассылка сохранена в БД, ID: {broadcast_id}")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Broadcast] Ошибка сохранения рассылки в БД: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Ошибка базы данных при сохранении рассылки.")
+
+
+    # 3. Находим всех клиентов (ШАГ 3)
     clients_to_notify = db.query(Client).filter(
         Client.company_id == company_id,
         Client.telegram_chat_id != None
     ).all()
 
     if not clients_to_notify:
-        return BotBroadcastResponse(status="ok", message="Рассылка завершена.", sent_to_clients=0)
+        return BotBroadcastResponse(status="ok", message="Рассылка сохранена, но нет клиентов для отправки.", sent_to_clients=0)
 
-    # 3. Запускаем асинхронную рассылку
+    # 4. Запускаем асинхронную рассылку (ШАГ 4)
     tasks = []
     bot = telegram.Bot(token=bot_token)
     
@@ -4495,9 +4799,11 @@ async def bot_broadcast( # <--- Делаем функцию async
         # Создаем задачу на отправку
         tasks.append(
             send_telegram_message(
-                token=bot_token, # Используем функцию, которая уже есть в main.py
+                token=bot_token, 
                 chat_id=client.telegram_chat_id,
-                text=payload.text # Текст из payload
+                text=payload.text, 
+                photo_id=payload.photo_file_id,
+                broadcast_id=broadcast_id # <-- ДОБАВЛЕНО (ID для кнопок)
             )
         )
     
@@ -4514,7 +4820,252 @@ async def bot_broadcast( # <--- Делаем функцию async
     )
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
 
+# --- Pydantic модели для Реакций ---
+class BotReactionPayload(BaseModel):
+    client_id: int
+    broadcast_id: int
+    reaction_type: str
+    company_id: int
+
+class BotReactionResponse(BaseModel):
+    status: str
+    message: str
+    new_counts: dict # {"like": 10, "dislike": 2}
+
+# --- Pydantic модели для Отчета по Рассылкам ---
+class BroadcastStatItem(BaseModel):
+    id: int
+    sent_at: datetime
+    text: str
+    photo_file_id: Optional[str] = None
+    like_count: int = 0
+    dislike_count: int = 0
+    # (Если добавляли другие реакции, добавьте счетчики сюда)
+
+class BroadcastReportResponse(BaseModel):
+    status: str
+    report: List[BroadcastStatItem]
+
+class ReactionDetailItem(BaseModel):
+    client_id: int
+    # full_name: str # Убираем
+    # phone: str # Убираем
+    reaction_type: str
+    created_at: datetime
+    client: ClientOut # <-- ДОБАВЛЯЕМ вложенную модель клиента
+
+    class Config:
+        from_attributes = True
+
+class BroadcastReactionDetailResponse(BaseModel):
+    status: str
+    broadcast_id: int
+    reactions: List[ReactionDetailItem]
+
+    class Config: # <-- Убедись, что этот блок есть
+        from_attributes = True
+
+# --- НОВЫЙ ЭНДПОИНТ ДЛЯ ЛОВЛИ РЕАКЦИЙ ---
+@app.post("/api/bot/react", tags=["Telegram Bot"], response_model=BotReactionResponse)
+def handle_bot_reaction(
+    payload: BotReactionPayload,
+    db: Session = Depends(get_db)
+):
+    """
+    Обрабатывает нажатие кнопки реакции от клиента.
+    Сохраняет реакцию и возвращает новые счетчики.
+    """
+    print(f"[Bot Reaction] Получена реакция: {payload.dict()}")
+    
+    # 1. Проверяем, существует ли рассылка
+    broadcast = db.query(Broadcast.id).filter(
+        Broadcast.id == payload.broadcast_id,
+        Broadcast.company_id == payload.company_id
+    ).first()
+    if not broadcast:
+        raise HTTPException(status_code=404, detail="Рассылка не найдена.")
+        
+    # 2. Проверяем, существует ли клиент
+    client = db.query(Client.id).filter(
+        Client.id == payload.client_id,
+        Client.company_id == payload.company_id
+    ).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Клиент не найден.")
+
+    # 3. Ищем существующую реакцию этого клиента на этот пост
+    existing_reaction = db.query(BroadcastReaction).filter(
+        BroadcastReaction.broadcast_id == payload.broadcast_id,
+        BroadcastReaction.client_id == payload.client_id
+    ).first()
+
+    if existing_reaction:
+        # Если реакция уже есть
+        if existing_reaction.reaction_type == payload.reaction_type:
+            # Пользователь нажал ту же кнопку - УДАЛЯЕМ реакцию
+            print(f"[Bot Reaction] Клиент {payload.client_id} УДАЛИЛ реакцию '{payload.reaction_type}'")
+            db.delete(existing_reaction)
+        else:
+            # Пользователь сменил реакцию - ОБНОВЛЯЕМ
+            print(f"[Bot Reaction] Клиент {payload.client_id} СМЕНИЛ реакцию на '{payload.reaction_type}'")
+            existing_reaction.reaction_type = payload.reaction_type
+    else:
+        # Если реакции нет - СОЗДАЕМ
+        print(f"[Bot Reaction] Клиент {payload.client_id} ДОБАВИЛ реакцию '{payload.reaction_type}'")
+        new_reaction = BroadcastReaction(
+            broadcast_id=payload.broadcast_id,
+            client_id=payload.client_id,
+            reaction_type=payload.reaction_type
+        )
+        db.add(new_reaction)
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Bot Reaction] Ошибка БД при сохранении реакции: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Ошибка базы данных при сохранении реакции.")
+
+    # 4. Считаем и возвращаем НОВЫЕ итоги для этой рассылки
+    reaction_counts = db.query(
+        BroadcastReaction.reaction_type, 
+        func.count(BroadcastReaction.id)
+    ).filter(
+        BroadcastReaction.broadcast_id == payload.broadcast_id
+    ).group_by(
+        BroadcastReaction.reaction_type
+    ).all()
+    
+    # Преобразуем в словарь {"like": 10, "dislike": 2}
+    new_counts = {reaction_type: count for reaction_type, count in reaction_counts}
+    print(f"[Bot Reaction] Новые счетчики для broadcast {payload.broadcast_id}: {new_counts}")
+
+    return BotReactionResponse(
+        status="ok",
+        message="Реакция обработана",
+        new_counts=new_counts
+    )
+
 # main.py
+
+# --- НОВЫЙ ЭНДПОИНТ ДЛЯ СТАТИСТИКИ РАССЫЛОК (ВЛАДЕЛЕЦ) ---
+@app.get("/api/reports/broadcasts", tags=["Отчеты", "Telegram Bot"], response_model=BroadcastReportResponse)
+def get_broadcast_report(
+    employee: Employee = Depends(get_company_owner), # Только Владелец
+    db: Session = Depends(get_db)
+):
+    """
+    Возвращает статистику по реакциям на все рассылки компании.
+    """
+    company_id = employee.company_id
+    print(f"[Broadcast Report] Владелец {employee.id} запросил статистику для компании {company_id}")
+
+    # 1. Сначала считаем все реакции, сгруппированные по broadcast_id
+    reaction_counts_query = db.query(
+        BroadcastReaction.broadcast_id,
+        BroadcastReaction.reaction_type,
+        func.count(BroadcastReaction.id).label('count')
+    ).join(Broadcast, Broadcast.id == BroadcastReaction.broadcast_id).filter(
+        Broadcast.company_id == company_id # Убеждаемся, что реакции из нашей компании
+    ).group_by(
+        BroadcastReaction.broadcast_id,
+        BroadcastReaction.reaction_type
+    )
+    
+    reaction_counts_raw = reaction_counts_query.all()
+    
+    # Преобразуем в удобный словарь:
+    # { 123: {"like": 10, "dislike": 2}, 124: {"like": 5} }
+    stats_map = {}
+    for broadcast_id, reaction_type, count in reaction_counts_raw:
+        if broadcast_id not in stats_map:
+            stats_map[broadcast_id] = {}
+        stats_map[broadcast_id][reaction_type] = count
+        
+    print(f"[Broadcast Report] Подсчитаны реакции: {stats_map}")
+
+    # 2. Теперь получаем сами рассылки (например, 10 последних)
+    broadcasts = db.query(Broadcast).filter(
+        Broadcast.company_id == company_id
+    ).order_by(
+        Broadcast.sent_at.desc()
+    ).limit(10).all() # Ограничим 10-ю последними
+
+    # 3. Собираем итоговый отчет
+    report_list = []
+    for b in broadcasts:
+        counts = stats_map.get(b.id, {}) # Получаем счетчики для этой рассылки
+        
+        stat_item = BroadcastStatItem(
+            id=b.id,
+            sent_at=b.sent_at,
+            text=b.text,
+            photo_file_id=b.photo_file_id,
+            like_count=counts.get("like", 0),
+            dislike_count=counts.get("dislike", 0)
+            # (добавьте 'fire_count' и т.д., если нужно)
+        )
+        report_list.append(stat_item)
+
+    return BroadcastReportResponse(status="ok", report=report_list)
+
+# --- НОВЫЙ ЭНДПОИНТ ДЛЯ ДЕТАЛИЗАЦИИ РЕАКЦИЙ (ВЛАДЕЛЕЦ) ---
+# --- НОВЫЙ ЭНДПОИНТ ДЛЯ ДЕТАЛИЗАЦИИ РЕАКЦИЙ (ВЛАДЕЛЕЦ) ---
+@app.get("/api/reports/broadcast/{broadcast_id}/reactions", tags=["Отчеты", "Telegram Bot"], response_model=BroadcastReactionDetailResponse)
+def get_broadcast_reaction_details(
+    broadcast_id: int,
+    employee: Employee = Depends(get_company_owner), # Только Владелец
+    db: Session = Depends(get_db)
+):
+    """
+    (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+    Возвращает список клиентов, которые отреагировали на конкретную рассылку.
+    """
+    company_id = employee.company_id
+    print(f"[Broadcast Details] Владелец {employee.id} запросил реакции для {broadcast_id}")
+
+    # 1. Проверяем, существует ли рассылка
+    broadcast = db.query(Broadcast.id).filter(
+        Broadcast.id == broadcast_id,
+        Broadcast.company_id == company_id
+    ).first()
+    if not broadcast:
+        raise HTTPException(status_code=404, detail="Рассылка не найдена в вашей компании.")
+
+    # 2. Запрашиваем реакции, объединяя с клиентами
+    reactions_query = db.query(
+        BroadcastReaction
+    ).options(
+        joinedload(BroadcastReaction.client) # Подгружаем данные клиента
+    ).filter(
+        BroadcastReaction.broadcast_id == broadcast_id
+    ).order_by(
+        BroadcastReaction.created_at.desc()
+    ).all()
+
+    # 3. Формируем ответ (ВРУЧНУЮ) - Это самый надежный способ
+    response_reactions = []
+    for reaction in reactions_query:
+        if reaction.client: # Убедимся, что клиент не был удален
+            response_reactions.append(
+                ReactionDetailItem(
+                    client_id=reaction.client_id,
+                    reaction_type=reaction.reaction_type,
+                    created_at=reaction.created_at,
+                    # Pydantic сам преобразует 'reaction.client' (SQLAlchemy)
+                    # в 'ClientOut', т.к. у ClientOut есть from_attributes
+                    client=reaction.client
+                )
+            )
+        else:
+            # Если клиент был удален, а реакция осталась
+            logger.warning(f"[Broadcast Details] Реакция ID {reaction.id} ссылается на удаленного клиента ID {reaction.client_id}")
+
+    return BroadcastReactionDetailResponse(
+        status="ok",
+        broadcast_id=broadcast_id,
+        reactions=response_reactions # Передаем вручную собранный список
+    )
 
 # --- НОВЫЙ ЭНДПОИНТ ДЛЯ ВЫХОДА ИЗ СИСТЕМЫ (ОТРЫВКИ) ---
 @app.post("/api/bot/unlink", tags=["Telegram Bot"])
