@@ -11,6 +11,7 @@ import asyncio
 import html # Для форматирования ответов
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
+from datetime import datetime, timezone, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -73,7 +74,8 @@ owner_main_menu_keyboard = [
     ["👤 Мой профиль", "📦 Все Заказы"], # <
     ["👥 Клиенты", "🏢 Филиалы"], # <
     ["➕ Добавить заказ", "📢 Объявление"], # <
-    ["🇨🇳 Адреса складов", "🇰🇬 Наши контакты"]
+    ["📊 Статистика", "🇰🇬 Наши контакты"], # <-- ИЗМЕНЕНО
+    ["🇨🇳 Адреса складов"] # <-- Перенесено
 ]
 owner_main_menu_markup = ReplyKeyboardMarkup(owner_main_menu_keyboard, resize_keyboard=True)
 # --- КОНЕЦ НОВОЙ КЛАВИАТУРЫ ---
@@ -89,13 +91,15 @@ owner_main_menu_markup = ReplyKeyboardMarkup(owner_main_menu_keyboard, resize_ke
     ADD_ORDER_TRACK_CODE,
     ADD_ORDER_COMMENT,
 
-    # --- НОВЫЕ ДИАЛОГИ ВЛАДЕЛЬЦА ---
+# --- НОВЫЕ ДИАЛОГИ ВЛАДЕЛЬЦА ---
     OWNER_ASK_ORDER_SEARCH,
     OWNER_ASK_CLIENT_SEARCH,
+    OWNER_ASK_BROADCAST_PHOTO, # <-- ДОБАВЛЕНО
     OWNER_ASK_BROADCAST_TEXT,
+    OWNER_REASK_BROADCAST_TEXT, # <-- ДОБАВЛЕНО
     OWNER_CONFIRM_BROADCAST
 
-) = range(9) # Теперь 9 состояний
+) = range(11) # Теперь 11 состояний
 
 # --- 4. Функции-помощники ---
 
@@ -704,6 +708,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await owner_locations(update, context)
         elif text == "📢 Объявление":
             await owner_broadcast_start(update, context)
+        elif text == "📊 Статистика": # <-- ДОБАВЛЕНО
+            await owner_statistics(update, context) # <-- ДОБАВЛЕНО
         else:
              logger.warning(f"Неизвестная команда Владельца: '{text}' от {client_id}")
              await update.message.reply_text("Неизвестная команда.", reply_markup=markup)
@@ -1060,6 +1066,184 @@ async def location_contact_back_callback(update: Update, context: ContextTypes.D
         logger.error(f"Неожиданная ошибка в location_contact_back_callback: {e}", exc_info=True)
         await query.edit_message_text("Произошла ошибка.")
 
+# --- НОВЫЙ ОБРАБОТЧИК РЕАКЦИЙ ---
+async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    (ИСПРАВЛЕНО) Ловит нажатия на кнопки реакций (callback_data='react_BROADCASTID_TYPE')
+    """
+    query = update.callback_query
+    
+    try:
+        # 1. ПРОВЕРЯЕМ АВТОРИЗАЦИЮ КЛИЕНТА В ПЕРВУЮ ОЧЕРЕДЬ
+        client_id = context.user_data.get('client_id')
+        if not client_id:
+            logger.warning(f"[Reaction Callback] Неавторизованный пользователь (ChatID: {query.from_user.id}) нажал на реакцию.")
+            # Отправляем ВСПЛЫВАЮЩЕЕ окно с ошибкой
+            await query.answer(
+                text="Ошибка: Вы не авторизованы.\n\nПожалуйста, нажмите /start, чтобы войти в систему и голосовать.", 
+                show_alert=True
+            )
+            return
+        
+        # 2. Парсим callback_data
+        # 'react_123_like' -> ['react', '123', 'like']
+        parts = query.data.split('_')
+        broadcast_id = int(parts[1])
+        reaction_type = parts[2]
+        
+        # Отправляем быстрый ответ, что голос учтен
+        await query.answer(text="Ваш голос учтен!") 
+        
+        logger.info(f"[Reaction Callback] Клиент {client_id} нажал '{reaction_type}' для рассылки {broadcast_id}")
+
+        # 3. Отправляем реакцию в API
+        payload = {
+            "client_id": client_id,
+            "broadcast_id": broadcast_id,
+            "reaction_type": reaction_type,
+            "company_id": COMPANY_ID_FOR_BOT
+        }
+        api_response = await api_request("POST", "/api/bot/react", json=payload)
+
+        if not api_response or "error" in api_response:
+            error_msg = api_response.get("error", "Неизвестная ошибка") if api_response else "Нет ответа"
+            logger.error(f"[Reaction Callback] Ошибка API при сохранении реакции: {error_msg}")
+            # Не обновляем кнопки, если была ошибка
+            return
+
+        # 4. Обновляем кнопки в сообщении
+        new_counts = api_response.get("new_counts", {})
+        like_count = new_counts.get("like", 0)
+        dislike_count = new_counts.get("dislike", 0)
+        
+        # (Если добавляли 'fire', добавьте его сюда)
+        # fire_count = new_counts.get("fire", 0)
+
+        # Формируем текст для кнопок
+        like_text = f"👍 {like_count}" if like_count > 0 else "👍"
+        dislike_text = f"👎 {dislike_count}" if dislike_count > 0 else "👎"
+        # fire_text = f"🔥 {fire_count}" if fire_count > 0 else "🔥"
+
+        # Создаем новую клавиатуру
+        new_keyboard = [
+            [
+                InlineKeyboardButton(like_text, callback_data=f"react_{broadcast_id}_like"),
+                InlineKeyboardButton(dislike_text, callback_data=f"react_{broadcast_id}_dislike"),
+                # InlineKeyboardButton(fire_text, callback_data=f"react_{broadcast_id}_fire"),
+            ]
+        ]
+        
+        # Редактируем исходное сообщение, заменяя клавиатуру
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+        logger.info(f"[Reaction Callback] Кнопки для рассылки {broadcast_id} обновлены.")
+
+    except (IndexError, ValueError, TypeError):
+        logger.error(f"[Reaction Callback] Ошибка парсинга callback_data: {query.data}", exc_info=True)
+    except Exception as e:
+         logger.error(f"[Reaction Callback] Неожиданная ошибка: {e}", exc_info=True)
+         # Пытаемся убрать кнопки, если что-то пошло не так
+         try:
+             await query.edit_message_reply_markup(reply_markup=None)
+         except:
+             pass
+
+# --- НОВЫЙ ОБРАБОТчик ДЛЯ ВЛАДЕЛЬЦА (КТО РЕАГИРОВАЛ) ---
+async def handle_show_reactions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    (ПОЛНАЯ ПЕРЕПИСЬ) Ловит нажатие Владельца на 'Показать, кто отреагировал'
+    (callback_data='show_reacts_BROADCASTID')
+    """
+    query = update.callback_query
+    
+    # --- 1. Проверка Авторизации (Владелец) ---
+    employee_id = context.user_data.get('employee_id')
+    if not employee_id:
+        try:
+            await query.answer("Ошибка: Вы не авторизованы как Владелец. Нажмите /start.", show_alert=True)
+        except Exception:
+            pass # Если не удалось ответить, ничего страшного
+        return
+
+    # --- 2. Быстрый ответ "Загружаю..." ---
+    # (Это ЕДИНСТВЕННЫЙ query.answer(), который мы вызовем)
+    try:
+        await query.answer(text="Загружаю список...")
+    except Exception as e:
+        logger.error(f"[Show Reactions] Не удалось отправить query.answer: {e}")
+        # Если не можем ответить, нет смысла продолжать
+        return
+
+    # --- 3. Получение данных из API ---
+    try:
+        parts = query.data.split('_') # 'show_reacts_123'
+        broadcast_id = int(parts[2])
+        
+        logger.info(f"[Show Reactions] Владелец (EID: {employee_id}) запросил список для {broadcast_id}")
+
+        api_response = await api_request(
+            "GET",
+            f"/api/reports/broadcast/{broadcast_id}/reactions",
+            employee_id=employee_id
+        )
+
+        # --- 4. Обработка ответа API ---
+        if not api_response or "error" in api_response or "reactions" not in api_response:
+            error_msg = api_response.get("error", "Нет ответа") if api_response else "Нет ответа"
+            logger.error(f"[Show Reactions] Ошибка API: {error_msg}")
+            # Отправляем сообщение об ошибке
+            await context.bot.send_message(
+                chat_id=query.from_user.id, 
+                text=f"❌ Ошибка загрузки данных: {error_msg}"
+            )
+            return
+
+        # --- 5. Формирование ответа ---
+        reactions = api_response.get("reactions", [])
+        if not reactions:
+            logger.info(f"[Show Reactions] Реакций для {broadcast_id} не найдено.")
+            await context.bot.send_message(
+                chat_id=query.from_user.id, 
+                text=f"📊 На рассылку #{broadcast_id} пока никто не отреагировал."
+            )
+            return
+        
+        # Группируем по типу реакции
+        likes = []
+        dislikes = []
+        
+        for r in reactions:
+            client_data = r.get('client', {}) 
+            client_info = f"<b>{client_data.get('full_name', '?')}</b> (<code>{client_data.get('phone', '?')}</code>)"
+            
+            if r.get('reaction_type') == 'like':
+                likes.append(client_info)
+            elif r.get('reaction_type') == 'dislike':
+                dislikes.append(client_info)
+            # (Можно добавить другие)
+
+        # Собираем сообщение
+        text = f"📊 <b>Реакции на рассылку #{broadcast_id}:</b>\n\n"
+        if likes:
+            text += f"👍 Понравилось ({len(likes)}):\n" + "\n".join(likes) + "\n\n"
+        if dislikes:
+            text += f"👎 Не понравилось ({len(dislikes)}):\n" + "\n".join(dislikes) + "\n\n"
+        if not likes and not dislikes:
+             text += "Нет данных о реакциях." # На всякий случай
+
+        # --- 6. Отправка сообщения ---
+        await context.bot.send_message(
+            chat_id=query.from_user.id, 
+            text=text, 
+            parse_mode=ParseMode.HTML
+        )
+
+    except (IndexError, ValueError, TypeError):
+        logger.error(f"[Show Reactions] Ошибка парсинга callback_data: {query.data}", exc_info=True)
+        await context.bot.send_message(chat_id=query.from_user.id, text="❌ Ошибка: неверный формат запроса.")
+    except Exception as e:
+        logger.error(f"[Show Reactions] Неожиданная ошибка: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=query.from_user.id, text=f"❌ Произошла неизвестная ошибка: {e}")
+
 # --- 10. НОВЫЕ Функции Владельца ---
 
 async def owner_all_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1123,6 +1307,24 @@ async def handle_owner_order_search(update: Update, context: ContextTypes.DEFAUL
         if calc_weight is not None and calc_cost is not None:
             text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
         
+        # --- ДОБАВЛЕНО: Вывод истории статусов (Задача 3-В) ---
+        history = order.get('history_entries', [])
+        if history:
+            text += "<b>История статусов:</b>\n"
+            bishkek_tz = timezone(timedelta(hours=6)) # Часовой пояс Бишкека
+            
+            for entry in history:
+                try:
+                    # Конвертируем UTC в Бишкек
+                    utc_date = datetime.fromisoformat(entry.get('created_at'))
+                    bishkek_date = utc_date.astimezone(bishkek_tz)
+                    hist_date = bishkek_date.strftime('%d.%m %H:%M')
+                    text += f"  <i>- {hist_date}: {entry.get('status')}</i>\n"
+                except Exception as e_hist:
+                    logger.warning(f"Ошибка парсинга даты истории: {e_hist}")
+                    text += f"  <i>- (ошибка даты): {entry.get('status')}</i>\n"
+        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+            
         text += "──────────────\n"
     
     if len(text) > 4000:
@@ -1221,32 +1423,167 @@ async def owner_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     await update.message.reply_html(text, reply_markup=markup)
 
+async def owner_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """(Владелец) Показывает статистику по реакциям на рассылки."""
+    client_id = context.user_data.get('client_id')
+    employee_id = context.user_data.get('employee_id')
+    markup = owner_main_menu_markup
+
+    if not employee_id:
+         await update.message.reply_text("Ошибка аутентификации Владельца. Попробуйте /start", reply_markup=markup)
+         return
+
+    logger.info(f"Владелец (EID: {employee_id}) запросил статистику рассылок.")
+    await update.message.reply_text("Загружаю статистику по последним 10 рассылкам...", reply_markup=markup)
+
+    # Вызываем новый API
+    api_response = await api_request(
+        "GET", 
+        "/api/reports/broadcasts",
+        employee_id=employee_id # Аутентификация
+    )
+
+    if not api_response or "error" in api_response or "report" not in api_response:
+        error_msg = api_response.get("error", "Нет ответа") if api_response else "Нет ответа"
+        logger.error(f"Ошибка API (Владелец /api/reports/broadcasts): {error_msg}")
+        await update.message.reply_text(f"Ошибка загрузки статистики: {error_msg}")
+        return
+
+    report_items = api_response.get("report", [])
+    if not report_items:
+        await update.message.reply_text("📊 Статистика пуста. Рассылок еще не было.", reply_markup=markup)
+        return
+
+    # --- ИЗМЕНЕНИЕ: Отправляем каждую статистику ОТДЕЛЬНЫМ сообщением ---
+    await update.message.reply_html("📊 <b>Статистика по последним 10 рассылкам:</b>\n\n", reply_markup=markup)
+
+    for item in report_items:
+        # Определяем часовой пояс Бишкека (UTC+6)
+        bishkek_tz = timezone(timedelta(hours=6))
+        # Получаем дату из ISO (она будет в UTC)
+        utc_date = datetime.fromisoformat(item.get('sent_at'))
+        # Конвертируем в Бишкек
+        bishkek_date = utc_date.astimezone(bishkek_tz)
+        # Форматируем
+        sent_date = bishkek_date.strftime('%d.%m.%Y %H:%M')
+
+        # Укорачиваем текст рассылки для превью
+        plain_text = re.sub(r'<[^>]+>', '', item.get('text', '')) # Убираем HTML
+        preview_text = (plain_text[:70] + '...') if len(plain_text) > 70 else plain_text
+        
+        photo_icon = "🖼️" if item.get('photo_file_id') else "📄"
+
+        item_text = f"<b>{photo_icon} Рассылка от {sent_date}</b>\n"
+        item_text += f"<i>«{html.escape(preview_text)}»</i>\n"
+        item_text += f"👍 <b>{item.get('like_count', 0)}</b> | 👎 <b>{item.get('dislike_count', 0)}</b>\n"
+        
+        # Создаем кнопку "Кто отреагировал?"
+        # Кнопка будет, только если есть хотя бы 1 реакция
+        reply_markup_inline = None
+        if item.get('like_count', 0) > 0 or item.get('dislike_count', 0) > 0:
+            keyboard = [[
+                InlineKeyboardButton(
+                    "Показать, кто отреагировал", 
+                    callback_data=f"show_reacts_{item.get('id')}"
+                )
+            ]]
+            reply_markup_inline = InlineKeyboardMarkup(keyboard)
+        
+        # Отправляем сообщение
+        await update.message.reply_html(item_text, reply_markup=reply_markup_inline)
+
 async def owner_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """(Владелец) Начинает диалог 'Объявление' (Рассылка)."""
+    """(Владелец) Начинает диалог 'Объявление' (Рассылка), спрашивает про фото."""
     logger.info(f"Владелец {context.user_data.get('client_id')} начинает рассылку.")
+    context.user_data['broadcast_photo'] = None # Сбрасываем фото
+    context.user_data['broadcast_text'] = None # Сбрасываем текст
+
+    keyboard = [["Да, добавить фото"], ["Нет, только текст"], ["Отмена"]]
     await update.message.reply_text(
-        "📢 Введите текст объявления для рассылки всем клиентам.\n"
-        "Вы можете использовать <b>HTML</b>-теги (<code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>).\n\n"
-        "Для отмены нажмите 'Отмена'.",
+        "📢 Начинаем рассылку.\n\nХотите прикрепить <b>одно фото</b> к вашему объявлению?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+        parse_mode=ParseMode.HTML
+    )
+    return OWNER_ASK_BROADCAST_PHOTO # <-- Переходим в новое состояние
+
+async def handle_broadcast_photo_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Обрабатывает выбор 'Да' или 'Нет' для фото."""
+    answer = update.message.text
+    
+    if answer == "Да, добавить фото":
+        await update.message.reply_text(
+            "Пожалуйста, <b>пришлите 1 фото</b> (не как файл, а как сжатое изображение).",
+            reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True),
+            parse_mode=ParseMode.HTML
+        )
+        return OWNER_ASK_BROADCAST_TEXT # <-- Все равно переходим к ASK_TEXT, но будем ждать фото
+
+    elif answer == "Нет, только текст":
+        context.user_data['broadcast_photo'] = None
+        await update.message.reply_text(
+            "Хорошо. Теперь введите <b>текст</b> объявления (можно использовать HTML).",
+            reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True),
+            parse_mode=ParseMode.HTML
+        )
+        return OWNER_REASK_BROADCAST_TEXT # <-- Переходим в состояние ожидания ТЕКСТА
+
+    else: # Если пользователь что-то другое нажал (не должно случиться с one_time_keyboard)
+        await update.message.reply_text("Пожалуйста, выберите 'Да' или 'Нет'.")
+        return OWNER_ASK_BROADCAST_PHOTO
+
+async def handle_broadcast_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Получил фото. Теперь просит текст."""
+    if not update.message.photo:
+        await update.message.reply_text("Это не фото. Пожалуйста, пришлите <b>сжатое изображение</b>, не файл.")
+        return OWNER_ASK_BROADCAST_TEXT # Остаемся в том же состоянии
+
+    # Берем фото лучшего качества (последнее в списке)
+    photo_file = update.message.photo[-1]
+    context.user_data['broadcast_photo'] = photo_file.file_id
+    logger.info(f"Владелец {update.effective_user.id} добавил фото, file_id: {photo_file.file_id}")
+    
+    await update.message.reply_text(
+        "✅ Фото получено.\n\nТеперь введите <b>текст</b> объявления (он будет подписью к фото).",
         reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True),
         parse_mode=ParseMode.HTML
     )
-    return OWNER_ASK_BROADCAST_TEXT
+    return OWNER_REASK_BROADCAST_TEXT # <-- Переходим в состояние ожидания ТЕКСТА
 
-async def handle_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """(Владелец) Получил текст рассылки, показывает превью и просит подтверждения."""
-    broadcast_text = update.message.text
-    # (Примечание: если нужен HTML, нужно отправлять update.message.text_html)
-    context.user_data['broadcast_text'] = update.message.text_html # Сохраняем с HTML
+async def handle_broadcast_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Получил фото. Теперь просит текст."""
+    if not update.message.photo:
+        await update.message.reply_text("Это не фото. Пожалуйста, пришлите <b>сжатое изображение</b>, не файл.")
+        return OWNER_ASK_BROADCAST_TEXT # Остаемся в том же состоянии
 
-    preview_message = (
-        "Пожалуйста, проверьте ваше объявление:\n"
-        "-----------------------------------\n"
-        f"{broadcast_text}\n" # Показываем как простой текст в превью
-        "-----------------------------------\n\n"
-        "<b>Отправляем это сообщение (с форматированием) всем клиентам?</b>"
-    )
+    # Берем фото лучшего качества (последнее в списке)
+    photo_file = update.message.photo[-1]
+    context.user_data['broadcast_photo'] = photo_file.file_id
+    logger.info(f"Владелец {update.effective_user.id} добавил фото, file_id: {photo_file.file_id}")
     
+    await update.message.reply_text(
+        "✅ Фото получено.\n\nТеперь введите <b>текст</b> объявления (он будет подписью к фото).",
+        reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True),
+        parse_mode=ParseMode.HTML
+    )
+    return OWNER_REASK_BROADCAST_TEXT # <-- Переходим в состояние ожидания ТЕКСТА
+
+async def handle_broadcast_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Получил текст рассылки, показывает превью и просит подтверждения."""
+    broadcast_text_html = update.message.text_html # Сохраняем с HTML
+    broadcast_text_plain = update.message.text # Для превью
+    context.user_data['broadcast_text'] = broadcast_text_html
+
+    photo_file_id = context.user_data.get('broadcast_photo')
+
+    # Формируем превью
+    preview_message = "<b>Пожалуйста, проверьте ваше объявление:</b>\n"
+    preview_message += "-----------------------------------\n"
+    if photo_file_id:
+        preview_message += "[ ФОТО ]\n"
+    preview_message += f"{broadcast_text_plain}\n" # Показываем как простой текст
+    preview_message += "-----------------------------------\n\n"
+    preview_message += "<b>Отправляем это сообщение всем клиентам?</b>"
+
     keyboard = [["Да, отправить"], ["Нет, отменить"]]
     await update.message.reply_html(
         preview_message,
@@ -1271,20 +1608,30 @@ async def handle_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
 
     broadcast_text_html = context.user_data.get('broadcast_text')
+    photo_file_id = context.user_data.get('broadcast_photo') # <-- Получаем фото
+
     if not broadcast_text_html:
         await update.message.reply_text("Ошибка: текст рассылки потерян. Попробуйте снова.", reply_markup=markup)
         return ConversationHandler.END
 
     await update.message.reply_text("⏳ Запускаю рассылку... Это может занять несколько минут.", reply_markup=markup)
     
+    # Формируем payload
+    payload = {
+        'text': broadcast_text_html,
+        'photo_file_id': photo_file_id, # <-- Добавляем ID фото (будет None, если фото нет)
+        'company_id': COMPANY_ID_FOR_BOT
+    }
+
     api_response = await api_request(
         "POST", 
         "/api/bot/broadcast",
         employee_id=employee_id, # <--- Аутентификация
-        json={'text': broadcast_text_html, 'company_id': COMPANY_ID_FOR_BOT}
+        json=payload # <-- Отправляем полный payload
     )
     
     context.user_data.pop('broadcast_text', None)
+    context.user_data.pop('broadcast_photo', None) # <-- Очищаем фото
 
     if not api_response or "error" in api_response:
         error_msg = api_response.get("error", "Нет ответа") if api_response else "Нет ответа"
@@ -1322,7 +1669,7 @@ async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Очистка ВСЕХ временных данных
     keys_to_clear = [
         'location_id', 'track_code', 'comment', 'available_locations', 
-        'phone_to_register', 'broadcast_text'
+        'phone_to_register', 'broadcast_text', 'broadcast_photo' # <-- ДОБАВЛЕНО
     ]
     for key in keys_to_clear:
         context.user_data.pop(key, None)
@@ -1452,9 +1799,16 @@ def main() -> None:
     owner_broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^📢 Объявление$'), owner_broadcast_start)],
         states={
+            OWNER_ASK_BROADCAST_PHOTO: [
+                MessageHandler(filters.Regex('^Да, добавить фото$'), handle_broadcast_photo_choice),
+                MessageHandler(filters.Regex('^Нет, только текст$'), handle_broadcast_photo_choice),
+            ],
             OWNER_ASK_BROADCAST_TEXT: [
-                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)
+                MessageHandler(filters.PHOTO, handle_broadcast_photo_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text_received), # Если фото не прислали, а прислали текст
+            ],
+            OWNER_REASK_BROADCAST_TEXT: [ # Состояние, когда мы ТОЧНО ждем текст
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text_received),
             ],
             OWNER_CONFIRM_BROADCAST: [
                 MessageHandler(filters.Regex('^Нет, отменить$'), cancel_dialog),
@@ -1479,6 +1833,12 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(location_contact_back_callback, pattern=r'^contact_list_back$'))
     application.add_handler(CommandHandler('logout', logout))
     # (Убрали back_callback, т.к. в этой версии он не нужен)
+
+    # НОВЫЙ Обработчик реакций (ловит все, что начинается с 'react_')
+    application.add_handler(CallbackQueryHandler(handle_reaction_callback, pattern=r'^react_'))
+
+    # НОВЫЙ Обработчик для Владельца (ловит 'show_reacts_')
+    application.add_handler(CallbackQueryHandler(handle_show_reactions_callback, pattern=r'^show_reacts_'))
 
     # Команда /cancel вне диалогов
     application.add_handler(CommandHandler('cancel', cancel_dialog))
