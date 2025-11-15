@@ -699,6 +699,7 @@ async function initializeMainAppUI() {
         if (document.getElementById('tab-expense-types')) renderPromises.push(renderExpenseTypesTab());
         if (document.getElementById('tab-expenses')) renderPromises.push(renderExpensesTab());
         if (document.getElementById('tab-reports')) renderPromises.push(renderReportsTab());
+        if (document.getElementById('tab-settings')) renderPromises.push(renderSettingsTab());
         if (document.getElementById('tab-settings')) renderPromises.push(renderSettingsTab()); 
         
         await Promise.all(renderPromises); 
@@ -1643,6 +1644,10 @@ function openCompanyModal(company = null) {
                       <input type="checkbox" id="modal-company-is-active" class="h-4 w-4 rounded" ${isEdit && company.is_active ? 'checked' : ''}>
                       <span class="ml-2 text-sm font-medium text-gray-700">Компания Активна (Разрешен вход)</span>
                   </label>
+                   <label class="flex items-center mt-2">
+                       <input type="checkbox" id="modal-company-ai-enabled" class="h-4 w-4 rounded" ${isEdit && (company.ai_enabled === true) ? 'checked' : ''}>
+                       <span class="ml-2 text-sm font-medium text-gray-700">🤖 Включить AI Ассистента (Интеллектуальный Рубильник)</span>
+                   </label>
             </div>
 
             <div class="flex gap-4 mt-6 border-t pt-4">
@@ -1714,26 +1719,30 @@ function handleCompanyActions(e) {
 }
 
 // --- Сохранение данных Компании (вызывается из модального окна) ---
+// index.html (Внутри МОДУЛЬ: УПРАВЛЕНИЕ КОМПАНИЯМИ)
+
 async function handleSaveCompany(e) {
     e.preventDefault(); // Предотвращаем стандартную отправку формы
     console.log("[Save] handleSaveCompany: Start");
     showLoader(); // Показываем индикатор загрузки
 
-    // Считываем ID компании (если он есть - режим редактирования)
     const companyId = document.getElementById('modal-company-id')?.value;
     const isEdit = !!companyId; // true, если ID есть
-    // Определяем URL и метод в зависимости от режима
     let url = '/api/superadmin/companies'; // URL для создания
     let method = 'POST'; // Метод для создания
     if(isEdit) {
         url = `/api/superadmin/companies/${companyId}`; // URL для обновления
         method = 'PATCH'; // Метод для обновления
     }
-    // Объект для данных, отправляемых на сервер
+    
+    // --- Безопасное считывание AI-Рубильника ---
+    const aiEnabledCheckbox = document.getElementById('modal-company-ai-enabled');
+    // Считываем статус как boolean, если элемент существует. Иначе оставляем undefined для PATCH
+    const aiEnabledStatus = aiEnabledCheckbox ? aiEnabledCheckbox.checked : undefined;
+    
     let payload = {};
 
     try {
-        // --- Собираем данные из полей модального окна ---
         if (isEdit) {
             // --- РЕДАКТИРОВАНИЕ ---
             payload = {
@@ -1741,12 +1750,13 @@ async function handleSaveCompany(e) {
                 subscription_paid_until: document.getElementById('modal-company-subscription')?.value,
                 contact_person: document.getElementById('modal-company-contact-person')?.value.trim() || null,
                 contact_phone: document.getElementById('modal-company-contact-phone')?.value.trim() || null,
-                is_active: document.getElementById('modal-company-is-active')?.checked,
-                // ДОБАВЛЕНО: Считываем поля бота
-                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null, // Отправляем null, если поле пустое
-                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null // Отправляем null, если поле пустое
+                is_active: document.getElementById('modal-company-is-active')?.checked, 
+                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null, 
+                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null,
+                // ИСПРАВЛЕНО: Теперь безопасно передаем ai_enabled (true, false, или undefined)
+                ai_enabled: aiEnabledStatus 
             };
-            // Проверка обязательных полей при редактировании
+            // Проверка обязательных полей
             if (!payload.name || !payload.subscription_paid_until) {
                 throw new Error("Название компании и дата окончания подписки обязательны.");
             }
@@ -1759,16 +1769,16 @@ async function handleSaveCompany(e) {
                 contact_person: document.getElementById('modal-company-contact-person')?.value.trim() || null,
                 contact_phone: document.getElementById('modal-company-contact-phone')?.value.trim() || null,
                 owner_full_name: document.getElementById('modal-company-owner-name')?.value.trim(),
-                owner_password: document.getElementById('modal-company-owner-password')?.value, // Пароль не тримим
-                // ДОБАВЛЕНО: Считываем поля бота
-                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null, // null если пусто
-                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null // null если пусто
+                owner_password: document.getElementById('modal-company-owner-password')?.value, 
+                telegram_bot_token: document.getElementById('modal-company-bot-token')?.value.trim() || null,
+                telegram_bot_username: document.getElementById('modal-company-bot-username')?.value.trim() || null,
+                // ИСПРАВЛЕНО: При создании, если undefined (нет элемента), ставим false
+                ai_enabled: aiEnabledStatus || false 
             };
-            // Проверка обязательных полей при создании
+            // Проверка обязательных полей
              if (!payload.name || !payload.company_code || !payload.subscription_paid_until || !payload.owner_full_name || !payload.owner_password) {
                   throw new Error("Все поля со звездочкой (*) обязательны при создании компании.");
              }
-             // Проверка корректности кода компании
              if (!/^[A-Z0-9_]{3,15}$/.test(payload.company_code)) {
                   throw new Error("Код компании некорректен (3-15 знаков, только латинские буквы A-Z, цифры 0-9 и символ подчеркивания '_').");
              }
@@ -1776,22 +1786,18 @@ async function handleSaveCompany(e) {
 
         // --- Отправляем запрос на сервер ---
         console.log(`[Save] handleSaveCompany: Sending ${method} to ${url}`, payload);
-        // Используем универсальную функцию apiFetch для отправки запроса
         const result = await apiFetch(url, { method: method, body: JSON.stringify(payload) });
         console.log("[Save] handleSaveCompany: Server response", result);
 
         // --- Обработка успеха ---
         alert(isEdit ? 'Данные компании успешно обновлены!' : 'Новая компания успешно создана!');
-        closeModal('company-modal'); // Закрываем модальное окно
-        await fetchAndRenderCompanies(); // Обновляем список компаний на странице
+        closeModal('company-modal'); 
+        await fetchAndRenderCompanies(); 
 
-    } catch(err) { // Обработка ошибок (от валидации или от apiFetch)
+    } catch(err) {
         console.error("[Save] handleSaveCompany: Error", err);
-        // Показываем сообщение об ошибке пользователю
         alert(`Ошибка сохранения данных компании: ${err.message}`);
-        // Оставляем модальное окно открытым для исправления
     } finally {
-        // --- Скрываем лоадер в любом случае ---
         hideLoader();
         console.log("[Save] handleSaveCompany: End");
     }
@@ -2050,6 +2056,11 @@ function openLocationModal(locationData = null) {
                 <input type="text" id="location-map" class="mt-1 w-full p-2 border rounded" 
                        value="${isEdit && locationData.map_link ? locationData.map_link : ''}" placeholder="https://go.2gis.com/...">
             </div>
+            <div>
+                <label for="location-schedule" class="block text-sm font-medium text-gray-700">График работы филиала</label>
+                <input type="text" id="location-schedule" class="mt-1 w-full p-2 border rounded" 
+                       value="${isEdit && locationData.schedule ? locationData.schedule : ''}" placeholder="Напр. Пн-Пт 9:00-18:00">
+            </div>
             <div class="flex gap-4 mt-6 border-t pt-4">
                 <button type="button" onclick="closeModal('location-modal')" class="w-full bg-gray-200 py-2 rounded hover:bg-gray-300 text-gray-800">Отмена</button>
                 <button type="submit" class="w-full bg-green-600 text-white py-2 rounded hover:bg-green-700">Сохранить</button>
@@ -2097,7 +2108,8 @@ async function handleSaveLocation(e) {
         phone: document.getElementById('location-phone')?.value.trim() || null,
         whatsapp_link: document.getElementById('location-whatsapp')?.value.trim() || null,
         instagram_link: document.getElementById('location-instagram')?.value.trim() || null,
-        map_link: document.getElementById('location-map')?.value.trim() || null
+        map_link: document.getElementById('location-map')?.value.trim() || null,
+        schedule: document.getElementById('location-schedule')?.value.trim() || null // <-- ДОБАВЛЕНО
         // --- КОНЕЦ НОВЫХ ПОЛЕЙ ---
     };
 
@@ -4389,12 +4401,19 @@ async function handleOrderExcelImport() {
         }
         resultsDiv.innerHTML = resultHtml; // Показываем результат
 
-        // --- Шаг 6: Обновление списка заказов и дат партий ---
+        // --- Шаг 6: Обновление списка заказов и дат партий (ИСПРАВЛЕН ПОРЯДОК) ---
         if (response.created_clients > 0 || partyDate || importLocationId) { 
-            console.log("[Import Orders] Refreshing orders list and party dates...");
-            await fetchAndRenderOrders(); 
+            console.log("[Import Orders] Refreshing party dates filter FIRST...");
+
+            // 1. СНАЧАЛА получаем новые даты
             availablePartyDates = await apiFetch('/api/orders/parties');
+
+            // 2. ПОТОМ обновляем (и "чекаем") фильтр в интерфейсе
             populatePartyFilter(); 
+            console.log("[Import Orders] Party filter updated. Refreshing orders list NOW...");
+
+            // 3. ТЕПЕРЬ загружаем заказы. Они не исчезнут, т.к. фильтр обновлен.
+            await fetchAndRenderOrders(); 
         }
 
     } catch (error) { // Обработка ошибок чтения файла или API
@@ -7936,6 +7955,8 @@ async function saveCalculation() {
 
 // === КОНЕЦ: Логика модального окна Расчета ===
 
+// index.html (внутри <script>)
+
 // =================================================================
 // МОДУЛЬ: НАСТРОЙКИ (Владелец)
 // =================================================================
@@ -7976,11 +7997,12 @@ async function renderSettingsTab() {
                         <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
                     </div>
 
-                <div>
-                    <label for="setting-client-code-start" class="block text-sm font-medium text-gray-700">Начальный номер для кодов клиентов</label>
-                    <p class="text-xs text-gray-500 mb-1">Новые клиенты (созданные в админке или боте) будут получать код, начиная с этого номера (например: 1001, 1400).</p>
-                    <input type="number" id="setting-client-code-start" data-key="client_code_start" class="setting-input w-full p-2 border rounded-md" placeholder="1001">
-                </div>
+                    <div>
+                        <label for="setting-client-code-start" class="block text-sm font-medium text-gray-700">Начальный номер для кодов клиентов</label>
+                        <p class="text-xs text-gray-500 mb-1">Новые клиенты (созданные в админке или боте) будут получать код, начиная с этого номера (например: 1001, 1400).</p>
+                        <input type="number" id="setting-client-code-start" data-key="client_code_start" class="setting-input w-full p-2 border rounded-md" placeholder="1001">
+                    </div>
+
                 </div>
 
                 <div id="subtab-settings-passwords" class="setting-subtab-pane space-y-6 hidden">
@@ -8009,10 +8031,11 @@ async function renderSettingsTab() {
         </div>
     `;
 
-    // Привязываем слушатель к форме
+    // --- Привязка слушателей к элементам ---
     const form = document.getElementById('settings-form');
     if (form) {
-        form.replaceWith(form.cloneNode(true)); // Очищаем старые
+        // Заменяем, чтобы удалить старые слушатели
+        form.replaceWith(form.cloneNode(true));
         document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
         console.log("[Listener OK] Added submit to #settings-form");
     }
@@ -8020,7 +8043,10 @@ async function renderSettingsTab() {
     // Привязываем слушатель к под-вкладкам
     const subtabsContainer = document.getElementById('settings-subtabs');
     if (subtabsContainer) {
-        subtabsContainer.addEventListener('click', e => {
+        // Используем делегирование
+        const newSubtabsContainer = subtabsContainer.cloneNode(true);
+        subtabsContainer.parentNode?.replaceChild(newSubtabsContainer, subtabsContainer);
+        newSubtabsContainer.addEventListener('click', e => {
             const tabButton = e.target.closest('.setting-subtab-btn');
             if (tabButton) {
                 const tabName = tabButton.dataset.subtab;
@@ -8037,11 +8063,12 @@ async function renderSettingsTab() {
                 });
             }
         });
-        console.log("[Listener OK] Added click to #settings-subtabs");
+        console.log("[Listener OK] Added click delegate to #settings-subtabs");
     }
 
     // Загружаем и отображаем текущие настройки
     await fetchAndRenderSettings();
+    console.log("[Render] renderSettingsTab: End");
 }
 
 // --- Загрузка и отображение Настроек ---
@@ -8049,9 +8076,10 @@ async function fetchAndRenderSettings() {
     console.log("[Fetch] fetchAndRenderSettings: Start");
     showLoader();
     try {
-        const settingsList = await apiFetch('/api/settings'); // Получаем список [{key: k, value: v}, ...]
+        // Используем GET /api/settings для получения настроек компании
+        const settingsList = await apiFetch('/api/settings'); 
         
-        // Преобразуем список в удобный объект (кэш)
+        // Преобразуем список [{key: k, value: v}, ...] в удобный объект (кэш)
         companySettings = settingsList.reduce((acc, setting) => {
             acc[setting.key] = setting.value;
             return acc;
@@ -8059,11 +8087,14 @@ async function fetchAndRenderSettings() {
         
         console.log("[Fetch] fetchAndRenderSettings: Settings loaded:", companySettings);
 
-        // Заполняем поля ввода
+        // Заполняем поля ввода (работаем только с текстовыми полями)
         document.querySelectorAll('.setting-input').forEach(input => {
             const key = input.dataset.key;
             if (companySettings.hasOwnProperty(key)) {
-                input.value = companySettings[key] || '';
+                 // AI-Рубильник удален, остается только текстовая логика
+                 input.value = companySettings[key] || '';
+            } else {
+                 input.value = '';
             }
         });
 
@@ -8075,33 +8106,38 @@ async function fetchAndRenderSettings() {
     }
 }
 
+// index.html (Внутри МОДУЛЬ: НАСТРОЙКИ)
+
 // --- Сохранение Настроек ---
 async function handleSaveSettings(e) {
     e.preventDefault();
     console.log("[Save] handleSaveSettings: Start");
     showLoader();
     
-    // Собираем данные из всех полей с классом 'setting-input'
+    // Собираем данные только из текстовых полей
     const settingsToSave = {};
     document.querySelectorAll('.setting-input').forEach(input => {
         const key = input.dataset.key;
         if (key) {
-            settingsToSave[key] = input.value.trim() || null;
+             // Сохраняем как null, если поле пустое (чтобы удалить старые значения из БД)
+             settingsToSave[key] = input.value.trim() || null; 
         }
     });
     
     const payload = {
-        settings: settingsToSave
+        settings: settingsToSave // Отправляем словарь {key: value}
     };
 
     try {
         console.log("[Save] handleSaveSettings: Sending payload:", payload);
+        
+        // Используем PUT /api/settings для обновления (создания/изменения)
         const updatedSettingsList = await apiFetch('/api/settings', {
             method: 'PUT',
             body: JSON.stringify(payload)
         });
         
-        // Обновляем кэш
+        // Обновляем кэш (логика остается)
         companySettings = updatedSettingsList.reduce((acc, setting) => {
             acc[setting.key] = setting.value;
             return acc;
@@ -8115,8 +8151,10 @@ async function handleSaveSettings(e) {
         alert(`Ошибка сохранения настроек: ${err.message}`);
     } finally {
         hideLoader();
+        console.log("[Save] handleSaveSettings: End");
     }
 }
+// --- КОНЕЦ МОДУЛЯ НАСТРОЙКИ ---
 
 
 </script>
