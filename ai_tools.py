@@ -1,23 +1,151 @@
-# ai_tools.py
+# ai_tools.py (Полностью переписанная версия 3.0 - с инструментами для клиента и Админа)
 
-# ... (ИМПОРТЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ)
 import json
 import logging
+import re
 from datetime import date
+from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# =================================================================
+# --- НОВЫЕ АСИНХРОННЫЕ ФУНКЦИИ-ИНСТРУМЕНТЫ ДЛЯ ИИ ---
+# Все функции принимают api_request_func (асинхронный клиент) и данные сессии
+# =================================================================
+
+async def get_user_orders_json(api_request_func, client_id: int, company_id: int) -> str:
+    """
+    Получает список всех невыданных заказов клиента для предоставления информации о статусе.
+    :param api_request_func: Асинхронная функция для выполнения API запросов.
+    :param client_id: ID текущего клиента.
+    :param company_id: ID текущей компании.
+    :return: JSON-строка со списком заказов.
+    """
+    active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
+    
+    orders = await api_request_func(
+        "GET",
+        "/api/orders",
+        params={
+            "client_id": client_id,
+            "company_id": company_id,
+            "statuses": active_statuses,
+            "limit": 10 # Ограничиваем для краткости контекста
+        }
+    )
+
+    if not orders or "error" in orders:
+        return json.dumps({"error": "Не удалось загрузить заказы или их нет."}, ensure_ascii=False)
+
+    formatted_orders = [
+        {
+            "трек": o.get('track_code'),
+            "статус": o.get('status'),
+            "комментарий": o.get('comment'),
+            "расчет_вес_кг": o.get('calculated_weight_kg'),
+            "расчет_сумма_сом": o.get('calculated_final_cost_som'),
+        } for o in orders
+    ]
+    
+    return json.dumps({"active_orders": formatted_orders}, ensure_ascii=False)
+
+
+async def add_client_order_request(api_request_func, client_id: int, company_id: int, request_text: str) -> str:
+    """
+    (ИСПРАВЛЕНО) Используйте этот инструмент, когда клиент просит создать заказ, добавить товар или передает список товаров для оформления.
+    :param api_request_func: Асинхронная функция для выполнения API запросов.
+    :param client_id: ID текущего клиента.
+    :param company_id: ID текущей компании.
+    :param request_text: Полный текст запроса клиента на создание заказа.
+    :return: JSON-ответ от API.
+    """
+    try:
+        if not client_id or not company_id:
+            return json.dumps({"status": "error", "message": "Ошибка: ID клиента или компании не определен."}, ensure_ascii=False)
+            
+        response = await api_request_func(
+            "POST",
+            "/api/bot/order_request", # Используем эндпоинт, который парсит текст
+            json={
+                "client_id": client_id,
+                "company_id": company_id,
+                "request_text": request_text
+            }
+        )
+        if "error" in response:
+            logger.error(f"[AI Tool Error] /api/bot/order_request: {response.get('error')}")
+            # Если ошибка парсинга (например, не найдено треков), просим клиента уточнить
+            if "не смог найти" in response.get("error", ""):
+                 return json.dumps({"status": "error", "message": "Я не смог распознать трек-коды в вашем сообщении. Пожалуйста, отправьте их в формате: ТРЕК-КОД Комментарий."}, ensure_ascii=False)
+            
+            return json.dumps({"status": "error", "message": response.get("error")}, ensure_ascii=False)
+        
+        # Собираем красивый ответ
+        created = response.get("created", 0)
+        assigned = response.get("assigned", 0)
+        skipped = response.get("skipped", 0)
+        
+        response_text = "Готово! 🚀\n"
+        if created > 0: response_text += f"✔️ Новых заказов добавлено: {created}\n"
+        if assigned > 0: response_text += f"✨ Найдено и присвоено вам: {assigned}\n"
+        if skipped > 0: response_text += f"⚠️ Пропущено (дубликаты): {skipped}\n"
+
+        return json.dumps({"status": "success", "message": response_text, "data": response}, ensure_ascii=False)
+    
+    except Exception as e:
+        logger.error(f"!!! [AI Tool Error] add_client_order_request: {e}", exc_info=True)
+        return json.dumps({"status": "error", "message": f"Ошибка связи с сервером: {e}"}, ensure_ascii=False)
+
+
+async def get_company_locations(api_request_func, company_id: int) -> str:
+    """
+    Используется ТОЛЬКО для получения актуальной информации о филиалах компании: адресах, телефонах и графике работы.
+    :param api_request_func: Асинхронная функция для выполнения API запросов.
+    :param company_id: ID текущей компании.
+    :return: JSON-строка со списком филиалов.
+    """
+    try:
+        # Используем эндпоинт, который ты добавишь
+        response = await api_request_func("GET", f"/api/bot/locations?company_id={company_id}") 
+        
+        if not response or "error" in response:
+             return json.dumps({"status": "error", "message": "Не удалось загрузить данные о филиалах."}, ensure_ascii=False)
+        
+        # Форматирование для лучшей читаемости моделью
+        locations_info = []
+        for loc in response:
+            locations_info.append({
+                "Филиал": loc.get('name'),
+                "Адрес": loc.get('address', 'Не указан'),
+                "Телефон": loc.get('phone', 'Не указан'),
+                "График_работы": loc.get('schedule', 'Не указан')
+            })
+        
+        return json.dumps(locations_info, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Ошибка связи с сервером: {e}"}, ensure_ascii=False)
+
+
+async def alert_order_submission(track_codes: List[str]) -> str:
+    """
+    Используется, если видишь 2+ трек-кода в одном сообщении, но клиент не нажал кнопку 'Добавить заказ'.
+    :param track_codes: Список найденных трек-кодов.
+    :return: Проактивный ответ для клиента.
+    """
+    count = len(track_codes)
+    return f"🎉 Я обнаружил {count} трек-код(ов) в вашем сообщении. Чтобы добавить их, пожалуйста, выберите '➕ Добавить заказ' в меню. Я смогу обработать весь ваш текст сразу!"
+
+# =================================================================
 # --- 1. ИНСТРУКЦИЯ ДЛЯ ИИ (СИСТЕМНЫЙ ПРОМПТ) ---
+# =================================================================
+
 TOOLS_SYSTEM_PROMPT = """
 ⚡️ **РЕЖИМ АДМИНИСТРАТОРА**
 Ты имеешь ПОЛНЫЙ доступ к управлению CRM. Твоя цель — помогать Владельцу управлять бизнесом быстро.
 
 🧠 **КАК ПОНИМАТЬ КОМАНДЫ:**
 Понимай с полуслова. Контекст — твой друг.
-- "Удали его" -> (смотри в истории, о каком заказе/клиенте шла речь).
-- "Запиши расход 200 такси" -> (Инструмент: add_expense).
-- "Сделай рассылку, что груз пришел" -> (Сначала предложи текст, потом вызови инструмент broadcast).
-- "Смени код Салтанат на 500" -> (Инструмент: change_client_code).
 
 🛠 **СПИСОК ИНСТРУМЕНТОВ (Возвращай JSON):**
 
@@ -48,17 +176,46 @@ TOOLS_SYSTEM_PROMPT = """
 
 ⚠️ **ВАЖНО:** Для любых действий, меняющих данные (удаление, смена, расход), ты должен вернуть JSON. Бот сам спросит подтверждение у Владельца.
 """
-# --- КОНЕЦ СИСТЕМНОГО ПРОМПТА ---
+# --- КОНЕЦ СИСТЕМНОГО ПРОМПТА ДЛЯ АДМИНА ---
 
+
+# =================================================================
 # --- 2. ФУНКЦИИ-ОБРАБОТЧИКИ (ПОЛНАЯ ПЕРЕПИСЬ) ---
+# =================================================================
 
-async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int, employee_id: int) -> str:
+async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int, employee_id: Optional[int], client_id: Optional[int] = None) -> str:
     """
     Выполняет "мысли" ИИ, превращая их в действия API или кнопки подтверждения.
-    (ВЕРСИЯ 2.1 - Добавлен инструмент get_settings)
+    (ВЕРСИЯ 3.0 - Добавлены клиентские инструменты)
     """
     tool = tool_command.get("tool")
     
+    # --- БЛОК КЛИЕНТСКИХ ИНСТРУМЕНТОВ ---
+    
+    if tool == "get_user_orders_json":
+        if not client_id: return "❌ Ошибка: ID клиента не определен для инструмента."
+        return await get_user_orders_json(api_request_func, client_id, company_id)
+
+    elif tool == "add_client_order_request":
+        if not client_id: return "❌ Ошибка: ID клиента не определен для инструмента."
+        request_text = tool_command.get("request_text")
+        if not request_text: return "❌ Ошибка: Не передан текст запроса на оформление заказа."
+        return await add_client_order_request(api_request_func, client_id, company_id, request_text)
+    
+    elif tool == "get_company_locations":
+        return await get_company_locations(api_request_func, company_id)
+
+    elif tool == "alert_order_submission":
+        tracks = tool_command.get("track_codes")
+        if not tracks or len(tracks) < 2: 
+             return "❌ Ошибка логики: Инструмент вызван с недостаточным количеством трек-кодов."
+        return await alert_order_submission(tracks)
+
+    # --- БЛОК АДМИНСКИХ ИНСТРУМЕНТОВ (требует employee_id) ---
+    
+    if not employee_id:
+        return "❌ Ошибка: Вы не авторизованы как сотрудник (Владелец) для использования административных инструментов."
+
     try:
         # === БЛОК 1: ЗАКАЗЫ ===
         
@@ -178,7 +335,7 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 "message": f"❓ Перевести партию от **{date_str}** ({count} шт) в статус **{status}**?"
             })
             
-        # === БЛОК 6: КОНФИГУРАЦИЯ (НОВЫЙ БЛОК) ===
+        # === БЛОК 5: КОНФИГУРАЦИЯ ===
         elif tool == "get_settings":
             # Используем API для Владельца, чтобы получить все настройки
             api_response = await api_request_func("GET", "/api/settings", employee_id=employee_id)
@@ -186,12 +343,10 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             if not api_response: 
                  return "❌ Ошибка загрузки настроек."
             
-            # Преобразуем список [{key: k, value: v}, ...] в словарь для удобства
             settings_dict = {s.get('key'): s.get('value') for s in api_response}
             
             settings_text = "⚙️ **Текущие Настройки Системы:**\n"
             
-            # Поля для отображения
             key_map = {
                 'china_warehouse_address': 'Адрес склада (Китай)',
                 'instruction_pdf_link': 'Ссылка на PDF-инструкцию',
@@ -205,14 +360,11 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             for key, display_name in key_map.items():
                 value = settings_dict.get(key)
                 if value:
-                    # Скрываем пароли
                     display_value = '*** (Установлен)' if key.startswith('password') else value
                     settings_text += f"- **{display_name}**: {display_value}\n"
                 elif key not in settings_dict:
-                     # Если настройки вообще нет в БД
-                    settings_text += f"- **{display_name}**: ⚠️ Не настроено\n"
+                     settings_text += f"- **{display_name}**: ⚠️ Не настроено\n"
             
-            # Отдельно выводим статус AI-рубильника
             ai_status = settings_dict.get('ai_enabled')
             ai_status_text = "✅ ВКЛЮЧЕН" if ai_status == 'True' else "❌ ВЫКЛЮЧЕН"
             settings_text += f"\n🤖 **AI Ассистент (Рубильник)**: {ai_status_text}"
