@@ -58,6 +58,7 @@ class Location(Base):
     whatsapp_link = Column(String, nullable=True)
     instagram_link = Column(String, nullable=True)
     map_link = Column(String, nullable=True)
+    schedule = Column(String, nullable=True) # <-- ДОБАВЛЕНО: ГРАФИК РАБОТЫ ФИЛИАЛА
     # --- КОНЕЦ НОВЫХ ПОЛЕЙ ---
 
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
