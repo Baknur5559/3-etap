@@ -4,6 +4,7 @@
 
 import os
 import httpx # Используется для API запросов
+import re    # <-- ДОБАВЛЕНО (для "Экстрасенса")
 import re    # Используется для очистки номера телефона
 import sys  # Для sys.exit()
 import logging
@@ -12,6 +13,9 @@ import html # Для форматирования ответов
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
+import json # <-- Добавляем json
+from ai_brain import get_ai_response
+from ai_tools import TOOLS_SYSTEM_PROMPT, execute_ai_tool # <-- Добавляем инструменты
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -24,6 +28,11 @@ from telegram.ext import (
     ContextTypes
 )
 from telegram.constants import ParseMode # Для HTML в сообщениях
+
+async def keep_typing(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача: отправляет статус 'печатает...' каждые 4 сек."""
+    chat_id = context.job.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
 # --- ИЗМЕНЕНИЕ: Модели и БД больше не нужны боту ---
 # from models import Client, Order, Location, Setting
@@ -205,6 +214,40 @@ async def api_request(
         return {"error": "Внутренняя ошибка бота при запросе к серверу.", "status_code": 500}
 # --- КОНЕЦ API REQUEST ---
 
+# --- НОВАЯ ФУНКЦИЯ: Проверка AI-Рубильника ---
+async def is_ai_enabled() -> bool:
+    """
+    Проверяет статус AI-Рубильника (ai_enabled) для текущей компании.
+    """
+    global COMPANY_ID_FOR_BOT
+    
+    # Запрашиваем только AI-Рубильник
+    keys_to_fetch = ['ai_enabled'] 
+    
+    # Используем публичный эндпоинт для бота
+    api_settings = await api_request(
+        "GET", 
+        "/api/bot/settings", 
+        params={'company_id': COMPANY_ID_FOR_BOT, 'keys': keys_to_fetch}
+    )
+    
+    if api_settings and "error" not in api_settings and isinstance(api_settings, list):
+        settings_dict = {s.get('key'): s.get('value') for s in api_settings}
+        # AI включен, если значение 'ai_enabled' равно строке 'True' или 'true'
+        return settings_dict.get('ai_enabled') in ['True', 'true']
+    
+    logger.error("Не удалось получить статус AI-Рубильника. Предполагаем, что AI отключен.")
+    return False
+
+# --- НОВАЯ ФУНКЦИЯ (ЗАГЛУШКА): Уведомление Владельца о Жалобе ---
+async def notify_owner_of_complaint(context: ContextTypes.DEFAULT_TYPE, complaint_text: str):
+    """
+    Заглушка: Отправляет уведомление в Telegram Владельцу компании.
+    """
+    logger.info(f"НОТИФИКАЦИЯ ЖАЛОБЫ (ЗАГЛУШКА): Текст: {complaint_text}")
+    # TODO: Реализовать получение telegram_chat_id Владельца и отправку сообщения
+    pass
+# --- КОНЕЦ ЗАГЛУШКИ ---
 
 # --- Функция идентификации бота (ОСТАЕТСЯ) ---
 def identify_bot_company() -> None:
@@ -538,67 +581,130 @@ async def add_order_received_location(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END 
 
 async def add_order_received_track_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """(ИЗМЕНЕНО) Получен трек-код. Ищем в 'Невостребованных'."""
-    track_code = update.message.text.strip()
-    if not track_code or len(track_code) < 3: 
-        await update.message.reply_text("Трек-код кажется некорректным. Попробуйте ввести еще раз:")
-        return ADD_ORDER_TRACK_CODE
-
-    logger.info(f"Пользователь {update.effective_user.id} ввел трек-код: {track_code}. Поиск в невостребованных...")
-
+    """
+    (ВЕРСИЯ 5.0 - "ЭКСТРАСЕНС")
+    1. "Вытаскивает" все трек-коды из "хаотичного" текста.
+    2. Если кодов > 1: отправляет массово БЕЗ комментариев.
+    3. Если код == 1: работает по старой логике (магия -> запрос комментария).
+    """
+    global COMPANY_ID_FOR_BOT
+    text_input = update.message.text.strip()
     client_id = context.user_data.get('client_id')
+    location_id = context.user_data.get('location_id')
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
-    # --- НОВАЯ ЛОГИКА: "Магия" ---
-    claim_payload = {
-        "track_code": track_code,
-        "client_id": client_id,
-        "company_id": COMPANY_ID_FOR_BOT
-    }
+    if not client_id or not location_id:
+         await update.message.reply_text("Ошибка: Потеряны данные сессии. Начните сначала с /start.", reply_markup=markup)
+         return ConversationHandler.END
 
-    api_response = await api_request(
-        "POST",
-        "/api/bot/claim_order", # <-- Вызываем новый эндпоинт
-        json=claim_payload
-    )
+    # --- НОВАЯ ЛОГИКА "ЭКСТРАСЕНС" ---
 
-    if api_response and "error" not in api_response and "id" in api_response:
-        # 1. УСПЕХ! Заказ найден и назначен
-        logger.info(f"МАГИЯ: Невостребованный заказ (ID: {api_response.get('id')}) назначен клиенту {client_id}")
-        await update.message.reply_html(
-            f"🎉 <b>Отличные новости!</b>\n\nМы нашли этот заказ (<code>{track_code}</code>) в нашей базе невостребованных посылок и <b>сразу добавили его вам!</b>",
-            reply_markup=markup
-        )
-        # Очищаем диалог
+    # Ищем все "слова", состоящие из букв (A-Z, a-z) и цифр (0-9),
+    # которые имеют длину от 8 до 25 символов.
+    # Это отсеет "чехол", "серьги", "42", но найдет "98111..." и "JT542..."
+    try:
+        # Используем r'\b[a-zA-Z0-9]{8,25}\b'
+        # \b - граница слова (чтобы не найти код внутри другого слова)
+        track_codes_found = re.findall(r'\b[a-zA-Z0-9]{8,25}\b', text_input)
+
+        # Удаляем дубликаты, если клиент вставил один код дважды
+        track_codes_found = sorted(list(set(track_codes_found))) 
+
+    except Exception as e_re:
+        logger.error(f"Ошибка Regex при парсинге трек-кодов: {e_re}")
+        await update.message.reply_html("<b>Ошибка:</b> Произошла внутренняя ошибка при разборе вашего текста.")
+        return ADD_ORDER_TRACK_CODE # Остаемся ждать
+
+
+    # --- Сценарий 1: Массовая загрузка (найдено > 1 кода) ---
+    if len(track_codes_found) > 1:
+        logger.info(f"Клиент {client_id} запустил МАССОВУЮ загрузку. Найдено {len(track_codes_found)} трек-кодов.")
+
+        # Собираем список, НО БЕЗ КОММЕНТАРИЕВ
+        items_to_add = [{"track_code": code, "comment": None} for code in track_codes_found]
+
+        await update.message.reply_text(f"✅ Понял. Нашел в вашем тексте {len(items_to_add)} трек-кодов. Обрабатываю... Ожидайте.")
+
+        payload = {
+            "client_id": client_id,
+            "location_id": location_id,
+            "company_id": COMPANY_ID_FOR_BOT,
+            "items": items_to_add
+        }
+
+        api_response = await api_request("POST", "/api/bot/bulk_add_orders", json=payload)
+
+        if not api_response or "error" in api_response:
+            error_msg = api_response.get("error", "Неизвестная ошибка") if api_response else "Нет ответа"
+            logger.error(f"Ошибка API /api/bot/bulk_add_orders: {error_msg}")
+            await update.message.reply_text(f"❌ Произошла ошибка при массовом добавлении: {error_msg}", reply_markup=markup)
+        else:
+            created = api_response.get("created", 0)
+            assigned = api_response.get("assigned", 0)
+            skipped = api_response.get("skipped", 0)
+
+            response_text = f"✅ <b>Готово!</b>\n\n"
+            if created > 0:
+                response_text += f"✔️ Новых заказов добавлено: <b>{created}</b>\n"
+            if assigned > 0:
+                response_text += f"✨ Найдено и присвоено вам (невостребованных): <b>{assigned}</b>\n"
+            if skipped > 0:
+                response_text += f"⚠️ Пропущено (дубликаты): <b>{skipped}</b>\n"
+
+            await update.message.reply_html(response_text, reply_markup=markup)
+
         context.user_data.pop('location_id', None)
         context.user_data.pop('available_locations', None)
         return ConversationHandler.END
 
-    elif api_response and api_response.get("status_code") == 404:
-        # 2. Не найден (это нормально, значит это новый заказ)
-        logger.info(f"Заказ '{track_code}' не найден в невостребованных. Продолжаем обычное добавление.")
-        # Продолжаем старую логику:
-        context.user_data['track_code'] = track_code
-        keyboard = [["⏩ Пропустить"], ["Отмена"]]
-        await update.message.reply_text(
-            "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    # --- Сценарий 2: Одиночный заказ (найден == 1 код) ---
+    elif len(track_codes_found) == 1:
+        track_code = track_codes_found[0]
+        logger.info(f"Клиент {client_id} ввел ОДИНОЧНЫЙ трек-код (найден в тексте): {track_code}.")
+
+        # 3. "Магия" (поиск невостребованных)
+        claim_payload = {
+            "track_code": track_code,
+            "client_id": client_id,
+            "company_id": COMPANY_ID_FOR_BOT
+        }
+        api_response = await api_request(
+            "POST",
+            "/api/bot/claim_order",
+            json=claim_payload
         )
-        return ADD_ORDER_COMMENT
+
+        if api_response and "error" not in api_response and "id" in api_response:
+            # 1. УСПЕХ! Заказ найден и назначен
+            logger.info(f"МАГИЯ: Невостребованный заказ (ID: {api_response.get('id')}) назначен клиенту {client_id}")
+            await update.message.reply_html(
+                f"🎉 <b>Отличные новости!</b>\n\nМы нашли этот заказ (<code>{track_code}</code>) в нашей базе невостребованных посылок и <b>сразу добавили его вам!</b>",
+                reply_markup=markup
+            )
+            context.user_data.pop('location_id', None)
+            context.user_data.pop('available_locations', None)
+            return ConversationHandler.END
+
+        else:
+            # 2. Не найден (или ошибка "магии") -> Спрашиваем комментарий
+            logger.info(f"Заказ '{track_code}' не найден в невостребованных. Спрашиваем комментарий.")
+            context.user_data['track_code'] = track_code
+            keyboard = [["⏩ Пропустить"], ["Отмена"]]
+            await update.message.reply_text(
+                "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            )
+            return ADD_ORDER_COMMENT
+
+    # --- Сценарий 3: "Мусор" (не найдено ни одного кода) ---
     else:
-        # 3. Другая ошибка API
-        error_msg = api_response.get("error", "Неизвестная ошибка") if api_response else "Нет ответа"
-        logger.error(f"Ошибка при попытке 'магии' (claim_order): {error_msg}")
-        # (Продолжаем как обычно, вместо того чтобы блокировать пользователя)
-        logger.info(f"Ошибка 'магии' проигнорирована, продолжаем обычное добавление.")
-        context.user_data['track_code'] = track_code
-        keyboard = [["⏩ Пропустить"], ["Отмена"]]
-        await update.message.reply_text(
-            "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        logger.warning(f"Клиент {client_id} ввел 'мусор', трек-коды не найдены. Текст: {text_input[:100]}")
+        await update.message.reply_html(
+            "❗️ <b>Ошибка:</b> Я не смог найти в вашем тексте ничего, похожего на трек-код (8-25 букв/цифр).\n\n"
+            "Пожалуйста, введите **один** трек-код или **список** трек-кодов."
         )
-        return ADD_ORDER_COMMENT
+        return ADD_ORDER_TRACK_CODE # Остаемся ждать
 
 async def add_order_received_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Получен комментарий от пользователя."""
@@ -668,57 +774,214 @@ async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обработка текстовых сообщений (команды меню).
-    Вызывается, ТОЛЬКО если пользователь уже идентифицирован (прошел /start).
+    (ИСПРАВЛЕНО) Проверяет AI-Рубильник перед обработкой произвольного текста.
     """
     user = update.effective_user
     text = update.message.text
     client_id = context.user_data.get('client_id')
     is_owner = context.user_data.get('is_owner', False)
     chat_id = update.effective_chat.id
-
-    if not client_id:
-        logger.warning(f"Сообщение '{text}' от неидентифицированного пользователя {chat_id}.")
-        await update.message.reply_text("Пожалуйста, сначала представьтесь. Нажмите /start.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    logger.info(f"Обработка команды меню от {user.full_name} (ClientID: {client_id}, IsOwner: {is_owner}): '{text}'")
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
-    # --- Общие команды ---
-    if text == "👤 Мой профиль":
-        await profile(update, context)
-    elif text == "🇨🇳 Адреса складов":
-        await china_addresses(update, context)
-    elif text == "🇰🇬 Наши контакты":
-        await bishkek_contacts(update, context)
-    
-    # --- Команды Клиента ---
-    elif text == "📦 Мои заказы" and not is_owner: 
-        await my_orders(update, context)
+    # --- 1. ПРОВЕРКА АВТОРИЗАЦИИ ---
+    if client_id is None:
+        await update.message.reply_text("Пожалуйста, нажмите /start.", reply_markup=ReplyKeyboardRemove())
+        return
 
-    # --- Команды Владельца ---
+    # --- 2. ОБРАБОТКА КОМАНД МЕНЮ (ИМЕЕТ ПРИОРИТЕТ) ---
+    if text == "👤 Мой профиль": await profile(update, context); return
+    elif text == "🇨🇳 Адреса складов": await china_addresses(update, context); return
+    elif text == "🇰🇬 Наши контакты": await bishkek_contacts(update, context); return
+    elif text == "📦 Мои заказы" and not is_owner: await my_orders(update, context); return
     elif is_owner:
-        # (Кнопки "Добавить заказ" обрабатываются диалогом)
-        if text == "📦 Все Заказы":
-            await owner_all_orders(update, context)
-        elif text == "👥 Клиенты":
-            await owner_clients(update, context)
-        elif text == "🏢 Филиалы":
-            await owner_locations(update, context)
-        elif text == "📢 Объявление":
-            await owner_broadcast_start(update, context)
-        elif text == "📊 Статистика": # <-- ДОБАВЛЕНО
-            await owner_statistics(update, context) # <-- ДОБАВЛЕНО
+        if text == "📦 Все Заказы": await owner_all_orders(update, context); return
+        elif text == "👥 Клиенты": await owner_clients(update, context); return
+        elif text == "🏢 Филиалы": await owner_locations(update, context); return
+        elif text == "📢 Объявление": await owner_broadcast_start(update, context); return
+        elif text == "📊 Статистика": await owner_statistics(update, context); return
+        # Если Владелец нажал кнопку, но она не сработала, AI не нужен
+        return # Выходим после обработки команд меню
+
+    # --- 3. ИИ-ОБРАБОТЧИК (Только для произвольного текста) ---
+    
+    # 3.1. КЛЮЧЕВОЙ ШАГ: ПРОВЕРКА AI-РУБИЛЬНИКА
+    if not (await is_ai_enabled()):
+        logger.warning(f"AI-Ассистент отключен. Ответ: 'Неизвестная команда' на '{text}'")
+        await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.", reply_markup=markup)
+        return
+        
+    # --- Если AI ВКЛЮЧЕН, выполняем всю сложную логику ---
+    
+    # 3.2. ЗАПУСКАЕМ СТАТУС "ПЕЧАТАЕТ..." (в цикле)
+    # (Предполагается, что функция keep_typing и execute_ai_tool существуют)
+    # typing_job = context.job_queue.run_repeating(keep_typing, interval=4, first=0, chat_id=chat_id)
+    # Чтобы не вызывать ошибку, если keep_typing не определен, закомментируем его:
+    typing_job = None 
+
+    try:
+        # 3.3. ОПРЕДЕЛЯЕМ ВРЕМЯ (Бишкек UTC+6)
+        now_utc = datetime.now(timezone.utc)
+        now_bishkek = now_utc + timedelta(hours=6)
+        current_date_str = now_bishkek.strftime("%Y-%m-%d") 
+        current_time_str = now_bishkek.strftime("%H:%M")
+        
+        # 3.4. ЛОГИКА ПРИВЕТСТВИЯ (12 часов)
+        last_greeted = context.user_data.get('last_greeted')
+        should_greet = False
+        if not last_greeted or (now_utc - last_greeted).total_seconds() > 12 * 3600:
+            should_greet = True
+            context.user_data['last_greeted'] = now_utc
+            
+        greeting_rule = ""
+        if should_greet:
+            hour = now_bishkek.hour
+            if 5 <= hour < 12: greet_text = "Кутман таң / Доброе утро"
+            elif 12 <= hour < 18: greet_text = "Кутман күн / Добрый день"
+            elif 18 <= hour < 23: greet_text = "Кутман кеч / Добрый вечер"
+            else: greet_text = "Салам / Здравствуйте"
+            greeting_rule = f"👋 ЭТО ПЕРВОЕ СООБЩЕНИЕ ЗА ДЕНЬ. Обязательно поздоровайся ({greet_text})."
         else:
-             logger.warning(f"Неизвестная команда Владельца: '{text}' от {client_id}")
-             await update.message.reply_text("Неизвестная команда.", reply_markup=markup)
-    else:
-        logger.warning(f"Неизвестная команда Клиента: '{text}' от {client_id}")
-        await update.message.reply_text("Неизвестная команда.", reply_markup=markup)
+            greeting_rule = "🚫 НЕ ЗДОРОВАЙСЯ! Мы уже общались недавно. Сразу отвечай на вопрос."
 
 
-# --- 8. Функции меню (ПЕРЕПИСАНЫ НА API) ---
+        # 3.5. ЗАГРУЗКА ДАННЫХ (Профиль + Заказы)
+        client_profile_str = "Профиль: Ошибка загрузки."
+        orders_str = "Заказы: Ошибка загрузки."
+        
+        try:
+            # А. Получаем профиль клиента
+            client_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
+            if client_data and "id" in client_data:
+                code_full = f"{client_data.get('client_code_prefix', 'KB')}{client_data.get('client_code_num', 'None')}"
+                client_profile_str = (
+                    f"ФИО: {client_data.get('full_name')}\n"
+                    f"КОД КЛИЕНТА: {code_full}\n"
+                    f"ТЕЛЕФОН: {client_data.get('phone')}\n"
+                    f"Роль: {'ВЛАДЕЛЕЦ' if is_owner else 'Клиент'}"
+                )
+            
+            # Б. Получаем заказы (Игнорируя 'выданные')
+            orders_resp = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT})
+            if orders_resp and isinstance(orders_resp, list):
+                active = [o for o in orders_resp if o.get('status') != "Выдан"]
+                
+                lines = [f"- {o['track_code']} | {o['status']}" + (f" | {o['comment']}" if o.get('comment') else "") for o in active]
+                total_debt = 0
+                for o in active:
+                    if o.get('status') == "Готов к выдаче":
+                        cost = o.get('calculated_final_cost_som') or o.get('final_cost_som') or 0
+                        total_debt += cost
+
+                orders_str = (
+                    f"Всего заказов в базе: {len(orders_resp)}\n"
+                    f"Активных (в работе): {len(active)}\n"
+                    f"Долг к оплате: {int(total_debt)} сом\n"
+                )
+                if active:
+                    if len(lines) > 15:
+                            orders_str += "Последние 15 активных заказов:\n" + "\n".join(lines[:15]) + "\n...(и другие)"
+                    else:
+                            orders_str += "Список активных:\n" + "\n".join(lines)
+                else:
+                    orders_str += "Нет активных заказов."
+        except Exception as e:
+            logger.error(f"Ошибка сбора контекста: {e}")
+
+        # 3.6. РАБОТА С ПАМЯТЬЮ
+        history = context.user_data.get('dialog_history', [])
+        history.append({"role": "user", "content": text})
+        if len(history) > 10: history = history[-10:]
+
+        # 3.7. СИСТЕМНЫЙ ПРОМПТ (Мозг)
+        # (TOOLS_SYSTEM_PROMPT должен быть импортирован из ai_tools.py)
+        system_role = (
+            f"СЕГОДНЯШНЯЯ ДАТА: {current_date_str} (Время: {current_time_str}).\n"
+            f"Ты — умный помощник карго '{COMPANY_NAME_FOR_BOT}'.\n\n"
+            f"--- 👤 ДОСЬЕ СОБЕСЕДНИКА ---\n{client_profile_str}\n\n"
+            f"--- 📦 ЕГО ЗАКАЗЫ ---\n{orders_str}\n\n"
+            "--- ⚡️ ТВОЯ ЗАДАЧА ---\n"
+            "1. **ЯЗЫК**: Отвечай СТРОГО на том языке, на котором написал клиент (Русский или Кыргызский). Это главное правило.\n"
+            f"2. **ПРИВЕТСТВИЕ**: {greeting_rule}\n"
+            "3. **ДИАЛОГ**: Помни контекст беседы (см. историю сообщений).\n"
+            "4. **СКОРОСТЬ**: ПИШИ КОРОТКО. Никаких 'По моим данным' или 'Согласно системе'. Сразу говори факт.\n"
+            "5. **КОМПЛАЙНС (ЖАЛОБЫ)**: Если в тексте клиента есть сильный негатив, ругательства, угроза уйти, или прямое требование 'позвать менеджера' — добавь в свой ответ на самом конце СЕКРЕТНЫЙ ТЕГ: [ALARM]. Клиент его не увидит, но он нужен для эскалации.\n"
+        )
+
+        # Если это Владелец -> Добавляем инструменты управления (TOOLS_SYSTEM_PROMPT)
+        if is_owner:
+            # ПРЕДПОЛАГАЕТСЯ, ЧТО TOOLS_SYSTEM_PROMPT ИМПОРТИРОВАН ИЗ ai_tools.py
+            # from ai_tools import TOOLS_SYSTEM_PROMPT
+            system_role += f"\n\n{TOOLS_SYSTEM_PROMPT}" # <-- Добавляем сюда
+
+        # 3.8. Запрос к ИИ
+        # ПРЕДПОЛАГАЕТСЯ, ЧТО get_ai_response ИМПОРТИРОВАН ИЗ ai_brain.py
+        ai_answer = await get_ai_response(history, system_role) 
+
+        # Сохраняем ответ бота в историю (чистый текст)
+        history.append({"role": "assistant", "content": ai_answer})
+        context.user_data['dialog_history'] = history
+        
+        # 3.9. ДЕТЕКТОР ЖАЛОБ (Поиск тега [ALARM])
+        is_complaint = False
+        if "[ALARM]" in ai_answer.upper():
+            ai_answer = ai_answer.replace("[ALARM]", "").strip() 
+            is_complaint = True
+            
+        # 3.10. Обработка команд Владельца (JSON)
+        if is_owner and ("tool" in ai_answer or "confirm_action" in ai_answer):
+            try:
+                # Улучшенный парсер для удаления ```json ```
+                clean_answer = ai_answer.replace("```json", "").replace("```", "").strip()
+                json_start = clean_answer.find('{')
+                json_end = clean_answer.rfind('}')
+                
+                if json_start != -1 and json_end != -1:
+                    json_str = clean_answer[json_start:json_end+1]
+                    command = json.loads(json_str)
+                    
+                    if "tool" in command:
+                        await update.message.reply_text(f"⚙️ Выполняю: `{command['tool']}`...", parse_mode=ParseMode.MARKDOWN)
+                        
+                        employee_id = context.user_data.get('employee_id')
+                        # ПРЕДПОЛАГАЕТСЯ, ЧТО execute_ai_tool ИМПОРТИРОВАН ИЗ ai_tools.py
+                        tool_result = await execute_ai_tool(command, api_request, COMPANY_ID_FOR_BOT, employee_id)
+                        
+                        # Проверка на кнопки подтверждения (confirm_action)
+                        try:
+                            if tool_result.strip().startswith("{"):
+                                confirm_data = json.loads(tool_result)
+                                if "confirm_action" in confirm_data:
+                                    keyboard = [
+                                        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"ai_confirm_{confirm_data['confirm_action']}")],
+                                        [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
+                                    ]
+                                    context.user_data['ai_pending_action'] = confirm_data
+                                    await update.message.reply_text(confirm_data['message'], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+                                    return
+                            
+                            await update.message.reply_text(tool_result, parse_mode=ParseMode.MARKDOWN)
+                            return
+                        except json.JSONDecodeError:
+                            await update.message.reply_text(tool_result, parse_mode=ParseMode.MARKDOWN)
+                            return
+            except Exception as e:
+                logger.error(f"JSON Error: {e}")
+                
+        # 3.11. Отправка ответа (Обычный текст)
+        await update.message.reply_text(ai_answer, reply_markup=markup)
+
+        # 3.12. ФОНОВАЯ ЗАДАЧА: Отправка жалобы Владельцу
+        if is_complaint:
+            # notify_owner_of_complaint должен быть определен/импортирован
+            # await notify_owner_of_complaint(COMPANY_ID_FOR_BOT, client_id, text) 
+             await update.message.reply_text("СЕКРЕТНЫЙ ТЕГ [ALARM] БЫЛ ОБНАРУЖЕН.", reply_markup=markup)
+
+
+    finally:
+        # 3.13. ОБЯЗАТЕЛЬНО ОСТАНАВЛИВАЕМ СТАТУС "ПЕЧАТАЕТ"
+        if typing_job:
+            typing_job.schedule_removal()
+    return
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает профиль клиента (или владельца), запрашивая данные через API."""
@@ -890,8 +1153,12 @@ async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error(f"Ошибка в china_addresses (API): {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при получении адреса склада.", reply_markup=markup)
 
+# bot_template.py
+
 async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает контакты офиса, запрашивая филиалы (через API)."""
+    """
+    Показывает список филиалов и общие ссылки (обновлено: График убран на уровень филиала).
+    """
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
@@ -899,6 +1166,7 @@ async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     try:
         # 1. Получаем список филиалов (Locations)
+        # Location теперь содержит все поля (address, phone, schedule и т.д.)
         api_locations = await api_request("GET", "/api/locations", params={})
         if not api_locations or "error" in api_locations or not isinstance(api_locations, list) or not api_locations:
              error_msg = api_locations.get("error", "Филиалы не найдены") if isinstance(api_locations, dict) else "Филиалы не найдены"
@@ -907,122 +1175,145 @@ async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         locations = api_locations
 
-        # 2. Получаем ОБЩИЕ контакты (WhatsApp/Instagram)
-        keys_to_fetch = ['whatsapp_link', 'instagram_link', 'map_link']
-        api_settings = await api_request("GET", "/api/settings", params={'keys': keys_to_fetch})
-        
-        settings_dict = {}
-        if api_settings and "error" not in api_settings and isinstance(api_settings, list):
-            settings_dict = {s.get('key'): s.get('value') for s in api_settings}
-
-        # 3. Формирование кнопок
+        # 2. Формирование кнопок
         keyboard = []
+        
+        # --- Если филиал один, показываем его сразу (как раньше) ---
+        if len(locations) == 1:
+            loc = locations[0]
+            # Вызываем callback-функцию напрямую, чтобы сразу показать контакты
+            await location_contact_callback(update, context, loc_id_override=loc.get('id'), is_start_of_dialog=True)
+            return
+
+        # --- Если филиалов несколько, показываем список ---
+        
         # Кнопки для каждого филиала
         for loc in locations:
             keyboard.append([InlineKeyboardButton(f"📍 {loc.get('name', 'Филиал')}", callback_data=f"contact_loc_{loc.get('id')}")])
 
-        # Общие кнопки
-        if settings_dict.get('whatsapp_link'): 
-            keyboard.append([InlineKeyboardButton("💬 WhatsApp", url=settings_dict.get('whatsapp_link'))])
-        if settings_dict.get('instagram_link'): 
-            keyboard.append([InlineKeyboardButton("📸 Instagram", url=settings_dict.get('instagram_link'))])
-        if settings_dict.get('map_link'): 
-            keyboard.append([InlineKeyboardButton("🗺️ Общая Карта", url=settings_dict.get('map_link'))])
+        # Общие кнопки (можно добавить, если они хранятся где-то еще, но пока удалены)
+        # Мы полагаемся на то, что нужные ссылки (WhatsApp, Instagram, Map) хранятся в Location
 
         reply_markup_inline = InlineKeyboardMarkup(keyboard) if keyboard else None
         
-        await update.message.reply_text(
-            "🇰🇬 Выберите филиал для просмотра контактов или воспользуйтесь общими ссылками:", 
+        text = "🇰🇬 Выберите филиал, контакты которого вы хотите посмотреть:"
+        
+        await update.message.reply_html(
+            text, 
             reply_markup=reply_markup_inline
         )
+        # Если есть хотя бы одна кнопка, отправляем меню
+        if reply_markup_inline:
+             await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text="Используйте основное меню:", 
+                reply_markup=markup
+            )
+             
     except Exception as e:
         logger.error(f"Неожиданная ошибка в bishkek_contacts: {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при получении контактов.", reply_markup=markup)
 
 # --- 9. Обработчики Инлайн-кнопок (ПЕРЕПИСАНЫ НА API) ---
-async def location_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def location_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, loc_id_override: Optional[int] = None, is_start_of_dialog: bool = False) -> None:
     """
-    (ИСПРАВЛЕНО) Показывает адрес и ИНЛАЙН-КНОПКИ выбранного филиала.
+    (ОБНОВЛЕНО) Показывает адрес, ГРАФИК и ИНЛАЙН-КНОПКИ выбранного филиала.
     """
     query = update.callback_query
-    await query.answer()
     
-    chat_id = update.effective_chat.id
-    is_owner = context.user_data.get('is_owner', False)
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
+    # Определяем chat_id, откуда пришло сообщение
+    chat_id = update.effective_chat.id if update.effective_chat else query.from_user.id
 
-    try:
-        location_id_str = query.data.split('_')[-1] # 'contact_loc_1' -> '1'
-        location_id = int(location_id_str)
-        logger.info(f"Пользователь {chat_id} запросил контакты филиала ID: {location_id}")
+    # 1. Ответ на callback
+    if query:
+        await query.answer()
 
-        # Запрашиваем данные ТОЛЬКО ЭТОГО филиала
-        api_response = await api_request("GET", f"/api/locations/{location_id}", params={})
-
-        if not api_response or "error" in api_response or not api_response.get('id'):
-            error_msg = api_response.get("error", "Филиал не найден.") if api_response else "Нет ответа"
-            logger.error(f"Ошибка API при запросе филиала {location_id}: {error_msg}")
-            await query.edit_message_text(f"Ошибка: {error_msg}")
-            # Отправляем меню, так как инлайн-сообщение сломано
-            await context.bot.send_message(chat_id=chat_id, text="Используйте основное меню:", reply_markup=markup)
+    # 2. Определяем ID филиала
+    location_id = loc_id_override # Используем переданный ID, если есть
+    if not location_id and query:
+        try:
+            # Извлекаем ID из callback_data: 'contact_loc_1' -> '1'
+            location_id_str = query.data.split('_')[-1]
+            location_id = int(location_id_str)
+        except (ValueError, IndexError):
+            logger.error(f"Ошибка парсинга location_id из callback: {query.data}")
+            if query:
+                await query.edit_message_text(text="Ошибка: Неверный ID филиала.")
             return
 
-        location = api_response
+    if not location_id:
+        return # Нечего делать, если ID филиала не определен
+
+    logger.info(f"Пользователь {chat_id} запросил контакты филиала ID: {location_id}")
+
+    # 3. Запрашиваем данные ТОЛЬКО ЭТОГО филиала
+    # Используем публичный эндпоинт, который принимает company_id
+    api_response = await api_request("GET", f"/api/locations/{location_id}", params={'company_id': COMPANY_ID_FOR_BOT})
+
+    if not api_response or "error" in api_response or not api_response.get('id'):
+        error_msg = api_response.get("error", "Филиал не найден.") if api_response else "Нет ответа"
+        logger.error(f"Ошибка API при запросе филиала {location_id}: {error_msg}")
         
-        # --- ФОРМИРУЕМ ТЕКСТ ---
-        text = (
-            f"📍 <b>{location.get('name', 'Филиал')}</b>\n\n"
-        )
-        if location.get('address'):
-             text += f"🗺️ <b>Адрес:</b>\n{location.get('address')}\n\n"
-        if location.get('phone'):
-             text += f"📞 <b>Телефон:</b> <code>{location.get('phone')}</code>\n"
+        # Если это не начало диалога, пробуем отредактировать сообщение
+        if query and not is_start_of_dialog:
+            await query.edit_message_text(f"Ошибка: {error_msg}")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"Ошибка: {error_msg}")
+        return
 
-        # --- ИСПРАВЛЕНИЕ: Добавляем кнопки ---
-        keyboard = []
-        if location.get('whatsapp_link'):
-            keyboard.append([InlineKeyboardButton("💬 WhatsApp", url=location.get('whatsapp_link'))])
-        if location.get('instagram_link'):
-            keyboard.append([InlineKeyboardButton("📸 Instagram", url=location.get('instagram_link'))])
-        if location.get('map_link'):
-            keyboard.append([InlineKeyboardButton("🗺️ Показать на карте", url=location.get('map_link'))])
-        
-        # Добавляем кнопку "Назад", если филиалов было несколько
-        # (Простая проверка: если у пользователя есть client_id, у него есть и user_data)
-        if context.user_data.get('client_id'):
-             keyboard.append([InlineKeyboardButton("⬅️ Назад к выбору", callback_data="contact_list_back")])
+    location = api_response
 
-        reply_markup_inline = InlineKeyboardMarkup(keyboard) if keyboard else None
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+    # 4. ФОРМИРУЕМ ТЕКСТ (включая новое поле schedule)
+    text = f"📍 <b>{location.get('name', 'Филиал')}</b>\n\n"
+    if location.get('schedule'):
+         text += f"⏰ <b>График работы:</b>\n{location.get('schedule')}\n\n" # <-- НОВОЕ ПОЛЕ
+    if location.get('address'):
+         text += f"🗺️ <b>Наш адрес:</b>\n{location.get('address')}\n"
+    if location.get('phone'):
+         text += f"📞 <b>Телефон:</b> <code>{location.get('phone')}</code>\n"
 
-        # Редактируем сообщение, показывая адрес И КНОПКИ
+    # 5. Генерируем кнопки
+    keyboard = []
+    if location.get('whatsapp_link'):
+        keyboard.append([InlineKeyboardButton("💬 Написать в WhatsApp", url=location.get('whatsapp_link'))])
+    if location.get('instagram_link'):
+        keyboard.append([InlineKeyboardButton("📸 Наш Instagram", url=location.get('instagram_link'))])
+    if location.get('map_link'):
+        keyboard.append([InlineKeyboardButton("🗺️ Показать на карте", url=location.get('map_link'))])
+
+    # Если есть больше одного филиала, добавляем кнопку "Назад"
+    # (Мы не знаем, сколько всего филиалов, но добавим кнопку "Назад" на всякий случай,
+    # если не было переопределения ID)
+    if not loc_id_override:
+         keyboard.append([InlineKeyboardButton("⬅️ Назад к выбору", callback_data="contact_list_back")])
+
+    reply_markup_inline = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    # 6. Отправляем или редактируем сообщение
+    if query and not is_start_of_dialog:
+        # Редактируем сообщение (для callback'а)
         await query.edit_message_text(
-            text, 
-            parse_mode=ParseMode.HTML, 
-            reply_markup=reply_markup_inline # <-- ИСПОЛЬЗУЕМ КНОПКИ
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup_inline
         )
-        
-        # (Больше не нужно отправлять "Используйте основное меню" отдельным сообщением)
-
-    except (ValueError, IndexError, KeyError, TypeError) as e:
-        logger.error(f"Ошибка обработки callback'а контакта: {e}. Callback data: {query.data}", exc_info=True)
-        try:
-            await query.edit_message_text(text="Произошла ошибка. Попробуйте снова нажать '🇰🇬 Наши контакты'.")
-        except:
-            pass # Если не удалось отредактировать
-        await context.bot.send_message(chat_id=chat_id, text="Используйте основное меню:", reply_markup=markup)
+    else:
+        # Отправляем новое сообщение (для start_of_dialog или ошибки)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup_inline
+        )
 
 # (Функция location_contact_back_callback удалена, т.к. мы используем API v5.0, где она не нужна)
 
 async def location_contact_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    (НОВАЯ) Возвращает пользователя к списку выбора филиалов (как в bishkek_contacts).
+    Возвращает пользователя к списку выбора филиалов (как в bishkek_contacts) с Графиком работы.
     """
     query = update.callback_query
     await query.answer()
-    
-    # Эта функция по сути заново вызывает bishkek_contacts,
-    # но нам нужно отредактировать сообщение, а не отправлять новое.
     
     logger.info(f"Пользователь {query.from_user.id} нажал 'Назад' к списку контактов")
     
@@ -1035,13 +1326,17 @@ async def location_contact_back_callback(update: Update, context: ContextTypes.D
 
         locations = api_locations
 
-        # 2. Получаем ОБЩИЕ контакты (WhatsApp/Instagram)
-        keys_to_fetch = ['whatsapp_link', 'instagram_link', 'map_link']
-        api_settings = await api_request("GET", "/api/settings", params={'keys': keys_to_fetch})
+        # 2. Получаем ОБЩИЕ контакты И ГРАФИК РАБОТЫ (Используем /api/bot/settings)
+        keys_to_fetch = ['whatsapp_link', 'instagram_link', 'map_link', 'office_schedule'] # <-- ДОБАВЛЕНО
+        api_settings = await api_request("GET", "/api/bot/settings", params={'company_id': COMPANY_ID_FOR_BOT, 'keys': keys_to_fetch})
         
         settings_dict = {}
         if api_settings and "error" not in api_settings and isinstance(api_settings, list):
             settings_dict = {s.get('key'): s.get('value') for s in api_settings}
+        
+        # --- НОВОЕ: Извлекаем график работы ---
+        schedule = settings_dict.get('office_schedule', 'График не указан')
+        # --- КОНЕЦ НОВОГО ---
 
         # 3. Формирование кнопок (такое же, как в bishkek_contacts)
         keyboard = []
@@ -1057,9 +1352,15 @@ async def location_contact_back_callback(update: Update, context: ContextTypes.D
 
         reply_markup_inline = InlineKeyboardMarkup(keyboard) if keyboard else None
         
-        # 4. Редактируем сообщение
+        # 4. Редактируем сообщение (Добавляем график работы в текст)
+        text = (
+            "🇰🇬 Выберите филиал для просмотра контактов или воспользуйтесь общими ссылками:\n\n"
+            f"⏰ <b>График работы:</b> {schedule}" # <-- ДОБАВЛЕНО
+        )
+        
         await query.edit_message_text(
-            "🇰🇬 Выберите филиал для просмотра контактов или воспользуйтесь общими ссылками:", 
+            text, 
+            parse_mode=ParseMode.HTML,
             reply_markup=reply_markup_inline
         )
     except Exception as e:
@@ -1146,6 +1447,103 @@ async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT
              await query.edit_message_reply_markup(reply_markup=None)
          except:
              pass
+         
+async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает подтверждения действий от AI-Администратора.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    if not context.user_data.get('is_owner'):
+        await query.edit_message_text("❌ Нет прав.")
+        return
+
+    data = query.data
+    if data == "ai_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        context.user_data.pop('ai_pending_action', None)
+        return
+
+    action_data = context.user_data.get('ai_pending_action')
+    if not action_data:
+        await query.edit_message_text("⚠️ Данные устарели.")
+        return
+
+    employee_id = context.user_data['employee_id']
+    
+    try:
+        # --- 1. ЗАКАЗЫ ---
+        if data == "ai_confirm_update_single":
+            await api_request("PATCH", f"/api/orders/{action_data['order_id']}", employee_id=employee_id, json={"status": action_data['new_status'], "company_id": COMPANY_ID_FOR_BOT})
+            await query.edit_message_text(f"✅ Статус изменен на '{action_data['new_status']}'.")
+
+        elif data == "ai_confirm_delete_order":
+            # Для удаления может потребоваться пароль, но пока сделаем без (доверие Владельцу)
+            # Или можно взять пароль из базы, но это сложно. 
+            # Пока используем API удаления без пароля (если переделали) или заглушку
+            # В main.py delete_order требует пароль. Это проблема. 
+            # РЕШЕНИЕ: Передадим пароль 'ai_admin_override' (нужно доработать main.py) или пока просто скажем "Удалите через сайт".
+            # А, стоп. Мы можем просто в main.py разрешить удаление без пароля, если это делает Владелец.
+            # ДАВАЙ ПОПРОБУЕМ вызвать API, предполагая, что пароль Владельца мы не знаем.
+            # В main.py мы меняли логику? delete_order требует пароль.
+            # Ладно, для теста покажем ошибку, если пароль нужен.
+            await query.edit_message_text("⚠️ Для удаления заказа пока используйте сайт (требуется пароль).")
+
+        elif data == "ai_confirm_assign_client":
+            payload = {"action": "assign_client", "order_ids": [action_data['order_id']], "client_id": action_data['client_id'], "new_status": "В пути"}
+            await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json=payload)
+            await query.edit_message_text(f"✅ Заказ присвоен {action_data['client_name']}.")
+
+        # --- 2. КЛИЕНТЫ ---
+        elif data == "ai_confirm_change_client_code":
+            # Используем PATCH
+            await api_request("PATCH", f"/api/clients/{action_data['client_id']}", employee_id=employee_id, json={"client_code_num": action_data['new_code'], "company_id": COMPANY_ID_FOR_BOT})
+            await query.edit_message_text(f"✅ Код клиента изменен на {action_data['new_code']}.")
+
+        elif data == "ai_confirm_delete_client":
+             await api_request("DELETE", f"/api/clients/{action_data['client_id']}", employee_id=employee_id, params={"company_id": COMPANY_ID_FOR_BOT})
+             await query.edit_message_text(f"✅ Клиент {action_data['client_name']} удален.")
+
+        # --- 3. ФИНАНСЫ ---
+        elif data == "ai_confirm_add_expense":
+            # Сначала найдем тип расхода "Прочее" или "Хоз. нужды"
+            types = await api_request("GET", "/api/expense_types", employee_id=employee_id, params={"company_id": COMPANY_ID_FOR_BOT})
+            type_id = types[0]['id'] if types else 1 # Берем первый попавшийся или 1
+            
+            payload = {
+                "amount": action_data['amount'],
+                "notes": action_data['reason'],
+                "expense_type_id": type_id,
+                "company_id": COMPANY_ID_FOR_BOT,
+                "shift_id": None # Общий расход
+            }
+            await api_request("POST", "/api/expenses", employee_id=employee_id, json=payload)
+            await query.edit_message_text(f"✅ Расход {action_data['amount']} сом добавлен.")
+
+        # --- 4. РАССЫЛКА ---
+        elif data == "ai_confirm_broadcast":
+            payload = {"text": action_data['text'], "company_id": COMPANY_ID_FOR_BOT}
+            resp = await api_request("POST", "/api/bot/broadcast", employee_id=employee_id, json=payload)
+            count = resp.get('sent_to_clients', 0) if resp else 0
+            await query.edit_message_text(f"✅ Рассылка отправлена {count} клиентам.")
+
+        # --- 5. МАССОВОЕ ---
+        elif data == "ai_confirm_bulk_status":
+            # (Получаем ID заказов заново, это безопаснее)
+            orders = await api_request("GET", "/api/orders", employee_id=employee_id, params={"party_dates": action_data['party_date'], "company_id": COMPANY_ID_FOR_BOT})
+            ids = [o['id'] for o in orders] if orders else []
+            if ids:
+                await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json={"action": "update_status", "order_ids": ids, "new_status": action_data['new_status']})
+                await query.edit_message_text(f"✅ Статус обновлен для {len(ids)} заказов.")
+            else:
+                await query.edit_message_text("❌ Заказы не найдены.")
+
+    except Exception as e:
+        logger.error(f"Action Error: {e}")
+        await query.edit_message_text(f"❌ Ошибка API: {e}")
+    
+    context.user_data.pop('ai_pending_action', None)
 
 # --- НОВЫЙ ОБРАБОТчик ДЛЯ ВЛАДЕЛЬЦА (КТО РЕАГИРОВАЛ) ---
 async def handle_show_reactions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1840,6 +2238,9 @@ def main() -> None:
     # НОВЫЙ Обработчик для Владельца (ловит 'show_reacts_')
     application.add_handler(CallbackQueryHandler(handle_show_reactions_callback, pattern=r'^show_reacts_'))
 
+    # НОВЫЙ Обработчик подтверждений ИИ (ловит 'ai_confirm_' и 'ai_cancel')
+    application.add_handler(CallbackQueryHandler(handle_ai_confirmation, pattern=r'^ai_'))
+
     # Команда /cancel вне диалогов
     application.add_handler(CommandHandler('cancel', cancel_dialog))
 
@@ -1849,6 +2250,15 @@ def main() -> None:
     logger.info(f"Бот (ID: {COMPANY_ID_FOR_BOT}) запущен и готов к работе...")
     application.run_polling()
     
+# --- НОВАЯ ФУНКЦИЯ (ЗАГЛУШКА): Уведомление Владельца о Жалобе ---
+async def notify_owner_of_complaint(context: ContextTypes.DEFAULT_TYPE, complaint_text: str):
+    """
+    Заглушка: Отправляет уведомление в Telegram Владельцу компании.
+    Требует получения Chat ID Владельца из БД (это сложная логика, пока просто лог).
+    """
+    logger.info(f"НОТИФИКАЦИЯ ЖАЛОБЫ (ЗАГЛУШКА): Текст: {complaint_text}")
+    # TODO: Реализовать получение telegram_chat_id Владельца и отправку сообщения
+    pass
 
 if __name__ == "__main__":
     main()
