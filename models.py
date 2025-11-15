@@ -31,6 +31,7 @@ class Company(Base):
     # --- ДОБАВИТЬ ЭТИ ПОЛЯ ---
     telegram_bot_token = Column(String, nullable=True, unique=True) # Токен бота (должен быть уникальным)
     telegram_bot_username = Column(String, nullable=True) # Имя пользователя бота (опционально)
+    ai_enabled = Column(Boolean, default=False) # Включен ли AI-ассистент
     # --- КОНЕЦ ДОБАВЛЕНИЯ --
 
     # Связи (кто принадлежит этой компании)
