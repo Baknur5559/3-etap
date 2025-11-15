@@ -1,4 +1,6 @@
-# ai_tools.py - Расширенный инструментарий AI-Администратора
+# ai_tools.py
+
+# ... (ИМПОРТЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ)
 import json
 import logging
 from datetime import date
@@ -42,14 +44,18 @@ TOOLS_SYSTEM_PROMPT = """
    - Если просят *написать* объявление -> Сначала просто сгенерируй красивый текст с эмодзи в чат.
    - Если просят *отправить* текст -> `{"tool": "broadcast", "text": "..."}`
 
+6. **⚙️ КОНФИГУРАЦИЯ:** - Получить настройки компании: `{"tool": "get_settings"}`
+
 ⚠️ **ВАЖНО:** Для любых действий, меняющих данные (удаление, смена, расход), ты должен вернуть JSON. Бот сам спросит подтверждение у Владельца.
 """
+# --- КОНЕЦ СИСТЕМНОГО ПРОМПТА ---
 
-# --- 2. ФУНКЦИИ-ОБРАБОТЧИКИ ---
+# --- 2. ФУНКЦИИ-ОБРАБОТЧИКИ (ПОЛНАЯ ПЕРЕПИСЬ) ---
 
 async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int, employee_id: int) -> str:
     """
     Выполняет "мысли" ИИ, превращая их в действия API или кнопки подтверждения.
+    (ВЕРСИЯ 2.1 - Добавлен инструмент get_settings)
     """
     tool = tool_command.get("tool")
     
@@ -69,7 +75,6 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
         elif tool == "update_order_status":
             track = tool_command.get("track_code")
             status = tool_command.get("new_status")
-            # Проверяем, существует ли заказ
             orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params={"q": track, "company_id": company_id, "limit": 1})
             if not orders: return f"❌ Заказ `{track}` не найден."
             return json.dumps({
@@ -149,7 +154,6 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             })
 
         elif tool == "get_report":
-            # (Код тот же, что был раньше - для отчета)
             start = tool_command.get("period_start")
             end = tool_command.get("period_end")
             report = await api_request_func("GET", "/api/reports/summary", employee_id=employee_id, params={"start_date": start, "end_date": end, "company_id": company_id})
@@ -173,7 +177,48 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 "confirm_action": "bulk_status", "party_date": date_str, "new_status": status, "count": count,
                 "message": f"❓ Перевести партию от **{date_str}** ({count} шт) в статус **{status}**?"
             })
+            
+        # === БЛОК 6: КОНФИГУРАЦИЯ (НОВЫЙ БЛОК) ===
+        elif tool == "get_settings":
+            # Используем API для Владельца, чтобы получить все настройки
+            api_response = await api_request_func("GET", "/api/settings", employee_id=employee_id)
+            
+            if not api_response: 
+                 return "❌ Ошибка загрузки настроек."
+            
+            # Преобразуем список [{key: k, value: v}, ...] в словарь для удобства
+            settings_dict = {s.get('key'): s.get('value') for s in api_response}
+            
+            settings_text = "⚙️ **Текущие Настройки Системы:**\n"
+            
+            # Поля для отображения
+            key_map = {
+                'china_warehouse_address': 'Адрес склада (Китай)',
+                'instruction_pdf_link': 'Ссылка на PDF-инструкцию',
+                'client_code_start': 'Начальный код клиента',
+                'office_schedule': 'График работы офиса',
+                'password_revert_order': 'Пароль на отмену выдачи',
+                'password_delete_order': 'Пароль на удаление заказа',
+                'password_delete_client': 'Пароль на удаление клиента',
+            }
 
+            for key, display_name in key_map.items():
+                value = settings_dict.get(key)
+                if value:
+                    # Скрываем пароли
+                    display_value = '*** (Установлен)' if key.startswith('password') else value
+                    settings_text += f"- **{display_name}**: {display_value}\n"
+                elif key not in settings_dict:
+                     # Если настройки вообще нет в БД
+                    settings_text += f"- **{display_name}**: ⚠️ Не настроено\n"
+            
+            # Отдельно выводим статус AI-рубильника
+            ai_status = settings_dict.get('ai_enabled')
+            ai_status_text = "✅ ВКЛЮЧЕН" if ai_status == 'True' else "❌ ВЫКЛЮЧЕН"
+            settings_text += f"\n🤖 **AI Ассистент (Рубильник)**: {ai_status_text}"
+            
+            return settings_text
+            
         else:
             return f"⚠️ Инструмент '{tool}' не поддерживается."
 
