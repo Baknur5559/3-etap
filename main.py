@@ -585,7 +585,17 @@ class ShiftForceClosePayload(BaseModel):
     closing_cash: float
     password: str # Требуем пароль Владельца
 
-# main.py
+# main.py (Добавление новой модели) добавление ии
+
+class BotOrderAdd(BaseModel):
+    track_code: str
+    client_id: int
+    company_id: int
+    location_id: int
+    comment: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
 
 class BotUnlinkPayload(BaseModel):
     telegram_chat_id: str
@@ -2121,6 +2131,14 @@ class OrderOut(OrderBase):
     class Config:
         orm_mode = True
 
+class BotOrderRequest(BaseModel):
+    client_id: int
+    company_id: int
+    request_text: str
+    
+    class Config:
+        from_attributes = True
+
 # Модели для массовых действий
 class BulkOrderItem(BaseModel): # Используется для ИМПОРТА
     track_code: str
@@ -2347,8 +2365,8 @@ def create_order(
     db: Session = Depends(get_db)
 ):
     """
-    Создает новый заказ (вызывается ботом или админкой).
-    УВЕДОМЛЯЕТ ВЛАДЕЛЬЦА.
+    (ИСПРАВЛЕНО 16.11.2025) Создает новый заказ (вызывается ботом или админкой).
+    ДОБАВЛЕН db.commit() и УВЕДОМЛЕНИЕ ВЛАДЕЛЬЦУ.
     """
     print(f"[Create Order API] Получен payload: {payload.dict()}")
 
@@ -2409,8 +2427,11 @@ def create_order(
 
     try:
         db.add(new_order)
+        
+        # !!! --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ --- !!!
         db.commit() 
         db.refresh(new_order) 
+        # !!! --- КОНЕЦ ИСПРАВЛЕНИЯ --- !!!
 
         history_entry = OrderHistory(
             order_id=new_order.id,
@@ -2422,7 +2443,7 @@ def create_order(
 
         db.refresh(new_order, attribute_names=['client'])
 
-        # --- НОВОЕ: Уведомление Владельцу ---
+        # --- Уведомление Владельцу ---
         comment_str = f"\n<i>Комментарий: {new_order.comment}</i>" if new_order.comment else ""
         message = (
             f"🔔 <b>Добавлен новый заказ (1 шт)</b>\n\n"
@@ -2434,7 +2455,6 @@ def create_order(
             company_id=new_order.company_id,
             message_text=message
         )
-        # --- КОНЕЦ УВЕДОМЛЕНИЯ ---
 
         print(f"[Create Order API] Заказ ID={new_order.id} успешно создан.")
         return new_order
@@ -2443,7 +2463,6 @@ def create_order(
         import traceback
         print(f"!!! Ошибка БД при создании заказа:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных: {e}")
-
 # main.py (Полностью заменяет функцию update_order)
 
 @app.patch("/api/orders/{order_id}", tags=["Заказы (Владелец)"], response_model=OrderOut)
@@ -4758,39 +4777,234 @@ def update_company_settings(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка сохранения настроек: {e}")
+    
+@app.post("/api/bot/add_order", tags=["Telegram Bot"])
+def create_bot_order(
+    order_data: BotOrderAdd,
+    db: Session = Depends(get_db)
+):
+    """
+    (ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ) Создает новый заказ, используя безопасную обработку ошибок.
+    """
+    # 1. Проверка на существование (Дополнительная защита от дубликатов)
+    existing_order = db.query(Order).filter(
+        Order.track_code == order_data.track_code,
+        Order.company_id == order_data.company_id
+    ).first()
+    
+    if existing_order:
+         raise HTTPException(status_code=409, detail="Заказ с таким трек-кодом уже существует.")
+
+    # 2. Создание нового заказа
+    new_order = Order(
+        track_code=order_data.track_code,
+        client_id=order_data.client_id,
+        company_id=order_data.company_id,
+        location_id=order_data.location_id,
+        comment=order_data.comment,
+        status="В обработке", # Начальный статус
+        purchase_type="Доставка", # Начальный тип
+        party_date=date.today()
+    )
+    
+    try:
+        db.add(new_order)
+        db.commit()
+        db.refresh(new_order)
+        logger.info(f"[Bot Save Order] Успешно создан заказ ID={new_order.id} для клиента {order_data.client_id}")
+        return {"message": "Заказ успешно добавлен", "id": new_order.id, "track_code": new_order.track_code}
+    
+    except Exception as e:
+        db.rollback()
+        import traceback
+        logger.error(f"!!! КРИТИЧЕСКАЯ ОШИБКА БД при сохранении заказа для клиента {order_data.client_id}: {e}", exc_info=True)
+        # Возвращаем детальную ошибку, чтобы увидеть причину сбоя (например, 'location_id cannot be null')
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных (Rollback): {e}")
 
 @app.get("/api/bot/settings", tags=["Telegram Bot"], response_model=List[SettingOut])
 def get_bot_company_settings(
     company_id: int = Query(...), # Обязательный ID компании
     keys: Optional[List[str]] = Query(None), # Необязательный список ключей для фильтрации
     db: Session = Depends(get_db)
-    # Здесь не нужна аутентификация сотрудника, т.к. вызывается ботом/ЛК
 ):
     """
-    Возвращает настройки для указанной компании.
-    Можно фильтровать по списку ключей (параметр 'keys').
+    (ИСПРАВЛЕНО) Возвращает настройки, включая статус AI из таблицы Company.
     """
-    print(f"[Get Settings] Запрос настроек для Company ID: {company_id}. Ключи: {keys}")
-    # Проверяем, существует ли компания
-    company = db.query(Company.id).filter(Company.id == company_id).first()
+    # 1. Проверяем, существует ли компания и загружаем ai_enabled
+    # Нам нужно загрузить ai_enabled, потому что оно находится в таблице companies, а не settings
+    company = db.query(Company.id, Company.ai_enabled).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
 
-    # Запрашиваем настройки для этой компании
+    settings_results = []
+    
+    # 2. Обрабатываем AI_ENABLED (из таблицы Company)
+    # Если ключи не переданы (keys=None) или 'ai_enabled' есть в списке
+    if not keys or 'ai_enabled' in keys:
+         # Создаем фиктивный объект Setting для возврата Pydantic-модели SettingOut
+         settings_results.append(Setting(key='ai_enabled', value=str(company.ai_enabled), company_id=company.id))
+         
+         # Удаляем 'ai_enabled' из списка ключей, чтобы не искать его в таблице Setting
+         if keys:
+             keys = [k for k in keys if k != 'ai_enabled']
+
+    # 3. Запрашиваем остальные настройки из таблицы Setting
     query = db.query(Setting).filter(Setting.company_id == company_id)
-
-    # Если передан список ключей, фильтруем по ним
     if keys:
-        query = query.filter(Setting.key.in_(keys))
+         query = query.filter(Setting.key.in_(keys))
 
-    settings = query.all()
-    print(f"[Get Settings] Найдено настроек: {len(settings)}")
+    settings_results.extend(query.all())
+    
+    return settings_results
 
-    # Преобразуем результат в нужный формат (можно использовать Pydantic напрямую)
-    # FastAPI сделает это сам благодаря response_model=List[SettingOut]
-    return settings
+@app.post("/api/bot/order_request", tags=["Telegram Bot"])
+def create_bot_order_request(
+    request_data: BotOrderRequest,
+    background_tasks: BackgroundTasks, # <-- Добавлено
+    db: Session = Depends(get_db)
+):
+    """
+    (ИСПРАВЛЕНО 16.11 v3) AI-ассистент отправляет сюда текст клиента для парсинга и добавления.
+    Эта функция эмулирует ручной ввод "➕ Добавить заказ".
+    """
+    logger.info(f"[AI Order Request] Получен запрос от AI для клиента {request_data.client_id}")
+    
+    client = db.query(Client).filter(Client.id == request_data.client_id, Client.company_id == request_data.company_id).first()
+    if not client:
+        logger.error(f"[AI Order Request] Клиент {request_data.client_id} не найден.")
+        raise HTTPException(status_code=404, detail="Клиент не найден.")
 
+    # --- ОПРЕДЕЛЕНИЕ LOCATION_ID (Берем первый филиал компании) ---
+    default_location = db.query(Location).filter(Location.company_id == request_data.company_id).order_by(Location.id).first()
+    if not default_location:
+        logger.error(f"[AI Order Request] У компании {request_data.company_id} нет филиалов.")
+        raise HTTPException(status_code=400, detail="В компании не настроены филиалы, создание заказа невозможно.")
+    
+    location_id_to_assign = default_location.id
+    
+    # --- ПАРСИНГ ТЕКСТА (Копируем логику из bot_template.py) ---
+    text_input = request_data.request_text
+    track_codes_found = re.findall(r'(\b[a-zA-Z0-9]{8,25}\b)', text_input)
+    
+    if not track_codes_found:
+        raise HTTPException(status_code=400, detail="Я не смог найти в вашем тексте ничего, похожего на трек-код (8-25 букв/цифр).")
+
+    parts_with_tracks = re.split(r'(\b[a-zA-Z0-9]{8,25}\b)', text_input)
+    items_to_add_map = {}
+    last_track = None
+
+    for part in parts_with_tracks:
+        if part in track_codes_found:
+            last_track = part
+            if last_track not in items_to_add_map:
+                 items_to_add_map[last_track] = "" 
+        elif last_track is not None:
+            items_to_add_map[last_track] += part
+            
+    final_items_dict = {}
+    for track, comment in items_to_add_map.items():
+        clean_comment = comment.strip().rstrip('.,;:')
+        if track not in final_items_dict:
+             final_items_dict[track] = clean_comment or None
+    
+    items_list = [{"track_code": code, "comment": comment} for code, comment in final_items_dict.items()]
+    
+    # --- Вызываем ту же логику, что и /api/bot/bulk_add_orders ---
+    # (Это дублирование кода, но необходимо для разделения эндпоинтов)
+    
+    existing_orders_map = {
+        o.track_code: o for o in db.query(Order).filter(Order.company_id == request_data.company_id)
+    }
+    
+    created_count = 0
+    assigned_count = 0
+    skipped_count = 0
+    orders_to_add = []
+    history_entries_to_add = []
+    
+    for item in items_list:
+        track_code = item['track_code']
+        existing_order = existing_orders_map.get(track_code)
+        
+        if existing_order:
+            if existing_order.client_id is None:
+                # "МАГИЯ" - ПРИСВАИВАЕМ ЗАКАЗ
+                existing_order.client_id = request_data.client_id
+                existing_order.comment = item['comment']
+                existing_order.location_id = location_id_to_assign
+                
+                # --- ИСПРАВЛЕНИЕ "МАГИИ" (ЧАСТЬ 1) ---
+                db.add(existing_order) # <-- ГЛАВНОЕ ИСПРАВЛЕНИЕ (Сообщаем SQLAlchemy об изменениях)
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+                history_entries_to_add.append(
+                    OrderHistory(order_id=existing_order.id, status=existing_order.status, employee_id=None)
+                )
+                assigned_count += 1
+            else:
+                skipped_count += 1
+        else:
+            # ЗАКАЗ НОВЫЙ
+            new_order = Order(
+                client_id=request_data.client_id,
+                track_code=track_code,
+                comment=item['comment'],
+                status="В обработке",
+                purchase_type="Доставка",
+                party_date=date.today(),
+                company_id=request_data.company_id,
+                location_id=location_id_to_assign
+            )
+            orders_to_add.append(new_order)
+            created_count += 1
+
+    if not orders_to_add and assigned_count == 0:
+         return {"message": f"Все заказы ({skipped_count} шт) уже числятся в базе.", "created": 0, "assigned": 0, "skipped": skipped_count}
+
+    try:
+        if orders_to_add:
+            db.bulk_save_objects(orders_to_add, return_defaults=True)
+            for order in orders_to_add:
+                history_entries_to_add.append(
+                    OrderHistory(order_id=order.id, status=order.status, employee_id=None)
+                )
+
+        if history_entries_to_add:
+            db.bulk_save_objects(history_entries_to_add)
+
+        db.commit() # Сохраняем и новые, и обновленные ("магия") заказы
+
+        # Уведомление Владельцу
+        message = f"🔔 <b>Клиент добавил заказы (AI Бот)</b>\n\nКлиент: <b>{client.full_name}</b>\n"
+        if created_count > 0: message += f"✔️ Новых добавлено: <b>{created_count} шт.</b>\n"
+        if assigned_count > 0: message += f"✨ Присвоено невостребованных: <b>{assigned_count} шт.</b>\n"
+        
+        background_tasks.add_task(
+            notify_owners,
+            company_id=request_data.company_id,
+            message_text=message
+        )
+        
+        return {"message": f"Готово! Добавлено: {created_count}, Присвоено: {assigned_count}, Пропущено: {skipped_count}", "created": created_count, "assigned": assigned_count, "skipped": skipped_count}
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [AI Order Request] Ошибка БД: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных (Rollback): {e}")
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
+
+@app.get("/api/bot/locations", tags=["Telegram Bot"], response_model=List[LocationOut])
+def get_bot_company_locations(
+    company_id: int = Query(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Возвращает список всех филиалов (локаций) компании для использования ботом.
+    """
+    locations = db.query(Location).filter(Location.company_id == company_id).all()
+    if not locations:
+        return [] # Возвращаем пустой список, если филиалов нет
+    return locations
 
 # main.py (ДОБАВИТЬ ЭТОТ ЭНДПОИНТ)
 @app.patch("/api/settings", tags=["Настройки"])
@@ -5588,6 +5802,10 @@ def bulk_add_orders_from_bot(
                 existing_order.client_id = payload.client_id
                 existing_order.comment = item.comment 
                 existing_order.location_id = payload.location_id 
+
+                # --- ИСПРАВЛЕНИЕ "МАГИИ" (ЧАСТЬ 2) ---
+                db.add(existing_order) # <-- ДОБАВЬ ЭТУ СТРОКУ
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
                 history_entries_to_add.append(
                     OrderHistory(order_id=existing_order.id, status=existing_order.status, employee_id=None)
