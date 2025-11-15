@@ -12,7 +12,7 @@ import asyncio
 import html # Для форматирования ответов
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import json # <-- Добавляем json
 from ai_brain import get_ai_response
 from ai_tools import TOOLS_SYSTEM_PROMPT, execute_ai_tool # <-- Добавляем инструменты
@@ -582,9 +582,9 @@ async def add_order_received_location(update: Update, context: ContextTypes.DEFA
 
 async def add_order_received_track_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    (ВЕРСИЯ 5.0 - "ЭКСТРАСЕНС")
-    1. "Вытаскивает" все трек-коды из "хаотичного" текста.
-    2. Если кодов > 1: отправляет массово БЕЗ комментариев.
+    (ВЕРСИЯ 6.2 - УДАЛЕНА СТРОГАЯ ПРОВЕРКА)
+    1. Парсит трек-коды и привязанные к ним комментарии.
+    2. Если кодов > 1: отправляет массово.
     3. Если код == 1: работает по старой логике (магия -> запрос комментария).
     """
     global COMPANY_ID_FOR_BOT
@@ -598,39 +598,55 @@ async def add_order_received_track_code(update: Update, context: ContextTypes.DE
          await update.message.reply_text("Ошибка: Потеряны данные сессии. Начните сначала с /start.", reply_markup=markup)
          return ConversationHandler.END
 
-    # --- НОВАЯ ЛОГИКА "ЭКСТРАСЕНС" ---
+    # --- ЛОГИКА "ЭКСТРАСЕНС" ---
 
-    # Ищем все "слова", состоящие из букв (A-Z, a-z) и цифр (0-9),
-    # которые имеют длину от 8 до 25 символов.
-    # Это отсеет "чехол", "серьги", "42", но найдет "98111..." и "JT542..."
-    try:
-        # Используем r'\b[a-zA-Z0-9]{8,25}\b'
-        # \b - граница слова (чтобы не найти код внутри другого слова)
-        track_codes_found = re.findall(r'\b[a-zA-Z0-9]{8,25}\b', text_input)
+    # 1. Находим все "слова", похожие на трек-код (8-25 букв/цифр)
+    track_codes_found = re.findall(r'(\b[a-zA-Z0-9]{8,25}\b)', text_input)
 
-        # Удаляем дубликаты, если клиент вставил один код дважды
-        track_codes_found = sorted(list(set(track_codes_found))) 
-
-    except Exception as e_re:
-        logger.error(f"Ошибка Regex при парсинге трек-кодов: {e_re}")
-        await update.message.reply_html("<b>Ошибка:</b> Произошла внутренняя ошибка при разборе вашего текста.")
+    # Если кодов не найдено, возвращаемся к ожиданию ввода
+    if not track_codes_found:
+        logger.warning(f"Клиент {client_id} ввел 'мусор', трек-коды не найдены. Текст: {text_input[:100]}")
+        await update.message.reply_html(
+            "❗️ <b>Ошибка:</b> Я не смог найти в вашем тексте ничего, похожего на трек-код (8-25 букв/цифр).\n\n"
+            "Пожалуйста, введите **один** трек-код или **список** трек-кодов."
+        )
         return ADD_ORDER_TRACK_CODE # Остаемся ждать
 
+    # 2. Парсим комментарии, используя найденные треки как разделители
+    parts_with_tracks = re.split(r'(\b[a-zA-Z0-9]{8,25}\b)', text_input)
 
+    items_to_add = {} # {track_code: comment}
+    last_track = None
+
+    for part in parts_with_tracks:
+        if part in track_codes_found:
+            last_track = part
+            if last_track not in items_to_add:
+                 items_to_add[last_track] = "" 
+        elif last_track is not None:
+            items_to_add[last_track] += part
+            
+    # 3. Финальная очистка и дедупликация
+    final_items = {} 
+    for track, comment in items_to_add.items():
+        clean_comment = comment.strip().rstrip('.,;:')
+        if track not in final_items:
+             final_items[track] = clean_comment or None 
+    
+    items_list = [{"track_code": code, "comment": comment} for code, comment in final_items.items()]
+    
+    
     # --- Сценарий 1: Массовая загрузка (найдено > 1 кода) ---
-    if len(track_codes_found) > 1:
-        logger.info(f"Клиент {client_id} запустил МАССОВУЮ загрузку. Найдено {len(track_codes_found)} трек-кодов.")
+    if len(items_list) > 1:
+        logger.info(f"Клиент {client_id} запустил МАССОВУЮ загрузку. Найдено {len(items_list)} трек-кодов с комментариями.")
 
-        # Собираем список, НО БЕЗ КОММЕНТАРИЕВ
-        items_to_add = [{"track_code": code, "comment": None} for code in track_codes_found]
-
-        await update.message.reply_text(f"✅ Понял. Нашел в вашем тексте {len(items_to_add)} трек-кодов. Обрабатываю... Ожидайте.")
+        await update.message.reply_text(f"✅ Понял. Нашел {len(items_list)} трек-кодов. Обрабатываю... Ожидайте.")
 
         payload = {
             "client_id": client_id,
             "location_id": location_id,
             "company_id": COMPANY_ID_FOR_BOT,
-            "items": items_to_add
+            "items": items_list
         }
 
         api_response = await api_request("POST", "/api/bot/bulk_add_orders", json=payload)
@@ -659,11 +675,14 @@ async def add_order_received_track_code(update: Update, context: ContextTypes.DE
         return ConversationHandler.END
 
     # --- Сценарий 2: Одиночный заказ (найден == 1 код) ---
-    elif len(track_codes_found) == 1:
-        track_code = track_codes_found[0]
-        logger.info(f"Клиент {client_id} ввел ОДИНОЧНЫЙ трек-код (найден в тексте): {track_code}.")
+    elif len(items_list) == 1:
+        item = items_list[0]
+        track_code = item['track_code']
+        comment_from_text = item['comment']
 
-        # 3. "Магия" (поиск невостребованных)
+        logger.info(f"Клиент {client_id} ввел ОДИНОЧНЫЙ трек-код. Текст: {comment_from_text}")
+
+        # 3. "Магия" (поиск невостребованных) - ПЕРВЫЙ ПРИОРИТЕТ
         claim_payload = {
             "track_code": track_code,
             "client_id": client_id,
@@ -676,10 +695,10 @@ async def add_order_received_track_code(update: Update, context: ContextTypes.DE
         )
 
         if api_response and "error" not in api_response and "id" in api_response:
-            # 1. УСПЕХ! Заказ найден и назначен
+            # 1. УСПЕХ! Заказ найден и присвоен (Магия сработала)
             logger.info(f"МАГИЯ: Невостребованный заказ (ID: {api_response.get('id')}) назначен клиенту {client_id}")
             await update.message.reply_html(
-                f"🎉 <b>Отличные новости!</b>\n\nМы нашли этот заказ (<code>{track_code}</code>) в нашей базе невостребованных посылок и <b>сразу добавили его вам!</b>",
+                f"🎉 <b>Отличные новости!</b>\n\nМы нашли этот заказ (<code>{track_code}</code>) в нашей базе невостребованных посылок и <b>сразу присвоили его вам!</b> Теперь он отображается в вашем списке заказов.",
                 reply_markup=markup
             )
             context.user_data.pop('location_id', None)
@@ -687,24 +706,45 @@ async def add_order_received_track_code(update: Update, context: ContextTypes.DE
             return ConversationHandler.END
 
         else:
-            # 2. Не найден (или ошибка "магии") -> Спрашиваем комментарий
-            logger.info(f"Заказ '{track_code}' не найден в невостребованных. Спрашиваем комментарий.")
+            # 2. Не найден (или ошибка "магии") -> Проверка на ДУБЛИКАТ, чтобы избежать создания нового.
+            
+            # НОВЫЙ ШАГ: Проверка, существует ли этот трек-код в системе вообще
+            search_response = await api_request(
+                 "GET",
+                 "/api/orders", # Используем общий эндпоинт поиска
+                 params={"q": track_code, "company_id": COMPANY_ID_FOR_BOT, "limit": 1}
+            )
+
+            if search_response and not search_response.get("error") and len(search_response) > 0:
+                 # Найден дубликат (принадлежит кому-то или "Неизвестному", но магия не сработала)
+                 order_status = search_response[0].get("status", "Неизвестен")
+                 
+                 await update.message.reply_html(
+                      f"⚠️ <b>Внимание:</b> Заказ с трек-кодом <code>{track_code}</code> уже зарегистрирован в нашей системе. "
+                      f"Его текущий статус: <b>{order_status}</b>. "
+                      f"Повторное добавление невозможно. Если вы считаете, что это ваш заказ, обратитесь к менеджеру для ручного присвоения."
+                 )
+                 # Сбрасываем разговор, чтобы не создавать дубликат
+                 context.user_data.pop('location_id', None)
+                 context.user_data.pop('available_locations', None)
+                 return ConversationHandler.END 
+            
+            # Если не найден (проверка на дубликат прошла успешно) -> Спрашиваем комментарий для создания нового.
+            logger.info(f"Заказ '{track_code}' не найден. Продолжаем создание нового.")
             context.user_data['track_code'] = track_code
+            
+            # Если в тексте уже был комментарий, сразу его используем и пропускаем шаг
+            if comment_from_text:
+                context.user_data['comment'] = comment_from_text
+                return await save_order_from_bot(update, context)
+            
+            # Если комментария не было, спрашиваем его
             keyboard = [["⏩ Пропустить"], ["Отмена"]]
             await update.message.reply_text(
                 "Шаг 3/3: Введите примечание (например, 'красные кроссовки') или нажмите 'Пропустить'.",
                 reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
             )
             return ADD_ORDER_COMMENT
-
-    # --- Сценарий 3: "Мусор" (не найдено ни одного кода) ---
-    else:
-        logger.warning(f"Клиент {client_id} ввел 'мусор', трек-коды не найдены. Текст: {text_input[:100]}")
-        await update.message.reply_html(
-            "❗️ <b>Ошибка:</b> Я не смог найти в вашем тексте ничего, похожего на трек-код (8-25 букв/цифр).\n\n"
-            "Пожалуйста, введите **один** трек-код или **список** трек-кодов."
-        )
-        return ADD_ORDER_TRACK_CODE # Остаемся ждать
 
 async def add_order_received_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Получен комментарий от пользователя."""
@@ -720,53 +760,72 @@ async def add_order_skip_comment(update: Update, context: ContextTypes.DEFAULT_T
     return await save_order_from_bot(update, context)
 
 async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет введенные данные заказа через API."""
+    """
+    (ИСПРАВЛЕНО 16.11) Финальный шаг: сохраняет новый заказ в базе через API,
+    вызывая СТАНДАРТНЫЙ эндпоинт /api/orders.
+    """
+    global COMPANY_ID_FOR_BOT
+    
     client_id = context.user_data.get('client_id')
-    location_id = context.user_data.get('location_id')
     track_code = context.user_data.get('track_code')
-    comment = context.user_data.get('comment') 
+    location_id = context.user_data.get('location_id')
+    comment = context.user_data.get('comment')
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
-    if not all([client_id, location_id, track_code]):
-         await update.message.reply_text("Ошибка: Не хватает данных. Попробуйте добавить заказ снова.", reply_markup=markup)
-         logger.error(f"Ошибка сохранения заказа: Не хватает данных. client={client_id}, loc={location_id}, track={track_code}")
-         # Очистка
-         context.user_data.pop('location_id', None)
-         context.user_data.pop('track_code', None)
-         context.user_data.pop('comment', None)
-         context.user_data.pop('available_locations', None)
-         return ConversationHandler.END 
+    # Очистка комментария
+    if comment == "⏩ Пропустить":
+         final_comment = None
+    else:
+         final_comment = comment
 
+    if not track_code or not client_id or not location_id:
+        await update.message.reply_text("❌ Ошибка: Потеряны данные для сохранения заказа (нет ID клиента, трека или филиала). Попробуйте /start", reply_markup=markup)
+        logger.error(f"Ошибка сохранения заказа: Не хватает данных. client={client_id}, loc={location_id}, track={track_code}")
+        # Очистка
+        for key in ['location_id', 'track_code', 'comment', 'available_locations']:
+            context.user_data.pop(key, None)
+        return ConversationHandler.END
+
+    # 2. Формируем и отправляем Payload
     payload = {
-        "client_id": client_id,
-        "location_id": location_id, 
         "track_code": track_code,
-        "comment": comment, 
-        "purchase_type": "Доставка", 
-        "company_id": COMPANY_ID_FOR_BOT # <--- Используем глобальный ID
+        "client_id": client_id,
+        "company_id": COMPANY_ID_FOR_BOT,
+        "location_id": location_id,
+        "comment": final_comment,
+        "purchase_type": "Доставка", # Всегда доставка из бота
+        "party_date": date.today().isoformat() # Сегодняшняя дата
     }
-    logger.info(f"Отправка запроса на создание заказа: {payload}")
     
-    # --- Вызов API ---
-    api_response = await api_request("POST", "/api/orders", json=payload)
+    api_response = await api_request(
+        "POST", 
+        "/api/orders",  # <-- ИСПОЛЬЗУЕМ СТАНДАРТНЫЙ ЭНДПОИНТ
+        json=payload
+    )
 
+    # 3. Обработка ответа
     if api_response and "error" not in api_response and "id" in api_response:
-        logger.info(f"Заказ ID {api_response.get('id')} успешно создан для клиента {client_id}")
+        # УСПЕХ: Заказ создан
         await update.message.reply_html(
-            f"✅ Готово! Ваш заказ с трек-кодом <code>{track_code}</code> успешно добавлен.",
-            reply_markup=markup 
+            f"✅ <b>Заказ добавлен!</b>\n\nТрек-код: <code>{track_code}</code>\n"
+            f"Теперь вы можете отслеживать его в разделе 'Мои заказы'.",
+            reply_markup=markup
         )
     else:
-        error_msg = api_response.get("error", "Не удалось сохранить заказ.") if api_response else "Нет ответа."
+        # ОШИБКА: Сервер вернул ошибку
+        error_msg = api_response.get("error", "Неизвестная ошибка сервера.") if api_response else "Нет ответа от API."
         logger.error(f"Ошибка сохранения заказа для клиента {client_id}: {error_msg}")
-        await update.message.reply_text(f"Ошибка сохранения заказа: {error_msg}", reply_markup=markup)
-
-    # Очистка
-    context.user_data.pop('location_id', None)
-    context.user_data.pop('track_code', None)
-    context.user_data.pop('comment', None)
-    context.user_data.pop('available_locations', None)
+        await update.message.reply_html(
+            f"❌ <b>Не удалось добавить заказ!</b>\n"
+            f"Ошибка: {error_msg}",
+            reply_markup=markup
+        )
+        
+    # Сброс данных сессии
+    for key in ['track_code', 'comment', 'location_id', 'available_locations']:
+        context.user_data.pop(key, None)
+        
     return ConversationHandler.END
 
 
