@@ -37,7 +37,7 @@ autorestart=true
 stopwaitsecs=600 ; wait 10 minutes before killing the script
 stderr_logfile=/var/log/supervisor/{program_name}_err.log
 stdout_logfile=/var/log/supervisor/{program_name}_out.log
-environment=LANG="en_US.UTF-8",LC_ALL="en_US.UTF-8",ADMIN_API_URL="{api_url}",TELEGRAM_BOT_TOKEN="{bot_token}"
+environment=LANG="en_US.UTF-8",LC_ALL="en_US.UTF-8",ADMIN_API_URL="{api_url}",TELEGRAM_BOT_TOKEN="{bot_token}"{env_extras}
 """
 
 # --- Определение модели Company (только нужные поля) ---
@@ -143,6 +143,12 @@ def main():
     configs_changed = False
     for program_name, company in required_programs.items():
         conf_path = os.path.join(SUPERVISOR_CONF_DIR, f"{program_name}.conf")
+        # --- ЛОГИКА ВКЛЮЧЕНИЯ ИИ ---
+        # Включаем ИИ только для компании с кодом 'TEST' (или можно добавить других)
+        env_extras = ""
+        if company.company_code == "TEST":
+            env_extras = ',ENABLE_AI="True"'
+
         conf_content = CONFIG_TEMPLATE.format(
             program_name=program_name,
             python_executable=PYTHON_EXECUTABLE,
@@ -151,7 +157,8 @@ def main():
             company_id=company.id,
             api_url=API_URL,
             project_dir=project_dir,
-            user=USER
+            user=USER,
+            env_extras=env_extras # <-- Вставляем доп. переменную
         ).strip() + "\n" # Добавляем перенос строки в конце
 
         # Проверяем, существует ли файл и нужно ли его обновить
