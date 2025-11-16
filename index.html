@@ -7972,13 +7972,14 @@ async function renderSettingsTab() {
 
     // Генерируем HTML для вкладки
     pane.innerHTML = `
-        <div class="bg-white p-6 rounded-lg shadow-md max-w-2xl mx-auto">
+        <div class="bg-white p-6 rounded-lg shadow-md max-w-4xl mx-auto">
             <h2 class="text-2xl font-bold mb-4">Настройки Компании</h2>
 
             <div class="border-b border-gray-200 mb-6">
                 <nav class="-mb-px flex space-x-8" id="settings-subtabs">
                     <button data-subtab="settings-main" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-indigo-500 text-indigo-600">Основные</button>
-                    <button data-subtab="settings-passwords" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700">Пароли</button>
+                    <button data-subtab="settings-ai" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700">🤖 Правила для ИИ</button>
+                    <button data-subtab="settings-passwords" class="setting-subtab-btn tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700">Пароли безопасности</button>
                 </nav>
             </div>
 
@@ -7986,87 +7987,106 @@ async function renderSettingsTab() {
 
                 <div id="subtab-settings-main" class="setting-subtab-pane space-y-6">
                     <div>
-                        <label for="setting-china-address" class="block text-sm font-medium text-gray-700">Адрес склада в Китае</label>
-                        <p class="text-xs text-gray-500 mb-1">Используйте <code>{{client_code}}</code> для подстановки кода клиента.</p>
-                        <textarea id="setting-china-address" data-key="china_warehouse_address" class="setting-input w-full p-2 border rounded-md h-24 font-mono"></textarea>
+                        <label class="block text-sm font-medium text-gray-700">Адрес склада в Китае</label>
+                        <p class="text-xs text-gray-500 mb-1">Используйте <code>{{client_code}}</code> для подстановки кода.</p>
+                        <textarea data-key="china_warehouse_address" class="setting-input w-full p-2 border rounded-md h-24 font-mono"></textarea>
                     </div>
 
                     <div>
-                        <label for="setting-pdf-link" class="block text-sm font-medium text-gray-700">Ссылка на PDF с инструкцией</label>
-                        <p class="text-xs text-gray-500 mb-1">Полная ссылка (https://...) для кнопки в боте.</p>
-                        <input type="url" id="setting-pdf-link" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://.../instruction.pdf">
+                        <label class="block text-sm font-medium text-gray-700">Ссылка на PDF с инструкцией</label>
+                        <input type="url" data-key="instruction_pdf_link" class="setting-input w-full p-2 border rounded-md" placeholder="https://...">
                     </div>
 
                     <div>
-                        <label for="setting-client-code-start" class="block text-sm font-medium text-gray-700">Начальный номер для кодов клиентов</label>
-                        <p class="text-xs text-gray-500 mb-1">Новые клиенты (созданные в админке или боте) будут получать код, начиная с этого номера (например: 1001, 1400).</p>
-                        <input type="number" id="setting-client-code-start" data-key="client_code_start" class="setting-input w-full p-2 border rounded-md" placeholder="1001">
+                        <label class="block text-sm font-medium text-gray-700">Начальный номер кода клиента</label>
+                        <input type="number" data-key="client_code_start" class="setting-input w-full p-2 border rounded-md" placeholder="1001">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">График работы (для отображения в боте)</label>
+                        <input type="text" data-key="office_schedule" class="setting-input w-full p-2 border rounded-md" placeholder="Пн-Сб 09:00-18:00">
+                    </div>
+                </div>
+
+                <div id="subtab-settings-ai" class="setting-subtab-pane space-y-6 hidden">
+                    <div class="bg-blue-50 p-4 rounded-md border border-blue-200 mb-4">
+                        <p class="text-sm text-blue-800">
+                            ℹ️ <b>Как это работает:</b> Всё, что вы напишете здесь, Искусственный Интеллект прочитает и запомнит. 
+                            Если клиент спросит про выкуп, ИИ ответит по вашим правилам. Пишите просто и понятно.
+                        </p>
                     </div>
 
+                    <div>
+                        <label class="block text-sm font-bold text-gray-800">🛒 Правила ВЫКУПА (Услуги байера)</label>
+                        <p class="text-xs text-gray-500 mb-1">Например: "Выкупаем с Taobao/1688. Комиссия 5%. Курс юаня актуальный на день оплаты." или "Выкупом не занимаемся."</p>
+                        <textarea data-key="rule_buyout" class="setting-input w-full p-2 border rounded-md h-32" placeholder="Опишите условия выкупа..."></textarea>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-bold text-gray-800">🚚 Правила ДОСТАВКИ и Сроки</label>
+                        <p class="text-xs text-gray-500 mb-1">Например: "Сроки доставки 10-15 дней. Ответственность за хрупкий груз не несем без обрешетки."</p>
+                        <textarea data-key="rule_delivery" class="setting-input w-full p-2 border rounded-md h-32" placeholder="Опишите условия доставки..."></textarea>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-bold text-gray-800">ℹ️ Общая информация / Запрещенные товары</label>
+                        <p class="text-xs text-gray-500 mb-1">Любая другая важная информация, которую должен знать ИИ.</p>
+                        <textarea data-key="rule_general" class="setting-input w-full p-2 border rounded-md h-24" placeholder="Запрещено возить: жидкости, батарейки..."></textarea>
+                    </div>
                 </div>
 
                 <div id="subtab-settings-passwords" class="setting-subtab-pane space-y-6 hidden">
-                    <p class="text-sm text-gray-600">Установите пароли для опасных действий. Если поле оставить <b>пустым</b>, пароль запрашиваться не будет.</p>
-
+                    <p class="text-sm text-gray-600">Пароли для подтверждения опасных действий в Админке.</p>
                     <div>
-                        <label for="setting-pass-revert-order" class="block text-sm font-medium text-gray-700">Пароль на <b>Возврат</b> выданного заказа</label>
-                        <input type="text" id="setting-pass-revert-order" data-key="password_revert_order" class="setting-input w-full p-2 border rounded-md">
+                        <label class="block text-sm font-medium text-gray-700">Пароль на Возврат статуса</label>
+                        <input type="text" data-key="password_revert_order" class="setting-input w-full p-2 border rounded-md">
                     </div>
-
                     <div>
-                        <label for="setting-pass-delete-order" class="block text-sm font-medium text-gray-700">Пароль на <b>Удаление</b> заказа</label>
-                        <input type="text" id="setting-pass-delete-order" data-key="password_delete_order" class="setting-input w-full p-2 border rounded-md">
+                        <label class="block text-sm font-medium text-gray-700">Пароль на Удаление заказа</label>
+                        <input type="text" data-key="password_delete_order" class="setting-input w-full p-2 border rounded-md">
                     </div>
-
                     <div>
-                        <label for="setting-pass-delete-client" class="block text-sm font-medium text-gray-700">Пароль на <b>Удаление</b> клиента</label>
-                        <input type="text" id="setting-pass-delete-client" data-key="password_delete_client" class="setting-input w-full p-2 border rounded-md">
+                        <label class="block text-sm font-medium text-gray-700">Пароль на Удаление клиента</label>
+                        <input type="text" data-key="password_delete_client" class="setting-input w-full p-2 border rounded-md">
                     </div>
                 </div>
 
-                <div class="border-t pt-4">
-                    <button type="submit" class="w-full bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700">Сохранить Настройки</button>
+                <div class="border-t pt-4 sticky bottom-0 bg-white pb-4">
+                    <button type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 shadow-md transition-colors">💾 Сохранить Все Настройки</button>
                 </div>
             </form>
         </div>
     `;
 
-    // --- Привязка слушателей к элементам ---
+    // --- Привязка слушателей ---
     const form = document.getElementById('settings-form');
     if (form) {
-        // Заменяем, чтобы удалить старые слушатели
         form.replaceWith(form.cloneNode(true));
         document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
-        console.log("[Listener OK] Added submit to #settings-form");
     }
 
-    // Привязываем слушатель к под-вкладкам
+    // Логика переключения вкладок
     const subtabsContainer = document.getElementById('settings-subtabs');
     if (subtabsContainer) {
-        // Используем делегирование
         const newSubtabsContainer = subtabsContainer.cloneNode(true);
         subtabsContainer.parentNode?.replaceChild(newSubtabsContainer, subtabsContainer);
         newSubtabsContainer.addEventListener('click', e => {
             const tabButton = e.target.closest('.setting-subtab-btn');
             if (tabButton) {
                 const tabName = tabButton.dataset.subtab;
-                // Стилизация кнопок
                 document.querySelectorAll('.setting-subtab-btn').forEach(btn => {
                     btn.classList.remove('border-indigo-500', 'text-indigo-600');
                     btn.classList.add('border-transparent', 'text-gray-500');
                 });
                 tabButton.classList.add('border-indigo-500', 'text-indigo-600');
                 tabButton.classList.remove('border-transparent', 'text-gray-500');
-                // Показ/скрытие панелей
                 document.querySelectorAll('.setting-subtab-pane').forEach(pane => {
                     pane.classList.toggle('hidden', pane.id !== `subtab-${tabName}`);
                 });
             }
         });
-        console.log("[Listener OK] Added click delegate to #settings-subtabs");
     }
 
-    // Загружаем и отображаем текущие настройки
     await fetchAndRenderSettings();
     console.log("[Render] renderSettingsTab: End");
 }
