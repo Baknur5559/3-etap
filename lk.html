@@ -67,21 +67,67 @@
     <script>
         const CLIENT_API_URL = 'http://127.0.0.1:8001'; 
 
-        // Функция для отображения ТЕКУЩИХ заказов
+        // Функция для отображения ТЕКУЩИХ заказов (С ИСТОРИЕЙ)
         function renderOrders(orders) {
             const ordersList = document.getElementById('current-pane');
             if (orders.length === 0) {
                 ordersList.innerHTML = '<p class="text-gray-500 p-4 text-center">Активных заказов нет.</p>';
             } else {
-                ordersList.innerHTML = orders.map(order => `
+                ordersList.innerHTML = orders.map(order => {
+                    
+                    // --- НОВАЯ ЛОГИКА: Форматирование истории ---
+                    let historyHtml = '';
+                    if (order.history_entries && order.history_entries.length > 0) {
+                        historyHtml = '<ul class="mt-2 pl-4 list-disc text-xs text-gray-500 space-y-0.5">';
+                        try {
+                            // --- (НОВЫЙ БЛОК JS) ---
+                            // 1. Создаем Map, чтобы хранить ПОСЛЕДНЮЮ запись для каждого статуса
+                            const latestStatusMap = new Map();
+                            
+                            // Сначала сортируем, чтобы гарантировать правильный порядок (старые -> новые)
+                            order.history_entries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+                            order.history_entries.forEach(entry => {
+                                // Ключ = статус, Значение = сам объект entry
+                                // Новые записи перезатрут старые с тем же статусом
+                                latestStatusMap.set(entry.status, entry);
+                            });
+
+                            // 2. Получаем отфильтрованный список (Map сохраняет порядок вставки)
+                            const filteredHistory = Array.from(latestStatusMap.values());
+                            // --- (КОНЕЦ НОВОГО БЛОКА JS) ---
+                            
+                            historyHtml += filteredHistory.map(entry => { // <-- Используем filteredHistory
+                                // Форматируем дату в локальный формат
+                                const entryDate = new Date(entry.created_at).toLocaleString('ru-RU', {
+                                    day: '2-digit', 
+                                    month: '2-digit', 
+                                    hour: '2-digit', 
+                                    minute: '2-digit'
+                                });
+                                return `<li><i>${entryDate}: ${entry.status}</i></li>`;
+                            }).join('');
+                        } catch(e) {
+                            console.warn("Ошибка форматирования истории заказа", e, order.history_entries);
+                            historyHtml += '<li>(Ошибка загрузки истории)</li>';
+                        }
+                        historyHtml += '</ul>';
+                    }
+                    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+                    // Рендеринг карточки
+                    return `
                     <div class="bg-white p-4 rounded-lg shadow-sm order-card">
                         <div class="flex justify-between items-center">
                             <p class="font-bold text-gray-800 break-all">${order.track_code}</p>
                             <span class="text-xs text-center sm:text-sm font-semibold text-white bg-blue-500 px-3 py-1 rounded-full whitespace-nowrap ml-2">${order.status}</span>
                         </div>
                         ${order.comment ? `<p class="text-sm text-gray-600 mt-2"><b>Примечание:</b> ${order.comment}</p>` : ''}
+                        
+                        ${historyHtml} 
+                        
                     </div>
-                `).join('');
+                `}).join('');
             }
         }
 
