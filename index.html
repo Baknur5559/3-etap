@@ -1856,15 +1856,38 @@ async function renderLocationsTab() {
 
     const locationListDiv = document.getElementById('locations-list');
     if (locationListDiv) {
-         locationListDiv.addEventListener('click', (e) => {
+         // Заменяем, чтобы очистить старые слушатели
+         const newLocationListDiv = locationListDiv.cloneNode(false);
+         locationListDiv.parentNode?.replaceChild(newLocationListDiv, locationListDiv);
+         newLocationListDiv.innerHTML = 'Загрузка списка филиалов...';
+         
+         newLocationListDiv.addEventListener('click', (e) => {
              const editBtn = e.target.closest('.edit-location-btn');
              const deleteBtn = e.target.closest('.delete-location-btn');
              const toggleBtn = e.target.closest('.toggle-shift-btn');
              
-             if (editBtn) openLocationModal(JSON.parse(editBtn.dataset.locationJson));
-             // ... (логика для удаления и переключения смен)
-             if (toggleBtn) handleShiftToggle(e); 
+             if (editBtn) {
+                 openLocationModal(JSON.parse(editBtn.dataset.locationJson));
+                 return; // Выходим
+             }
+             
+             if (toggleBtn) {
+                 handleShiftToggle(e); 
+                 return; // Выходим
+             }
+
+             // --- ДОБАВЛЕННАЯ ЛОГИКА УДАЛЕНИЯ ---
+             if (deleteBtn) {
+                console.log("[Action] Delete location button clicked");
+                const locationId = deleteBtn.dataset.locationId;
+                const locationName = deleteBtn.dataset.locationName;
+                // Вызываем функцию, которая содержит confirm
+                handleDeleteLocation(locationId, locationName); 
+                return; // Выходим
+             }
+             // --- КОНЕЦ ДОБАВЛЕННОЙ ЛОГИКИ ---
          });
+         console.log("[Listener OK] Added click delegate listener to #locations-list (with delete)");
     }
 
     await fetchAndRenderLocations();
@@ -2149,26 +2172,26 @@ async function handleSaveLocation(e) {
 // --- Удаление Филиала ---
 async function handleDeleteLocation(locationId, locationName) {
     console.log(`[Delete] handleDeleteLocation: Start deleting ID ${locationId} (${locationName})`);
-    // Дополнительная проверка перед удалением (можно запросить пароль или код)
-    // const confirmation = prompt(`Для подтверждения удаления филиала "${locationName}" введите "УДАЛИТЬ":`);
-    // if (confirmation !== "УДАЛИТЬ") {
-    //      alert("Удаление отменено.");
-    //      return;
-    // }
+    
+    // Подтверждение
+    if (!confirm(`Вы уверены, что хотите удалить филиал "${locationName}"?\n\nВНИМАНИЕ: Удаление возможно, только если к филиалу не привязаны сотрудники, смены или заказы.`)) {
+         alert("Удаление отменено.");
+         return;
+    }
     
     showLoader();
     try {
-        // TODO: Добавить эндпоинт DELETE /locations/{id} на бэкенд.
-        // Пока имитируем или показываем заглушку.
-        // await apiFetch(`/locations/${locationId}`, { method: 'DELETE' });
+        // Вызываем новый эндпоинт
+        await apiFetch(`/api/locations/${locationId}`, { method: 'DELETE' });
         
-        console.warn(`[Delete] handleDeleteLocation: DELETE endpoint for locations not implemented yet. Deletion skipped for ID ${locationId}.`);
-        alert(`Функция удаления филиала "${locationName}" пока не реализована на сервере.`);
+        console.log(`[Delete] handleDeleteLocation: Филиал ${locationName} (ID: ${locationId}) успешно удален.`);
+        alert(`Филиал "${locationName}" успешно удален.`);
         
-        // alert(`Филиал "${locationName}" успешно удален.`); // Когда будет готово
-        // await fetchAndRenderLocations(); // Обновить список после удаления
+        // Обновляем кэш и список
+        companyLocations = companyLocations.filter(loc => loc.id != locationId);
+        await fetchAndRenderLocations(); 
 
-    } catch(err) { // Обработка ошибок от apiFetch
+    } catch(err) { // Обработка ошибок от apiFetch (включая 400 Bad Request, если есть зависимости)
         console.error("[Delete] handleDeleteLocation: Error", err);
         alert(`Ошибка удаления филиала "${locationName}": ${err.message}`);
     } finally {
@@ -2656,32 +2679,26 @@ async function handleToggleEmployeeStatus(employeeId, newStatus /* true or false
 // --- Полное удаление сотрудника через API ---
 async function handleDeleteEmployee(employeeId, employeeName) {
      console.log(`[Delete] handleDeleteEmployee: Start deleting ID ${employeeId} (${employeeName})`);
+     
+     // Двойное подтверждение уже есть в handleEmployeeActions, но оставим и здесь
+     if (!confirm(`Вы уверены, что хотите ПОЛНОСТЬЮ удалить сотрудника "${employeeName}" (ID: ${employeeId})?\n\nЭто действие необратимо. Смены, привязанные к нему, могут вызвать ошибку (если они есть).`)) {
+         alert("Удаление отменено.");
+         return;
+     }
+
      showLoader(); // Показываем лоадер
      try {
-         // TODO: Убедиться, что на бэкенде есть эндпоинт DELETE /employees/{id}
-         //       и он корректно обрабатывает удаление (например, проверяет зависимости).
-
-         // --- ВРЕМЕННАЯ ЗАГЛУШКА: Используем PATCH для деактивации ---
-          console.warn(`[Delete] handleDeleteEmployee: Using PATCH to deactivate instead of DELETE (endpoint DELETE /employees/{id} should be implemented).`);
-           await apiFetch(`/api/employees/${employeeId}`, {
-                method: 'PATCH',
-                body: JSON.stringify({ is_active: false }) // Просто деактивируем
-           });
-          alert(`Сотрудник "${employeeName}" был деактивирован (уволен).\n\nПримечание: Полное удаление данных пока не реализовано на сервере.`);
-         // --- КОНЕЦ ЗАГЛУШКИ ---
-
-         /* --- КОД ДЛЯ РЕАЛЬНОГО УДАЛЕНИЯ (когда будет готов бэкенд) ---
+         // Вызываем новый эндпоинт DELETE
          console.log(`[Delete] Sending DELETE request for employee ID ${employeeId}`);
-         await apiFetch(`/employees/${employeeId}`, { method: 'DELETE' });
+         await apiFetch(`/api/employees/${employeeId}`, { method: 'DELETE' });
+         
          console.log(`[Delete] handleDeleteEmployee: Employee ID ${employeeId} deleted successfully.`);
-         alert(`Сотрудник "${employeeName}" и все связанные с ним данные были успешно удалены.`);
-         */
-
+         alert(`Сотрудник "${employeeName}" успешно удален.`);
+         
          await fetchAndRenderEmployees(); // Обновляем список сотрудников
 
-     } catch (err) { // Обработка ошибок от apiFetch
+     } catch (err) { // Обработка ошибок от apiFetch (включая 400 Bad Request, если есть зависимости)
           console.error("!!! [Delete] handleDeleteEmployee: Error", err);
-          // Бэкенд может вернуть ошибку (400), если нельзя удалить сотрудника
           alert(`Ошибка удаления сотрудника "${employeeName}": ${err.message}`);
      } finally {
           hideLoader(); // Скрываем лоадер
