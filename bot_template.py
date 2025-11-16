@@ -10,6 +10,7 @@ import sys  # Для sys.exit()
 import logging
 import asyncio
 import html # Для форматирования ответов
+import asyncio
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, date
@@ -307,14 +308,15 @@ def identify_bot_company() -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обработчик /start. Проверяет пользователя по Chat ID.
-    Если найден - входит.
-    Если не найден - спрашивает телефон.
+    /start - Просто вход.
+    Если клиент есть -> Приветствуем.
+    Если гость -> Приветствуем и включаем ИИ (НЕ требуем телефон сразу).
     """
     user = update.effective_user
-    chat_id = str(user.id) 
-    logger.info(f"Команда /start от {user.full_name} (ID: {chat_id}) для компании {COMPANY_ID_FOR_BOT}")
+    chat_id = str(user.id)
+    logger.info(f"Команда /start от {user.full_name} (ID: {chat_id})")
 
+    # Проверяем юзера (тихо)
     api_response = await api_request(
         "POST",
         "/api/bot/identify_user", 
@@ -322,56 +324,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     if api_response and "error" not in api_response:
-        # --- УСПЕХ: Пользователь найден по Chat ID ---
+        # --- КЛИЕНТ НАЙДЕН ---
         client_data = api_response.get("client")
-        is_owner = api_response.get("is_owner", False) 
-
-        if not client_data or not client_data.get("id"):
-             logger.error(f"Ошибка API /identify_user: Не получены данные клиента. Ответ: {api_response}")
-             await update.message.reply_text("Произошла ошибка при получении данных профиля.", reply_markup=ReplyKeyboardRemove())
-             return ConversationHandler.END 
-
-        # --- Сохраняем ВСЕ данные в user_data ---
+        is_owner = api_response.get("is_owner", False)
         context.user_data['client_id'] = client_data.get("id")
         context.user_data['is_owner'] = is_owner
         context.user_data['full_name'] = client_data.get("full_name")
-        context.user_data['employee_id'] = api_response.get("employee_id") # <-- ВАЖНО ДЛЯ ВЛАДЕЛЬЦА
-        logger.info(f"Пользователь {chat_id} идентифицирован как ClientID: {client_data.get('id')}, IsOwner: {is_owner}, EID: {api_response.get('employee_id')}")
+        context.user_data['employee_id'] = api_response.get("employee_id")
 
         markup = owner_main_menu_markup if is_owner else client_main_menu_markup
         role_text = " (Владелец)" if is_owner else ""
         await update.message.reply_html(
-            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас снова видеть! Используйте меню.",
+            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас видеть! Используйте меню.",
             reply_markup=markup
         )
-        return ConversationHandler.END
-
-    elif api_response and api_response.get("status_code") == 404:
-        # --- ОШИБКА 404: Пользователь не найден по Chat ID ---
-        logger.info(f"Пользователь {chat_id} не найден. Запрашиваем телефон.")
-        await update.message.reply_text(
-            "Здравствуйте! 🌟\n\nПохоже, мы еще не знакомы или ваш Telegram не привязан."
-            "\nПожалуйста, введите ваш номер телефона (тот, что вы использовали при регистрации в карго), начиная с 0 или 996.",
-            reply_markup=ReplyKeyboardRemove() 
-        )
-        return ASK_PHONE # <-- Переходим в состояние ожидания телефона
-
     else:
-        # --- ДРУГАЯ ОШИБКА API ---
-        error_msg = api_response.get("error", "Неизвестная ошибка.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове /api/bot/identify_user (Chat ID): {error_msg}")
-        await update.message.reply_text(
-            f"Произошла ошибка при проверке данных: {error_msg}\nПожалуйста, попробуйте позже, нажав /start.",
-            reply_markup=ReplyKeyboardRemove() 
+        # --- ГОСТЬ (НЕ НАЙДЕН) ---
+        # ВАЖНО: Мы НЕ требуем телефон, а просто здороваемся и разрешаем общаться с ИИ
+        context.user_data['client_id'] = None
+        await update.message.reply_html(
+            "👋 Здравствуйте! Я — ИИ-помощник Карго.\n\n"
+            "Вы пока не зарегистрированы, но можете задавать мне вопросы!\n"
+            "📦 Если захотите добавить заказы — нажмите /register.",
+            reply_markup=ReplyKeyboardRemove()
         )
-        return ConversationHandler.END
+
+    return ConversationHandler.END # <-- САМОЕ ГЛАВНОЕ: Не захватываем пользователя!
+
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /register - Принудительная регистрация.
+    Вот тут мы уже требуем телефон.
+    """
+    await update.message.reply_text(
+        "📝 Регистрация нового клиента.\n\n"
+        "Пожалуйста, введите ваш номер телефона (начиная с 0 или 996).",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_PHONE # <-- Вот тут захватываем пользователя
 
 async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обработчик получения номера телефона, ВВЕДЕННОГО ТЕКСТОМ.
-    Проверяет по API.
-    Если найден - входит.
-    Если не найден - спрашивает ФИО для регистрации.
+    Умная проверка номера.
+    Если не найден -> Мягко предлагаем варианты, а не посылаем.
     """
     user = update.effective_user
     chat_id = str(user.id)
@@ -379,10 +374,10 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     normalized_phone = normalize_phone_number(phone_number_text)
     
     if not normalized_phone:
-         await update.message.reply_text(f"Не удалось распознать номер: {phone_number_text}. Попробуйте отправить его текстом (начиная с 0 или 996).", reply_markup=ReplyKeyboardRemove())
+         await update.message.reply_text(f"Не удалось распознать номер. Попробуйте цифрами (например: 0555123456).", reply_markup=ReplyKeyboardRemove())
          return ASK_PHONE 
 
-    logger.info(f"Получен номер текстом от {user.full_name} (ID: {chat_id}): {phone_number_text} -> {normalized_phone}")
+    logger.info(f"Проверка номера {normalized_phone} для {user.full_name}")
 
     api_response = await api_request(
         "POST",
@@ -391,113 +386,111 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     if api_response and "error" not in api_response:
-        # --- УСПЕХ: Пользователь найден по Телефону ---
+        # --- УСПЕХ ---
         client_data = api_response.get("client")
         is_owner = api_response.get("is_owner", False)
-        
-        if not client_data or not client_data.get("id"):
-             logger.error(f"Ошибка API /identify_user (Phone): Не получены данные клиента. Ответ: {api_response}")
-             await update.message.reply_text("Ошибка при получении данных профиля. Попробуйте /start.", reply_markup=ReplyKeyboardRemove())
-             return ConversationHandler.END
-
-        # --- Сохраняем ВСЕ данные в user_data ---
         context.user_data['client_id'] = client_data.get("id")
         context.user_data['is_owner'] = is_owner
         context.user_data['full_name'] = client_data.get("full_name")
-        context.user_data['employee_id'] = api_response.get("employee_id") # <-- ВАЖНО ДЛЯ ВЛАДЕЛЬЦА
-        logger.info(f"Пользователь {chat_id} успешно привязан к ClientID: {client_data.get('id')}, IsOwner: {is_owner}, EID: {api_response.get('employee_id')}")
+        context.user_data['employee_id'] = api_response.get("employee_id")
 
         markup = owner_main_menu_markup if is_owner else client_main_menu_markup
         role_text = " (Владелец)" if is_owner else ""
         await update.message.reply_html(
-            f"🎉 Отлично, <b>{client_data.get('full_name')}</b>{role_text}! Ваш аккаунт успешно привязан.\n\nИспользуйте меню.",
+            f"🎉 Отлично, <b>{client_data.get('full_name')}</b>{role_text}! Аккаунт найден.\nТеперь вам доступны все функции!",
             reply_markup=markup
         )
         return ConversationHandler.END
 
     elif api_response and api_response.get("status_code") == 404:
-        # --- ОШИБКА 404: Пользователь не найден по Телефону ---
-        logger.info(f"Клиент с номером {normalized_phone} не найден. Предлагаем регистрацию.")
+        # --- 404: УМНЫЙ ОТВЕТ ---
         context.user_data['phone_to_register'] = normalized_phone
         
-        await update.message.reply_html( 
-            f"Клиент с номером <code>{normalized_phone}</code> не найден. Хотите зарегистрироваться?\n\n"
-            "Отправьте ваше <b>полное имя (ФИО)</b>.",
-            reply_markup=ReplyKeyboardRemove() 
-        )
-        return GET_NAME # <-- Переходим в состояние ожидания имени
-
-    else:
-        # --- ДРУГАЯ ОШИБКА API ---
-        error_msg = api_response.get("error", "Неизвестная ошибка.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове /api/bot/identify_user (Phone): {error_msg}")
-        await update.message.reply_text(
-            f"Произошла ошибка при проверке номера: {error_msg}\nПожалуйста, попробуйте позже, нажав /start.",
+        await update.message.reply_html(
+            f"😕 Хм, номер <code>{normalized_phone}</code> в базе не найден.\n\n"
+            f"☝️ <b>Если вы уже работали с нами:</b>\n"
+            f"Возможно, вы сдавали груз под <b>другим номером</b>? Попробуйте вспомнить и отправить тот номер.\n\n"
+            f"🆕 <b>Если вы у нас впервые:</b>\n"
+            f"Давайте создадим вам новый аккаунт! Просто отправьте ваше <b>Имя (ФИО)</b> в ответ.",
             reply_markup=ReplyKeyboardRemove()
         )
+        # Мы все равно переходим к GET_NAME, но текст подсказывает пользователю, что делать
+        return GET_NAME 
+
+    else:
+        await update.message.reply_text("Ошибка соединения с сервером. Попробуйте позже /start.")
         return ConversationHandler.END
 
 async def register_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    (Переименовано из register_via_name)
-    Получает ФИО и регистрирует нового клиента через ПУБЛИЧНЫЙ API эндпоинт.
+    Получает ФИО и регистрирует клиента.
+    ИСПРАВЛЕНО: Теперь понимает слова отмены.
     """
-    full_name = update.message.text
+    full_name = update.message.text.strip()
     phone_to_register = context.user_data.get('phone_to_register')
     user = update.effective_user
     chat_id = str(user.id)
 
+    # --- 1. ЗАЩИТА ОТ "ОТМЕНА ПОТОМ НАПИШУ" (РУС + KG) ---
+    stop_words = [
+        # Русский
+        'отмена', 'стоп', 'позже', 'потом', 'нет', 'не хочу', 'cancel', 'назад', 
+        'подожди', 'минутку', 'стой', 'передумал', 'не надо', 'выход',
+        # Кыргызский
+        'жок', 'кийин', 'токто', 'керек эмес', 'азыр эмес', 'күтө тур', 'кой', 'болду', 'чыгуу'
+    ]
+    
+    # Проверка: если хотя бы одно слово найдено в тексте
+    if any(word in full_name.lower() for word in stop_words):
+        await update.message.reply_text(
+            "Хорошо, регистрация отменена. 👌 / Макул, токтоттук.\n\n"
+            "Вы остаетесь в гостевом режиме. Когда будете готовы — нажмите /register.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        context.user_data.pop('phone_to_register', None)
+        return ConversationHandler.END
+    # -------------------------------------------
+
     if not phone_to_register:
-        logger.error(f"Ошибка регистрации для {chat_id}: Не найден phone_to_register в user_data.")
-        await update.message.reply_text("Произошла внутренняя ошибка. Пожалуйста, попробуйте начать сначала с /start.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Произошла ошибка. Начните с /register.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
-    if not full_name or len(full_name) < 2:
-         await update.message.reply_text("Пожалуйста, введите корректное полное имя (ФИО).")
+    if len(full_name) < 2:
+         await update.message.reply_text("Имя слишком короткое. Пожалуйста, введите полное Имя.")
          return GET_NAME 
 
-    logger.info(f"Попытка регистрации: Имя='{full_name}', Телефон='{phone_to_register}', Компания={COMPANY_ID_FOR_BOT}, ChatID={chat_id}")
+    # Далее стандартная логика регистрации...
+    logger.info(f"Попытка регистрации: Имя='{full_name}', Телефон='{phone_to_register}'")
     
     payload = {
         "full_name": full_name,
         "phone": phone_to_register,
-        "company_id": COMPANY_ID_FOR_BOT, # <-- Используем ID, полученный при запуске
-        "telegram_chat_id": chat_id   # <-- Сразу привязываем Telegram
+        "company_id": COMPANY_ID_FOR_BOT,
+        "telegram_chat_id": chat_id,
+        "client_code_prefix": "TG" # Или логика префикса из прошлых шагов
     }
     
-    # --- Вызов API для регистрации ---
     api_response = await api_request("POST", "/api/bot/register_client", json=payload)
 
     if api_response and "error" not in api_response and "id" in api_response:
-        # --- УСПЕХ: Клиент создан ---
         client_data = api_response 
-        
-        # --- Сразу сохраняем данные в user_data ---
         context.user_data['client_id'] = client_data.get("id")
-        context.user_data['is_owner'] = False # Новые клиенты не могут быть Владельцами
+        context.user_data['is_owner'] = False
         context.user_data['full_name'] = client_data.get("full_name")
-        context.user_data['employee_id'] = None
         context.user_data.pop('phone_to_register', None)
-        logger.info(f"Новый клиент успешно зарегистрирован: ID={client_data.get('id')}")
 
         client_code = f"{client_data.get('client_code_prefix', 'TG')}{client_data.get('client_code_num', '?')}"
         
         await update.message.reply_html(
-            f"✅ Регистрация успешна, <b>{full_name}</b>!\n\n"
+            f"✅ <b>Регистрация успешна, {html.escape(full_name)}!</b>\n\n"
             f"Ваш код: <b>{client_code}</b>\n\n"
-            "Теперь используйте меню.",
-            reply_markup=client_main_menu_markup # Новые клиенты всегда получают меню клиента
+            "Теперь вам доступны все функции бота!",
+            reply_markup=client_main_menu_markup
         )
         return ConversationHandler.END
     else:
-        # --- ОШИБКА РЕГИСТРАЦИИ ---
         error_msg = api_response.get("error", "Неизвестная ошибка.") if api_response else "Сервер недоступен."
-        logger.error(f"Ошибка при вызове POST /api/bot/register_client: {error_msg}")
-        await update.message.reply_text(
-            f"К сожалению, произошла ошибка при регистрации: {error_msg}\n"
-            "Попробуйте /start снова.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text(f"Ошибка при регистрации: {error_msg}")
         return ConversationHandler.END
 
 # --- 6. Диалог добавления заказа (ПЕРЕПИСАН НА API) ---
@@ -829,218 +822,356 @@ async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# --- 7. Обработчик текстовых сообщений (МАРШРУТИЗАТОР) ---
+# --- ОБРАБОТЧИКИ ТЕКСТА И ГОЛОСА ---
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обертка для текстовых сообщений."""
+    user_text = update.message.text
+    if not user_text: return
+    # Передаем текст в главную логику
+    await process_text_logic(update, context, user_text)
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обертка для голоса (Google Speech Free)."""
+    voice = await update.message.voice.get_file()
+    # Имя файла
+    path = f"voice_{update.message.id}_{update.effective_user.id}.ogg"
+    
+    try:
+        # 1. Показываем, что бот "слушает" (загружает файл)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_voice")
+        msg = await update.message.reply_text("👂 Слушаю...")
+        
+        # Скачиваем файл
+        await voice.download_to_drive(path)
+        
+        # Импортируем НАШУ НОВУЮ функцию Google
+        from ai_brain import transcribe_audio_google
+        
+        # Распознаем
+        text = await transcribe_audio_google(path)
+        
+        # Удаляем сообщение "Слушаю..."
+        try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+        except: pass
+        
+        if not text: 
+            await update.message.reply_text("🤷‍♂️ Не удалось разобрать слова. Попробуйте четче.")
+            return
+            
+        # 2. Показываем, что услышали
+        await update.message.reply_text(f"🗣 <b>Вы сказали:</b>\n<i>«{text}»</i>", parse_mode=ParseMode.HTML)
+        
+        # 3. САМОЕ ГЛАВНОЕ: Показываем статус "Печатает...", пока ИИ думает
+        # Это даст пользователю понять, что процесс идет
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        
+        # 4. Отправляем текст в главную логику
+        await process_text_logic(update, context, text)
+        
+    except Exception as e:
+        logger.error(f"Voice Error: {e}")
+        await update.message.reply_text("Ошибка обработки голосового.")
+    finally: 
+        # Удаляем скачанный файл
+        if os.path.exists(path): 
+            try: os.remove(path)
+            except: pass
+
+async def notify_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """
-    (ИСПРАВЛЕНО) Проверяет AI-Рубильник перед обработкой произвольного текста.
+    Фоновая задача: отправляет успокаивающие сообщения, если ИИ думает долго.
     """
+    try:
+        # > 3 секунды
+        await asyncio.sleep(3)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await context.bot.send_message(chat_id=chat_id, text="Секундочку, формирую ответ... ✍️")
+
+        # > 10 секунд (3 + 7)
+        await asyncio.sleep(7)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await context.bot.send_message(chat_id=chat_id, text="Собираю информацию, чтобы дать подробный ответ. Подождите немного... 🧐")
+
+        # > 25 секунд (10 + 15)
+        await asyncio.sleep(15)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await context.bot.send_message(chat_id=chat_id, text="Вопрос сложный, но я работаю над ним! Скоро вернусь к вам. ⏳")
+
+    except asyncio.CancelledError:
+        # Задача отменена (значит, ИИ успел ответить), ничего не делаем
+        pass
+
+# --- 7. Обработчик текстовых сообщений (МАРШРУТИЗАТОР) ---
+
+import ast # Добавь этот импорт в начало файла, если его нет!
+
+async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """
+    (ФИНАЛ v22 - UZ/TIMING)
+    Добавлена логика удержания внимания (3с, 10с, 25с) и таймаут (60с).
+    """
+    from ai_tools import TOOLS_SYSTEM_PROMPT
+    import ast
+    import json
+
     user = update.effective_user
-    text = update.message.text
     client_id = context.user_data.get('client_id')
+    employee_id = context.user_data.get('employee_id')
     is_owner = context.user_data.get('is_owner', False)
     chat_id = update.effective_chat.id
-    markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    # --- 1. ПРОВЕРКА АВТОРИЗАЦИИ ---
-    if client_id is None:
-        await update.message.reply_text("Пожалуйста, нажмите /start.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    # --- 2. ОБРАБОТКА КОМАНД МЕНЮ (ИМЕЕТ ПРИОРИТЕТ) ---
-    if text == "👤 Мой профиль": await profile(update, context); return
-    elif text == "🇨🇳 Адреса складов": await china_addresses(update, context); return
-    elif text == "🇰🇬 Наши контакты": await bishkek_contacts(update, context); return
-    elif text == "📦 Мои заказы" and not is_owner: await my_orders(update, context); return
-    elif is_owner:
-        if text == "📦 Все Заказы": await owner_all_orders(update, context); return
-        elif text == "👥 Клиенты": await owner_clients(update, context); return
-        elif text == "🏢 Филиалы": await owner_locations(update, context); return
-        elif text == "📢 Объявление": await owner_broadcast_start(update, context); return
-        elif text == "📊 Статистика": await owner_statistics(update, context); return
-        # Если Владелец нажал кнопку, но она не сработала, AI не нужен
-        return # Выходим после обработки команд меню
-
-    # --- 3. ИИ-ОБРАБОТЧИК (Только для произвольного текста) ---
     
-    # 3.1. КЛЮЧЕВОЙ ШАГ: ПРОВЕРКА AI-РУБИЛЬНИКА
+    # 1. ИНДИКАТОР РЕАКЦИИ
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    if client_id:
+        markup = owner_main_menu_markup if is_owner else client_main_menu_markup
+    else:
+        markup = ReplyKeyboardRemove()
+
+    # 2. МЕНЮ
+    if client_id:
+        if text == "👤 Мой профиль": await profile(update, context); return
+        elif text == "🇨🇳 Адреса складов": await china_addresses(update, context); return
+        elif text == "🇰🇬 Наши контакты": await bishkek_contacts(update, context); return
+        elif text == "📦 Мои заказы" and not is_owner: await my_orders(update, context); return
+        
+        if is_owner:
+            if text == "📦 Все Заказы": await owner_all_orders(update, context); return
+            elif text == "👥 Клиенты": await owner_clients(update, context); return
+            elif text == "🏢 Филиалы": await owner_locations(update, context); return
+            elif text == "📢 Объявление": await owner_broadcast_start(update, context); return
+            elif text == "📊 Статистика": await owner_statistics(update, context); return
+    else:
+        if text in ["👤 Мой профиль", "📦 Мои заказы", "➕ Добавить заказ"]:
+             await update.message.reply_text("Чтобы пользоваться этими функциями, нужно войти. Нажмите /register.", reply_markup=ReplyKeyboardRemove())
+             return
+
+    # 3. ПРОВЕРКА РУБИЛЬНИКА
     if not (await is_ai_enabled()):
-        logger.warning(f"AI-Ассистент отключен. Ответ: 'Неизвестная команда' на '{text}'")
-        await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.", reply_markup=markup)
-        return
-        
-    # --- Если AI ВКЛЮЧЕН, выполняем всю сложную логику ---
-    
-    # 3.2. ЗАПУСКАЕМ СТАТУС "ПЕЧАТАЕТ..." (в цикле)
-    # (Предполагается, что функция keep_typing и execute_ai_tool существуют)
-    # typing_job = context.job_queue.run_repeating(keep_typing, interval=4, first=0, chat_id=chat_id)
-    # Чтобы не вызывать ошибку, если keep_typing не определен, закомментируем его:
-    typing_job = None 
-
-    try:
-        # 3.3. ОПРЕДЕЛЯЕМ ВРЕМЯ (Бишкек UTC+6)
-        now_utc = datetime.now(timezone.utc)
-        now_bishkek = now_utc + timedelta(hours=6)
-        current_date_str = now_bishkek.strftime("%Y-%m-%d") 
-        current_time_str = now_bishkek.strftime("%H:%M")
-        
-        # 3.4. ЛОГИКА ПРИВЕТСТВИЯ (12 часов)
-        last_greeted = context.user_data.get('last_greeted')
-        should_greet = False
-        if not last_greeted or (now_utc - last_greeted).total_seconds() > 12 * 3600:
-            should_greet = True
-            context.user_data['last_greeted'] = now_utc
-            
-        greeting_rule = ""
-        if should_greet:
-            hour = now_bishkek.hour
-            if 5 <= hour < 12: greet_text = "Кутман таң / Доброе утро"
-            elif 12 <= hour < 18: greet_text = "Кутман күн / Добрый день"
-            elif 18 <= hour < 23: greet_text = "Кутман кеч / Добрый вечер"
-            else: greet_text = "Салам / Здравствуйте"
-            greeting_rule = f"👋 ЭТО ПЕРВОЕ СООБЩЕНИЕ ЗА ДЕНЬ. Обязательно поздоровайся ({greet_text})."
+        if not client_id:
+             await update.message.reply_text("Здравствуйте! Для начала работы нажмите /register.", reply_markup=ReplyKeyboardRemove())
         else:
-            greeting_rule = "🚫 НЕ ЗДОРОВАЙСЯ! Мы уже общались недавно. Сразу отвечай на вопрос."
+             await update.message.reply_text("Неизвестная команда. Используйте кнопки.", reply_markup=markup)
+        return
 
+    # 4. АВТО-ПЕРЕХВАТ ТРЕК-КОДОВ
+    potential_tracks = re.findall(r'([a-zA-Z0-9]{8,25})', text)
+    valid_tracks = [t for t in potential_tracks if len(t) >= 8]
 
-        # 3.5. ЗАГРУЗКА ДАННЫХ (Профиль + Заказы)
-        client_profile_str = "Профиль: Ошибка загрузки."
-        orders_str = "Заказы: Ошибка загрузки."
+    if valid_tracks and len(valid_tracks) >= 1:
+        if not client_id:
+            await update.message.reply_text("🧐 Вижу трек-коды, но вы не зарегистрированы. Нажмите /register.", reply_markup=ReplyKeyboardRemove())
+            return
+        
+        await update.message.reply_text(f"🔎 Найдено треков: {len(valid_tracks)}. Обрабатываю...", reply_markup=markup)
+        
+        # ИНДИКАТОР
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         
         try:
-            # А. Получаем профиль клиента
-            client_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
-            if client_data and "id" in client_data:
-                code_full = f"{client_data.get('client_code_prefix', 'KB')}{client_data.get('client_code_num', 'None')}"
-                client_profile_str = (
-                    f"ФИО: {client_data.get('full_name')}\n"
-                    f"КОД КЛИЕНТА: {code_full}\n"
-                    f"ТЕЛЕФОН: {client_data.get('phone')}\n"
-                    f"Роль: {'ВЛАДЕЛЕЦ' if is_owner else 'Клиент'}"
-                )
+            # Ставим таймаут 60 секунд на запрос к серверу
+            api_response = await asyncio.wait_for(
+                api_request("POST", "/api/bot/order_request", json={
+                    "client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "request_text": text
+                }),
+                timeout=60.0
+            )
             
-            # Б. Получаем заказы (Игнорируя 'выданные')
-            orders_resp = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT})
-            if orders_resp and isinstance(orders_resp, list):
-                active = [o for o in orders_resp if o.get('status') != "Выдан"]
-                
-                lines = [f"- {o['track_code']} | {o['status']}" + (f" | {o['comment']}" if o.get('comment') else "") for o in active]
-                total_debt = 0
-                for o in active:
-                    if o.get('status') == "Готов к выдаче":
-                        cost = o.get('calculated_final_cost_som') or o.get('final_cost_som') or 0
-                        total_debt += cost
+            if not api_response or "error" in api_response:
+                err = api_response.get('error', 'Нет ответа') if api_response else 'Нет связи'
+                await update.message.reply_text(f"❌ Ошибка: {err}")
+                return
 
-                orders_str = (
-                    f"Всего заказов в базе: {len(orders_resp)}\n"
-                    f"Активных (в работе): {len(active)}\n"
-                    f"Долг к оплате: {int(total_debt)} сом\n"
-                )
-                if active:
-                    if len(lines) > 15:
-                            orders_str += "Последние 15 активных заказов:\n" + "\n".join(lines[:15]) + "\n...(и другие)"
-                    else:
-                            orders_str += "Список активных:\n" + "\n".join(lines)
-                else:
-                    orders_str += "Нет активных заказов."
+            created = api_response.get("created", 0)
+            assigned = api_response.get("assigned", 0)
+            skipped = api_response.get("skipped", 0)
+            
+            msg = "📋 <b>Результат:</b>\n"
+            if created > 0: msg += f"✅ Создано: {created}\n"
+            if assigned > 0: msg += f"🎉 Присвоено: {assigned}\n"
+            if skipped > 0: msg += f"⚠️ Уже в базе: {skipped}\n"
+            if created == 0 and assigned == 0 and skipped == 0: msg += "Не удалось добавить (возможно, формат неверен)."
+
+            await update.message.reply_html(msg, reply_markup=markup)
+            return 
+
+        except asyncio.TimeoutError:
+             await update.message.reply_text("⚠️ Сервер долго не отвечает. Попробуйте позже.", reply_markup=markup)
+             return
         except Exception as e:
-            logger.error(f"Ошибка сбора контекста: {e}")
+            logger.error(f"Auto-Add Error: {e}")
+            await update.message.reply_text("Сбой при добавлении.", reply_markup=markup)
+            return
 
-        # 3.6. РАБОТА С ПАМЯТЬЮ
-        history = context.user_data.get('dialog_history', [])
-        history.append({"role": "user", "content": text})
-        if len(history) > 10: history = history[-10:]
+    # 5. ПОДГОТОВКА ИИ
+    history = context.user_data.get('dialog_history', [])
+    history.append({"role": "user", "content": text})
+    if len(history) > 10: history = history[-10:]
 
-        # 3.7. СИСТЕМНЫЙ ПРОМПТ (Мозг)
-        # (TOOLS_SYSTEM_PROMPT должен быть импортирован из ai_tools.py)
+    # --- СЫВОРОТКА ПРАВДЫ ---
+    company_info_text = ""
+    try:
+        loc_data = await api_request("GET", "/api/bot/locations", params={"company_id": COMPANY_ID_FOR_BOT})
+        if loc_data:
+            company_info_text += "\n🏢 **НАШИ АДРЕСА:**\n"
+            for loc in loc_data:
+                company_info_text += (
+                    f"📍 {loc.get('name')}\n"
+                    f"   🏠 {loc.get('address', 'Уточняется')}\n"
+                    f"   ⏰ {loc.get('schedule', 'Не указан')}\n"
+                    f"   📞 {loc.get('phone', 'Не указан')}\n\n"
+                )
+        else:
+             company_info_text += "Адреса филиалов пока не настроены.\n"
+
+        rule_keys = ['rule_buyout', 'rule_delivery', 'rule_general']
+        rules_response = await api_request("GET", "/api/bot/settings", params={'company_id': COMPANY_ID_FOR_BOT, 'keys': rule_keys})
+        if rules_response and isinstance(rules_response, list):
+            rules_dict = {r['key']: r['value'] for r in rules_response}
+            if rules_dict.get('rule_buyout'): company_info_text += f"\n🛒 **ВЫКУП:**\n{rules_dict['rule_buyout']}\n"
+            if rules_dict.get('rule_delivery'): company_info_text += f"\n🚚 **ДОСТАВКА:**\n{rules_dict['rule_delivery']}\n"
+            if rules_dict.get('rule_general'): company_info_text += f"\nℹ️ **ИНФО:**\n{rules_dict['rule_general']}\n"
+
+    except Exception:
+        pass
+    
+    current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    if client_id:
+        client_profile_str = "..."
+        orders_str = "..."
+        try:
+            c_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
+            if c_data:
+                 code = f"{c_data.get('client_code_prefix')}{c_data.get('client_code_num')}"
+                 client_profile_str = f"ФИО: {c_data.get('full_name')}\nКод: {code}\nТел: {c_data.get('phone')}"
+            
+            o_data = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "limit": 5})
+            if o_data:
+                 active = [o for o in o_data if o['status'] != 'Выдан']
+                 orders_str = f"Активных заказов: {len(active)}."
+        except: pass
+
         system_role = (
-            f"СЕГОДНЯШНЯЯ ДАТА: {current_date_str} (Время: {current_time_str}).\n"
-            f"Ты — умный помощник карго '{COMPANY_NAME_FOR_BOT}'.\n\n"
-            f"--- 👤 ДОСЬЕ СОБЕСЕДНИКА ---\n{client_profile_str}\n\n"
-            f"--- 📦 ЕГО ЗАКАЗЫ ---\n{orders_str}\n\n"
-            "--- ⚡️ ТВОЯ ЗАДАЧА ---\n"
-            "1. **ЯЗЫК**: Отвечай СТРОГО на том языке, на котором написал клиент (Русский или Кыргызский). Это главное правило.\n"
-            f"2. **ПРИВЕТСТВИЕ**: {greeting_rule}\n"
-            "3. **ДИАЛОГ**: Помни контекст беседы (см. историю сообщений).\n"
-            "4. **СКОРОСТЬ**: ПИШИ КОРОТКО. Никаких 'По моим данным' или 'Согласно системе'. Сразу говори факт.\n"
-            "5. **КОМПЛАЙНС (ЖАЛОБЫ)**: Если в тексте клиента есть сильный негатив, ругательства, угроза уйти, или прямое требование 'позвать менеджера' — добавь в свой ответ на самом конце СЕКРЕТНЫЙ ТЕГ: [ALARM]. Клиент его не увидит, но он нужен для эскалации.\n"
+            f"СЕГОДНЯ: {current_date}. Ты — помощник Cargo CRM.\n"
+            f"КЛИЕНТ:\n{client_profile_str}\n"
+            f"ЗАКАЗЫ: {orders_str}\n"
+            "Твоя цель: Помогать с заказами, отвечать на вопросы."
+        )
+    else:
+        system_role = (
+            f"СЕГОДНЯ: {current_date}. Ты — консультант Cargo CRM.\n"
+            "Твой собеседник — ГОСТЬ.\n"
+            "1. Отвечай на вопросы о ценах (используй `get_shipping_price`) и адресах.\n"
+            "2. Если клиент хочет добавить заказ — говори: 'Нажмите /register'."
         )
 
-        # Если это Владелец -> Добавляем инструменты управления (TOOLS_SYSTEM_PROMPT)
-        if is_owner:
-            # ПРЕДПОЛАГАЕТСЯ, ЧТО TOOLS_SYSTEM_PROMPT ИМПОРТИРОВАН ИЗ ai_tools.py
-            # from ai_tools import TOOLS_SYSTEM_PROMPT
-            system_role += f"\n\n{TOOLS_SYSTEM_PROMPT}" # <-- Добавляем сюда
+    system_role += (
+        f"{company_info_text}\n"
+        f"\n{TOOLS_SYSTEM_PROMPT}"
+    )
 
-        # 3.8. Запрос к ИИ
-        # ПРЕДПОЛАГАЕТСЯ, ЧТО get_ai_response ИМПОРТИРОВАН ИЗ ai_brain.py
-        ai_answer = await get_ai_response(history, system_role) 
-
-        # Сохраняем ответ бота в историю (чистый текст)
+    # 6. ЗАПРОС ИИ (С ТАЙМЕРАМИ)
+    # Запускаем фоновую задачу для отправки "Подождите..."
+    wait_task = asyncio.create_task(notify_progress(context, chat_id))
+    
+    try:
+        # Ставим жесткий таймаут 60 секунд на ответ ИИ
+        ai_answer = await asyncio.wait_for(get_ai_response(history, system_role), timeout=60.0)
+        
+        # Если ИИ ответил - отменяем задачу ожидания
+        wait_task.cancel()
+        
         history.append({"role": "assistant", "content": ai_answer})
         context.user_data['dialog_history'] = history
-        
-        # 3.9. ДЕТЕКТОР ЖАЛОБ (Поиск тега [ALARM])
-        is_complaint = False
-        if "[ALARM]" in ai_answer.upper():
-            ai_answer = ai_answer.replace("[ALARM]", "").strip() 
-            is_complaint = True
-            
-        # 3.10. Обработка команд Владельца (JSON)
-        if is_owner and ("tool" in ai_answer or "confirm_action" in ai_answer):
+
+        # 7. ВЫПОЛНЕНИЕ КОМАНД
+        if "tool" in ai_answer or "confirm_action" in ai_answer:
             try:
-                # Улучшенный парсер для удаления ```json ```
-                clean_answer = ai_answer.replace("```json", "").replace("```", "").strip()
-                json_start = clean_answer.find('{')
-                json_end = clean_answer.rfind('}')
-                
-                if json_start != -1 and json_end != -1:
-                    json_str = clean_answer[json_start:json_end+1]
-                    command = json.loads(json_str)
+                clean_ans = ai_answer.replace("```json", "").replace("```", "").strip()
+                command = None
+                if "{" in clean_ans:
+                    json_start = clean_ans.find('{')
+                    json_end = clean_ans.rfind('}') + 1
+                    json_str = clean_ans[json_start:json_end]
+                    try: command = json.loads(json_str)
+                    except:
+                        try: command = ast.literal_eval(json_str)
+                        except: pass
+
+                if command and isinstance(command, dict) and "tool" in command:
+                    if command['tool'] != 'get_user_orders_json':
+                         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+                    tool_result = await execute_ai_tool(
+                        tool_command=command, 
+                        api_request_func=api_request, 
+                        company_id=COMPANY_ID_FOR_BOT, 
+                        employee_id=employee_id, 
+                        client_id=client_id
+                    )
                     
-                    if "tool" in command:
-                        await update.message.reply_text(f"⚙️ Выполняю: `{command['tool']}`...", parse_mode=ParseMode.MARKDOWN)
-                        
-                        employee_id = context.user_data.get('employee_id')
-                        # ПРЕДПОЛАГАЕТСЯ, ЧТО execute_ai_tool ИМПОРТИРОВАН ИЗ ai_tools.py
-                        tool_result = await execute_ai_tool(command, api_request, COMPANY_ID_FOR_BOT, employee_id)
-                        
-                        # Проверка на кнопки подтверждения (confirm_action)
-                        try:
-                            if tool_result.strip().startswith("{"):
-                                confirm_data = json.loads(tool_result)
-                                if "confirm_action" in confirm_data:
-                                    keyboard = [
-                                        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"ai_confirm_{confirm_data['confirm_action']}")],
-                                        [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
-                                    ]
-                                    context.user_data['ai_pending_action'] = confirm_data
-                                    await update.message.reply_text(confirm_data['message'], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-                                    return
-                            
-                            await update.message.reply_text(tool_result, parse_mode=ParseMode.MARKDOWN)
+                    try:
+                        if is_owner and isinstance(tool_result, str) and tool_result.strip().startswith("{") and "confirm_action" in tool_result:
+                            confirm_data = json.loads(tool_result)
+                            keyboard = [
+                                [InlineKeyboardButton("✅ Подтвердить", callback_data=f"ai_confirm_{confirm_data['confirm_action']}")],
+                                [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
+                            ]
+                            context.user_data['ai_pending_action'] = confirm_data
+                            await update.message.reply_text(confirm_data['message'], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
                             return
-                        except json.JSONDecodeError:
-                            await update.message.reply_text(tool_result, parse_mode=ParseMode.MARKDOWN)
-                            return
-            except Exception as e:
-                logger.error(f"JSON Error: {e}")
-                
-        # 3.11. Отправка ответа (Обычный текст)
+                    except: pass
+                    
+                    final_text = str(tool_result)
+                    try:
+                        if final_text.strip().startswith(("{", "[")):
+                            res_json = json.loads(final_text)
+                            if isinstance(res_json, dict) and "message" in res_json:
+                                final_text = res_json["message"]
+                            elif isinstance(res_json, list): 
+                                formatted_text = ""
+                                for l in res_json:
+                                    nm = l.get("Филиал") or l.get("name") or "Филиал"
+                                    ad = l.get("Адрес") or l.get("address") or ""
+                                    ph = l.get("Телефон") or l.get("phone") or ""
+                                    sch = l.get("График_работы") or l.get("schedule") or ""
+                                    formatted_text += f"📍 <b>{nm}</b>\n🏠 {ad}\n"
+                                    if sch: formatted_text += f"⏰ {sch}\n"
+                                    if ph: formatted_text += f"📞 {ph}\n"
+                                    formatted_text += "\n"
+                                if formatted_text: final_text = formatted_text
+                    except: pass
+                    
+                    await update.message.reply_text(final_text[:4000], parse_mode=ParseMode.HTML)
+                    return
+
+            except Exception as e_tool:
+                logger.error(f"Tool Error: {e_tool}")
+                pass
+
         await update.message.reply_text(ai_answer, reply_markup=markup)
 
-        # 3.12. ФОНОВАЯ ЗАДАЧА: Отправка жалобы Владельцу
-        if is_complaint:
-            # notify_owner_of_complaint должен быть определен/импортирован
-            # await notify_owner_of_complaint(COMPANY_ID_FOR_BOT, client_id, text) 
-             await update.message.reply_text("СЕКРЕТНЫЙ ТЕГ [ALARM] БЫЛ ОБНАРУЖЕН.", reply_markup=markup)
+    except asyncio.TimeoutError:
+        # --- 60 СЕКУНД ИСТЕКЛИ ---
+        wait_task.cancel()
+        logger.error("AI Response Timeout (60s)")
+        
+        # Если есть ссылка на WhatsApp в настройках, можно добавить её в кнопку
+        # Но для надежности просто просим нажать кнопку меню
+        await update.message.reply_text(
+            "⚠️ **По техническим причинам я не могу сейчас подготовить ответ.**\n\n"
+            "Пожалуйста, свяжитесь с нами через оператора:\n"
+            "👉 Нажмите кнопку **«🇰🇬 Наши контакты»** в меню ниже.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup
+        )
 
-
-    finally:
-        # 3.13. ОБЯЗАТЕЛЬНО ОСТАНАВЛИВАЕМ СТАТУС "ПЕЧАТАЕТ"
-        if typing_job:
-            typing_job.schedule_removal()
-    return
+    except Exception as e:
+        wait_task.cancel()
+        logger.error(f"AI Error: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте еще раз.", reply_markup=markup)
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает профиль клиента (или владельца), запрашивая данные через API."""
@@ -1731,7 +1862,7 @@ async def handle_owner_order_search(update: Update, context: ContextTypes.DEFAUL
         "GET", 
         "/api/orders",
         employee_id=employee_id, # <--- Аутентификация
-        params={'q': search_term, 'company_id': COMPANY_ID_FOR_BOT, 'limit': 20}
+        params={'q': search_term, 'company_id': COMPANY_ID_FOR_BOT, 'limit': 1000}
     )
 
     if not api_response or "error" in api_response or not isinstance(api_response, list):
@@ -2194,14 +2325,14 @@ def main() -> None:
     logger.info(f"Запуск бота для компании '{COMPANY_NAME_FOR_BOT}' (ID: {COMPANY_ID_FOR_BOT})...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # --- Диалог Регистрации/Идентификации ---
+    # --- Диалог Регистрации (Теперь по команде /register) ---
     registration_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)], 
+        entry_points=[CommandHandler("register", start_registration)], # <-- ИЗМЕНЕНО
         states={
             ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_input)],
             GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_get_name)],
         },
-        fallbacks=[CommandHandler('cancel', cancel_dialog), MessageHandler(filters.Regex('^Отмена$'), cancel_dialog)],
+        fallbacks=[CommandHandler('cancel', cancel_dialog)],
         per_user=True, per_chat=True, name="registration",
     )
     
@@ -2277,7 +2408,8 @@ def main() -> None:
     )
     
     # --- Регистрация обработчиков ---
-    
+    # Обработчик /start теперь стоит ОТДЕЛЬНО (чтобы не блокировать ИИ)
+    application.add_handler(CommandHandler("start", start))
     # Сначала диалоги (они имеют приоритет)
     application.add_handler(registration_conv)
     application.add_handler(add_order_conv)
@@ -2305,6 +2437,9 @@ def main() -> None:
 
     # Обработчик ВСЕХ ОСТАЛЬНЫХ текстовых сообщений (меню)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    # Обработка Голоса (НОВОЕ)
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
     logger.info(f"Бот (ID: {COMPANY_ID_FOR_BOT}) запущен и готов к работе...")
     application.run_polling()
