@@ -67,31 +67,6 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             return # Выходим, если ID чата нет
         track_codes_str = "\n".join([f"<code>{code}</code>" for code in track_codes])
 
-        # --- (Задача 3-Б) Получаем историю статусов ---
-        history_str = ""
-        if track_codes:
-            first_track_code = track_codes[0]
-            # Ищем ОДИН заказ, чтобы получить его ID
-            order_for_history = db.query(Order.id).filter(
-                Order.track_code == first_track_code,
-                Order.client_id == client.id,
-                Order.company_id == client.company_id
-            ).first()
-            
-            if order_for_history:
-                history_entries = db.query(OrderHistory).filter(
-                    OrderHistory.order_id == order_for_history.id
-                ).order_by(OrderHistory.created_at.asc()).all()
-                
-                if history_entries:
-                    history_str = "\n<b>⏳ История статусов:</b>\n"
-                    bishkek_tz = timezone(timedelta(hours=6)) # UTC+6
-                    for entry in history_entries:
-                        bishkek_date = entry.created_at.astimezone(bishkek_tz)
-                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
-                        history_str += f"<i>- {hist_date}: {entry.status}</i>\n"
-        # --- Конец (Задача 3-Б) ---
-
         # --- Получаем токен бота ИЗ КОМПАНИИ клиента (Используем нашу 'db') ---
         company_bot_token = None
         if client.company_id:
@@ -107,10 +82,6 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
         if not company_bot_token:
             return
         # --- Конец блока получения токена ---
-
-        # --- Блок загрузки контактов и генерации ссылки на ЛК (Используем нашу 'db') ---
-        phone_setting = db.query(Setting).filter(Setting.key == 'contact_phone', Setting.company_id == client.company_id).first()
-        phone = phone_setting.value if phone_setting and phone_setting.value else "Телефон не указан"
         
         secret_token = f"CLIENT-{client.id}-COMPANY-{client.company_id}-SECRET"
         client_portal_base_url = os.getenv("CLIENT_PORTAL_URL", "http://ВАШ_ДОМЕН_ИЛИ_IP/lk.html") 
@@ -128,6 +99,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
 
         location_name = "Наш офис"
         location_address = "Адрес уточняется у менеджера"
+        phone = "Телефон не указан" # <-- Значение по умолчанию
         total_cost = 0
         total_weight = 0
 
@@ -136,6 +108,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
             if first_order.location:
                 location_name = first_order.location.name 
                 location_address = first_order.location.address or f"Филиал '{location_name}' (адрес не указан)"
+                phone = first_order.location.phone or "Телефон не указан" # <-- Получаем телефон из филиала
             
             for order in orders_in_db:
                 total_cost += order.calculated_final_cost_som or 0
@@ -153,7 +126,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"Спешим сообщить, что ваши заказы уже прибыли в наш филиал <b>'{location_name}'</b> и очень ждут вас!\n\n"
                 f"<b>Трек-коды:</b>\n{track_codes_str}\n\n"
                 f"<b>Статус:</b> ✅ <b>{new_status}</b> ✅\n" # <-- Убрал \n\n
-                f"{history_str}\n" # <-- ДОБАВЛЕНО
+                
                 f"{weight_str}"
                 f"{cost_str}"
                 f"📍 <b>Забрать можно здесь:</b>\n{location_address}\n\n" 
@@ -166,7 +139,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"Ваши заказы уже мчатся к вам! 🚚💨\n\n"
                 f"<b>Статус отправлений:</b>\n{track_codes_str}\n\n"
                 f"...изменился на: ➡️ <b>{new_status}</b>\n" # <-- Убрал \n\n
-                f"{history_str}\n" # <-- ДОБАВЛЕНО
+                
                 f"Мы сообщим, как только они прибудут! 🥳\nСледить за заказами можно в <a href='{lk_link}'>личном кабинете</a>."
             )
         
@@ -175,7 +148,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"Отличные новости! 🤩 Ваши заказы прибыли на наш склад в Кыргызстане!\n\n"
                 f"<b>Статус посылок:</b>\n{track_codes_str}\n\n"
                 f"...изменился на: 🇰🇬 <b>{new_status}</b> 🇰🇬\n" # <-- Убрал \n\n
-                f"{history_str}\n" # <-- ДОБАВЛЕНО
+                
                 f"Сейчас мы их сортируем и скоро они будут готовы к выдаче! 🚀\n"
                 f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
             )
@@ -185,7 +158,7 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"Обновление по вашим заказам! 📄\n\n"
                 f"<b>Новый статус для:</b>\n{track_codes_str}\n\n"
                 f"➡️ <b>{new_status}</b>\n" # <-- Убрал \n\n
-                f"{history_str}\n" # <-- ДОБАВЛЕНО
+                
                 f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
             )
         # --- Конец формирования сообщения ---
@@ -1286,6 +1259,103 @@ def update_location(
         import traceback
         print(f"!!! Ошибка при обновлении филиала ID {location_id}:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка базы данных при обновлении филиала: {e}")
+    
+@app.delete("/api/employees/{employee_id}", tags=["Персонал (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
+def delete_employee(
+    employee_id: int,
+    employee: Employee = Depends(get_company_owner), # Только Владелец
+    db: Session = Depends(get_db)
+):
+    """Удаляет сотрудника, если он не используется."""
+    
+    # 1. Найти сотрудника
+    target_employee = db.query(Employee).options(joinedload(Employee.role)).filter(
+        Employee.id == employee_id,
+        Employee.company_id == employee.company_id
+    ).first()
+
+    if not target_employee:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден в вашей компании.")
+
+    # 2. Проверка на удаление Владельца
+    if target_employee.role.name == 'Владелец':
+        active_owners_count = db.query(Employee).filter(
+            Employee.company_id == employee.company_id,
+            Employee.is_active == True,
+            Employee.role.has(name='Владелец')
+        ).count()
+        if active_owners_count <= 1 and target_employee.is_active:
+            raise HTTPException(status_code=400, detail="Нельзя удалить единственного активного Владельца компании.")
+
+    # 3. Проверка зависимостей
+    # A. Смены
+    shift_count = db.query(Shift).filter(Shift.employee_id == employee_id).count()
+    if shift_count > 0:
+        raise HTTPException(status_code=400, detail=f"Нельзя удалить: {shift_count} смен (включая закрытые) привязаны к этому сотруднику.")
+
+    # B. История заказов (отвязываем, а не блокируем)
+    history_count = db.query(OrderHistory).filter(OrderHistory.employee_id == employee_id).count()
+    if history_count > 0:
+        print(f"[Delete Employee] Отвязка {history_count} записей истории от сотрудника {employee_id}...")
+        db.query(OrderHistory).filter(OrderHistory.employee_id == employee_id).update({"employee_id": None}, synchronize_session=False)
+
+    # 4. Удаление
+    try:
+        db.delete(target_employee)
+        db.commit()
+        print(f"[Delete Employee] Владелец {employee.full_name} удалил сотрудника {target_employee.full_name} (ID: {employee_id})")
+        return None
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Delete Employee] Ошибка БД при удалении {employee_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при удалении: {e}")
+    
+@app.delete("/api/locations/{location_id}", tags=["Персонал (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
+def delete_location(
+    location_id: int,
+    employee: Employee = Depends(get_company_owner), # Только Владелец
+    db: Session = Depends(get_db)
+):
+    """Удаляет филиал, если он не используется."""
+    
+    # 1. Найти филиал
+    location = db.query(Location).filter(
+        Location.id == location_id,
+        Location.company_id == employee.company_id
+    ).first()
+    
+    if not location:
+        raise HTTPException(status_code=404, detail="Филиал не найден в вашей компании.")
+        
+    if location.name == "Главный филиал":
+        raise HTTPException(status_code=400, detail="Нельзя удалить 'Главный филиал'. Вы можете его переименовать.")
+
+    # 2. Проверка зависимостей
+    # A. Сотрудники
+    employee_count = db.query(Employee).filter(Employee.location_id == location_id).count()
+    if employee_count > 0:
+        raise HTTPException(status_code=400, detail=f"Нельзя удалить: {employee_count} сотрудников привязаны к этому филиалу.")
+        
+    # B. Смены
+    shift_count = db.query(Shift).filter(Shift.location_id == location_id).count()
+    if shift_count > 0:
+        raise HTTPException(status_code=400, detail=f"Нельзя удалить: {shift_count} смен (включая закрытые) привязаны к этому филиалу.")
+
+    # C. Заказы
+    order_count = db.query(Order).filter(Order.location_id == location_id).count()
+    if order_count > 0:
+        raise HTTPException(status_code=400, detail=f"Нельзя удалить: {order_count} заказов привязаны к этому филиалу.")
+        
+    # 3. Удаление
+    try:
+        db.delete(location)
+        db.commit()
+        print(f"[Delete Location] Владелец {employee.full_name} удалил филиал {location.name} (ID: {location_id})")
+        return None
+    except Exception as e:
+        db.rollback()
+        logger.error(f"!!! [Delete Location] Ошибка БД при удалении {location_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при удалении: {e}")
 
 @app.get("/api/employees", tags=["Персонал (Владелец)"], response_model=List[EmployeeOut])
 def get_employees(
@@ -2687,7 +2757,9 @@ def bulk_order_action(
         print(f"[Notification] Найдено {len(notifications_to_send)} клиентов для массовой рассылки.")
         # --- КОНЕЦ Группировки ---
 
-        count = query.update({"status": new_status}, synchronize_session='fetch')
+        # 'fetch' обновляет объекты в сессии, что ломает нашу проверку 'order.status != new_status'
+        # 'False' (по умолчанию) просто выполняет UPDATE и не трогает сессию.
+        count = query.update({"status": new_status}, synchronize_session=False)
         
         # (Задача 3) Добавляем записи в историю
         if count > 0:
@@ -2744,7 +2816,7 @@ def bulk_order_action(
             count = query.update({
                 "status": "Выкуплен", 
                 "buyout_actual_rate": payload.buyout_actual_rate
-            }, synchronize_session='fetch')
+            }, synchronize_session=False) # Используем False
 
             # (Задача 3) Добавляем записи в историю
             if count > 0:
@@ -2754,7 +2826,7 @@ def bulk_order_action(
                         status="Выкуплен",
                         employee_id=employee.id
                     )
-                    for order in orders_to_action # 'orders_to_action' уже загружены
+                    for order in orders_to_action # 'orders_to_action' все еще содержат старые данные
                 ]
                 db.bulk_save_objects(history_entries)
 
@@ -2764,6 +2836,20 @@ def bulk_order_action(
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Ошибка базы данных при массовом выкупе: {e}")
 
+    # (Задача 3) Добавляем записи в историю для обновленных заказов
+        if count > 0:
+            history_entries = [
+                OrderHistory(
+                    order_id=order_id,
+                    status=new_status, # Статус (например, "В пути")
+                    employee_id=employee.id
+                )
+                for order_id in ids_to_update # ids_to_update содержит ID тех, кому МЕНЯЕМ клиента
+            ]
+            db.bulk_save_objects(history_entries)
+        
+        db.commit()
+    
     # --- ИСПРАВЛЕННЫЙ БЛОК 'assign_client' (v3.2) ---
     elif payload.action == 'assign_client':
         
