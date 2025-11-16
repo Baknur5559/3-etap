@@ -16,7 +16,8 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, date
 import json # <-- Добавляем json
 from ai_brain import get_ai_response
-from ai_tools import TOOLS_SYSTEM_PROMPT, execute_ai_tool # <-- Добавляем инструменты
+from ai_tools import execute_ai_tool # <-- Убрали старый промпт
+from ai_brain import AI_SYSTEM_PROMPT # <-- Добавили НОВЫЙ промпт "АЗЕМ"
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -303,6 +304,28 @@ def identify_bot_company() -> None:
         print("="*50)
         sys.exit(1)
 
+async def check_restart_or_get_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """
+    (CRITICAL) Проверяет, был ли бот перезапущен (потеря context.user_data).
+    Если да, просит пользователя нажать /start.
+    Если нет, возвращает client_id.
+    """
+    client_id = context.user_data.get('client_id')
+    
+    if client_id is None:
+        # (Проверяем, что это не /start или /register, хотя сюда они и так не попадут)
+        text = update.message.text if update.message else ""
+        if text not in ['/start', '/register']:
+            logger.warning(f"[Restart Check] client_id отсутствует для Chat ID {update.effective_user.id}. Просим нажать /start.")
+            await update.message.reply_html(
+                "<b>Бот был обновлен!</b> 🚀\n\n"
+                "Пожалуйста, нажмите /start, чтобы обновить ваше меню и продолжить работу.",
+                reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
+            )
+        return None # Возвращаем None, сигнализируя о сбое
+    
+    return client_id # Возвращаем ID, если все в порядке
+
 
 # --- 5. Диалог Регистрации (ПОЛНОСТЬЮ ПЕРЕПИСАН) ---
 
@@ -335,7 +358,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         markup = owner_main_menu_markup if is_owner else client_main_menu_markup
         role_text = " (Владелец)" if is_owner else ""
         await update.message.reply_html(
-            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас видеть! Используйте меню.",
+            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас видеть! Используйте меню или напишите что вы хотите наш ИИ менеджер ответит на все ваши вопросы.",
             reply_markup=markup
         )
     else:
@@ -497,10 +520,11 @@ async def register_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def add_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Начинает диалог добавления заказа, спрашивает филиал (через API)."""
-    client_id = context.user_data.get('client_id')
-    if not client_id:
-        await update.message.reply_text("Ошибка: Сначала нужно идентифицироваться. Нажмите /start.")
-        return ConversationHandler.END 
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return ConversationHandler.END
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     logger.info(f"Пользователь {client_id} начинает добавление заказа для компании {COMPANY_ID_FOR_BOT}.")
 
@@ -824,13 +848,6 @@ async def save_order_from_bot(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- ОБРАБОТЧИКИ ТЕКСТА И ГОЛОСА ---
 
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обертка для текстовых сообщений."""
-    user_text = update.message.text
-    if not user_text: return
-    # Передаем текст в главную логику
-    await process_text_logic(update, context, user_text)
-
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обертка для голоса (Google Speech Free)."""
     voice = await update.message.voice.get_file()
@@ -870,13 +887,28 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await process_text_logic(update, context, text)
         
     except Exception as e:
-        logger.error(f"Voice Error: {e}")
+        # --- (ИСПРАВЛЕНО) УЛУЧШЕННОЕ ЛОГИРОВАНИЕ ---
+        import traceback
+        logger.error(f"!!! [Voice Error] Произошла критическая ошибка при обработке голоса:")
+        logger.error(traceback.format_exc()) # <-- ЭТО ПОКАЖЕТ НАМ ПРИЧИНУ
+        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
         await update.message.reply_text("Ошибка обработки голосового.")
     finally: 
         # Удаляем скачанный файл
         if os.path.exists(path): 
             try: os.remove(path)
             except: pass
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    (ВОССТАНОВЛЕНО) Обертка для текстовых сообщений.
+    Извлекает текст и передает его в process_text_logic.
+    """
+    user_text = update.message.text
+    if not user_text: 
+        return
+    # Передаем текст в главную логику
+    await process_text_logic(update, context, user_text.strip())
 
 async def notify_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """
@@ -886,7 +918,7 @@ async def notify_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         # > 3 секунды
         await asyncio.sleep(3)
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        await context.bot.send_message(chat_id=chat_id, text="Секундочку, формирую ответ... ✍️")
+        await context.bot.send_message(chat_id=chat_id, text="Секундочку, печатаю... ✍️")
 
         # > 10 секунд (3 + 7)
         await asyncio.sleep(7)
@@ -910,11 +942,18 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """
     (ФИНАЛ v22 - UZ/TIMING)
     (v6.4 - Исправлено форматирование get_user_orders_json)
+    (v6.6 - ИСПРАВЛЕНА СИГНАТУРА: 'text: str' ВОЗВРАЩЕН)
     """
-    from ai_tools import TOOLS_SYSTEM_PROMPT
+    from ai_brain import AI_SYSTEM_PROMPT # <-- (ИСПРАВЛЕНО) Импортируем "АЗЕМА"
     import ast
     import json
     import html # Убедись, что этот импорт есть вверху файла
+
+    # --- (ИСПРАВЛЕНИЕ) Текст 'text' теперь приходит как аргумент ---
+    if not text:
+        logger.warning("process_text_logic получила пустой текст. Игнорируем.")
+        return # Если текст пустой, выходим
+    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
 
     user = update.effective_user
     client_id = context.user_data.get('client_id')
@@ -923,6 +962,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     chat_id = update.effective_chat.id
     
     # === НАЧАЛО: ПРОВЕРКА ПЕРЕЗАПУСКА (v6.3) ===
+    # (Эта проверка теперь использует 'text', который пришел как аргумент)
     if client_id is None and text.strip() not in ['/start', '/register']:
         logger.warning(f"[Restart Check] client_id отсутствует для Chat ID {user.id}. Вероятен перезапуск. Просим нажать /start.")
         await update.message.reply_html(
@@ -941,23 +981,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         markup = ReplyKeyboardRemove()
 
-    # 2. МЕНЮ
-    if client_id:
-        if text == "👤 Мой профиль": await profile(update, context); return
-        elif text == "🇨🇳 Адреса складов": await china_addresses(update, context); return
-        elif text == "🇰🇬 Наши контакты": await bishkek_contacts(update, context); return
-        elif text == "📦 Мои заказы" and not is_owner: await my_orders(update, context); return
-        
-        if is_owner:
-            if text == "📦 Все Заказы": await owner_all_orders(update, context); return
-            elif text == "👥 Клиенты": await owner_clients(update, context); return
-            elif text == "🏢 Филиалы": await owner_locations(update, context); return
-            elif text == "📢 Объявление": await owner_broadcast_start(update, context); return
-            elif text == "📊 Статистика": await owner_statistics(update, context); return
-    else:
-        if text in ["👤 Мой профиль", "📦 Мои заказы", "➕ Добавить заказ"]:
-             await update.message.reply_text("Чтобы пользоваться этими функциями, нужно войти. Нажмите /register.", reply_markup=ReplyKeyboardRemove())
-             return
+    # (Блок #2. МЕНЮ был удален в прошлом рефакторинге - это ПРАВИЛЬНО)
 
     # 3. ПРОВЕРКА РУБИЛЬНИКА
     if not (await is_ai_enabled()):
@@ -1049,25 +1073,35 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         c_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
         if c_data:
-             code = f"{c_data.get('client_code_prefix')}{c_data.get('client_code_num')}"
+             code = f"{c_data.get('client_code_prefix','')}{c_data.get('client_code_num','')}"
              client_profile_str = f"ФИО: {c_data.get('full_name')}\nКод: {code}\nТел: {c_data.get('phone')}"
         
-        o_data = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "limit": 5})
-        if o_data:
-             active = [o for o in o_data if o['status'] != 'Выдан']
-             orders_str = f"Активных заказов: {len(active)}."
+        # --- (ИСПРАВЛЕНО) Запрашиваем АКТУАЛЬНЫЕ статусы (как в 'my_orders') ---
+        active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
+        o_data = await api_request("GET", "/api/orders", params={
+            "client_id": client_id, 
+            "company_id": COMPANY_ID_FOR_BOT, 
+            "statuses": active_statuses, # <-- Используем фильтр статусов
+            "limit": 50 # <-- Увеличиваем лимит
+        })
+        if o_data and isinstance(o_data, list):
+             orders_str = f"Активных заказов: {len(o_data)}."
+        else:
+             orders_str = "Активных заказов: 0."
+        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
     except: pass
 
-    system_role = (
-        f"СЕГОДНЯ: {current_date}. Ты — помощник Cargo CRM.\n"
+    # (ИСПРАВЛЕНО) Используем AI_SYSTEM_PROMPT ("АЗЕМ") и форматируем его
+    system_role = AI_SYSTEM_PROMPT.format(company_name=COMPANY_NAME_FOR_BOT)
+    
+    # Добавляем "Сыворотку Правды" (контекст)
+    system_role += (
+        f"\n\n--- КОНТЕКСТ ДИАЛОГА ---\n"
+        f"СЕГОДНЯ: {current_date}.\n"
         f"КЛИЕНТ:\n{client_profile_str}\n"
         f"ЗАКАЗЫ: {orders_str}\n"
-        "Твоя цель: Помогать с заказами, отвечать на вопросы."
-    )
-
-    system_role += (
         f"{company_info_text}\n"
-        f"\n{TOOLS_SYSTEM_PROMPT}"
+        f"--- КОНЕЦ КОНТЕКСТА ---"
     )
 
     # 6. ЗАПРОС ИИ (С ТАЙМЕРАМИ)
@@ -1127,27 +1161,75 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             
                             # === НАЧАЛО ИСПРАВЛЕНИЯ (v6.4) ===
                             elif isinstance(res_json, dict) and "active_orders" in res_json:
-                                # Форматируем ответ от get_user_orders_json
-                                orders = res_json["active_orders"]
+                                # (v2.0) Форматируем ответ от get_user_orders_json с историей и группировкой
+                                orders = res_json.get("active_orders", [])
                                 if not orders:
                                     final_text = "У вас пока нет активных заказов. 🚚"
                                 else:
-                                    formatted_text = "📦 <b>Ваши текущие заказы:</b>\n\n"
-                                    for o in orders:
-                                        formatted_text += f"<b>Трек:</b> <code>{o.get('трек', '?')}</code>\n"
-                                        formatted_text += f"<b>Статус:</b> {o.get('статус', '?')}\n"
-                                        comment = o.get('комментарий')
-                                        if comment:
-                                            # Используем html.escape для безопасности
-                                            formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
+                                    # Группировка
+                                    active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
+                                    grouped_orders = {}
+                                    for status in active_statuses:
+                                        grouped_orders[status] = []
+                                    for order in orders:
+                                        status = order.get('статус', 'В обработке')
+                                        if status in grouped_orders:
+                                            grouped_orders[status].append(order)
+
+                                    formatted_text = "📦 <b>Ваши текущие заказы:</b>\n"
+                                    has_orders_in_message = False
+                                    bishkek_tz = timezone(timedelta(hours=6)) # Часовой пояс Бишкека 
+
+                                    for status, status_orders in grouped_orders.items():
+                                        if not status_orders:
+                                            continue
                                         
-                                        calc_weight = o.get('расчет_вес_кг')
-                                        calc_cost = o.get('расчет_сумма_сом')
-                                        if calc_weight is not None and calc_cost is not None:
-                                            formatted_text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+                                        has_orders_in_message = True
+                                        formatted_text += f"\n\n═════ <b>{status.upper()}</b> ({len(status_orders)} шт) ═════\n\n"
+
+                                        for o in status_orders:
+                                            formatted_text += f"<b>Трек:</b> <code>{o.get('трек', '?')}</code>\n"
+                                            # formatted_text += f"<b>Статус:</b> {o.get('статус', '?')}\n"
+                                            comment = o.get('комментарий')
+                                            if comment:
+                                                formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
                                             
-                                        formatted_text += "──────────────\n"
+                                            calc_weight = o.get('расчет_вес_кг')
+                                            calc_cost = o.get('расчет_сумма_сом')
+                                            if calc_weight is not None and calc_cost is not None:
+                                                formatted_text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+                                            
+                                            # --- НОВАЯ ЛОГИКА: Показ истории (v3.0 - Дедупликация) ---
+                                            history = o.get('history_entries', [])
+                                            if history:
+                                                formatted_text += "<b>История:</b>\n"
+                                                try:
+                                                    # --- (НОВЫЙ БЛОК) ---
+                                                    latest_status_map = {}
+                                                    for entry in history:
+                                                        entry_status = entry.get('status')
+                                                        # (AI tool уже конвертировал дату в строку .isoformat())
+                                                        entry['parsed_date'] = datetime.fromisoformat(entry.get('date').replace('Z', '+00:00'))
+                                                        latest_status_map[entry_status] = entry # Перезаписываем
+
+                                                    filtered_history = latest_status_map.values()
+                                                    sorted_filtered_history = sorted(filtered_history, key=lambda e: e['parsed_date'])
+                                                    # --- (КОНЕЦ НОВОГО БЛОКА) ---
+
+                                                    for entry in sorted_filtered_history: # <-- Используем отфильтрованный список
+                                                        bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
+                                                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
+                                                        formatted_text += f"  <i>- {hist_date}: {entry.get('status')}</i>\n"
+                                                except Exception as e_hist:
+                                                    logger.warning(f"Ошибка парсинга даты истории (AI format): {e_hist}")
+                                                    formatted_text += "  <i>- (ошибка отображения истории)</i>\n"
+                                            # --- КОНЕЦ ИСТОРИИ ---
+
+                                            formatted_text += "──────────────\n"
                                     
+                                    if not has_orders_in_message:
+                                         formatted_text = "У вас пока нет активных заказов. 🚚"
+
                                     if len(formatted_text) > 4000:
                                          formatted_text = formatted_text[:4000] + "\n... (список слишком длинный)"
                                     final_text = formatted_text
@@ -1166,16 +1248,35 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     if ph: formatted_text += f"📞 {ph}\n"
                                     formatted_text += "\n"
                                 if formatted_text: final_text = formatted_text
-                    except: pass
+                            
+                            # --- (НОВЫЙ БЛОК ELSE) ---
+                            else:
+                                # Если JSON не подошел ни под один формат (например, это {"error": "..."})
+                                # Просто берем его как текст, он уже содержит сообщение об ошибке.
+                                final_text = str(tool_result)
+                            # --- (КОНЕЦ НОВОГО БЛОКА) ---
+
+                    except Exception as e_json:
+                        # (ИСПРАВЛЕНО) Если не JSON, просто используем как текст
+                        logger.warning(f"Tool result was not JSON ({e_json}), using raw text.")
+                        final_text = str(tool_result) 
+                    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
                     
                     await update.message.reply_text(final_text[:4000], parse_mode=ParseMode.HTML)
                     return
 
             except Exception as e_tool:
-                logger.error(f"Tool Error: {e_tool}")
-                pass
-
-        await update.message.reply_text(ai_answer, reply_markup=markup)
+                # (ИСПРАВЛЕНО) Отправляем ошибку пользователю
+                logger.error(f"!!! [Tool Error] Ошибка при выполнении execute_ai_tool: {e_tool}", exc_info=True)
+                await update.message.reply_html(
+                    f"⚠️ <b>Произошла ошибка при выполнении команды.</b>\n"
+                    f"<i>Техническая деталь: {html.escape(str(e_tool))}</i>"
+                )
+                return # <-- (ВАЖНО) Выходим, чтобы не отправить ai_answer
+        
+        # (ИСПРАВЛЕНО) Этот блок теперь НЕ ДОЛЖЕН отправлять ai_answer, если был вызван инструмент
+        # (Мы уже вышли через 'return' внутри блока `if command...`)
+        await update.message.reply_html(ai_answer, reply_markup=markup)
 
     except asyncio.TimeoutError:
         wait_task.cancel()
@@ -1185,24 +1286,25 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "⚠️ **По техническим причинам я не могу сейчас подготовить ответ.**\n\n"
             "Пожалуйста, свяжитесь с нами через оператора:\n"
             "👉 Нажмите кнопку **«🇰🇬 Наши контакты»** в меню ниже.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             reply_markup=markup
         )
 
     except Exception as e:
         wait_task.cancel()
         logger.error(f"AI Error: {e}")
-        await update.message.reply_text("Произошла ошибка. Попробуйте еще раз.", reply_markup=markup)
+        await update.message.reply_html("<b>Произошла ошибка.</b> Попробуйте еще раз.", reply_markup=markup)
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает профиль клиента (или владельца), запрашивая данные через API."""
-    client_id = context.user_data.get('client_id')
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
-
-    if not client_id:
-         await update.message.reply_text("Ошибка: Не удалось определить профиль. Попробуйте /start.", reply_markup=markup)
-         return
 
     logger.info(f"Запрос профиля для клиента {client_id}")
     api_response_client = await api_request("GET", f"/api/clients/{client_id}", params={'company_id': COMPANY_ID_FOR_BOT})
@@ -1238,10 +1340,16 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = [[InlineKeyboardButton("Перейти в Личный Кабинет", url=lk_url)]]
         await update.message.reply_text("Ссылка на ваш Личный Кабинет:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает активные заказы ОБЫЧНОГО КЛИЕНТА через API."""
-    client_id = context.user_data.get('client_id')
+    """
+    (ВЕРСИЯ 2.0) Показывает активные заказы КЛИЕНТА, сгруппированные по статусу и с историей.
+    """
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     markup = client_main_menu_markup # Эта функция только для клиентов
 
     logger.info(f"Запрос 'Мои заказы' для клиента {client_id}")
@@ -1252,7 +1360,8 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     params = {
         'client_id': client_id,
         'statuses': active_statuses,
-        'company_id': COMPANY_ID_FOR_BOT
+        'company_id': COMPANY_ID_FOR_BOT,
+        'limit': 50 # (Увеличим лимит для группировки)
     }
     api_response = await api_request("GET", "/api/orders", params=params)
 
@@ -1266,31 +1375,96 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=markup)
         return
 
-    message = "📦 <b>Ваши текущие заказы:</b>\n\n"
-    for order in sorted(active_orders, key=lambda o: o.get('id', 0), reverse=True):
-        message += f"<b>Трек:</b> <code>{order.get('track_code', '?')}</code>\n"
-        message += f"<b>Статус:</b> {order.get('status', '?')}\n"
-        comment = order.get('comment')
-        if comment:
-            message += f"<b>Примечание:</b> {html.escape(comment)}\n"
+    # --- НОВАЯ ЛОГИКА: Группировка по статусу ---
+    grouped_orders = {}
+    for status in active_statuses:
+        grouped_orders[status] = []
+
+    for order in active_orders:
+        status = order.get('status', 'В обработке')
+        if status in grouped_orders:
+            grouped_orders[status].append(order)
+    # --- КОНЕЦ ГРУППИРОВКИ ---
+
+    message = "📦 <b>Ваши текущие заказы:</b>\n"
+    has_orders_in_message = False
+
+    # Часовой пояс Бишкека (UTC+6)
+    bishkek_tz = timezone(timedelta(hours=6)) 
+
+    for status, orders in grouped_orders.items():
+        if not orders:
+            continue
         
-        # Показ расчета, если он есть
-        calc_weight = order.get('calculated_weight_kg')
-        calc_cost = order.get('calculated_final_cost_som')
-        if calc_weight is not None and calc_cost is not None:
-            message += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+        has_orders_in_message = True
+        # Добавляем заголовок группы
+        message += f"\n\n═════ <b>{status.upper()}</b> ({len(orders)} шт) ═════\n\n"
+        
+        for order in sorted(orders, key=lambda o: o.get('id', 0), reverse=True):
+            message += f"<b>Трек:</b> <code>{order.get('track_code', '?')}</code>\n"
+            # message += f"<b>Статус:</b> {order.get('status', '?')}\n"
             
-        message += "──────────────\n"
+            comment = order.get('comment')
+            if comment:
+                message += f"<b>Примечание:</b> {html.escape(comment)}\n"
+            
+            # Показ расчета, если он есть
+            calc_weight = order.get('calculated_weight_kg')
+            calc_cost = order.get('calculated_final_cost_som')
+            if calc_weight is not None and calc_cost is not None:
+                message += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+
+            # --- НОВАЯ ЛОГИКА: Показ истории (v3.0 - Дедупликация) ---
+            history = order.get('history_entries', [])
+            if history:
+                message += "<b>История:</b>\n"
+                try:
+                    # --- (НОВЫЙ БЛОК) ---
+                    # 1. Создаем словарь, чтобы хранить ПОСЛЕДНЮЮ запись для каждого статуса
+                    latest_status_map = {}
+                    for entry in history:
+                        # (datetime.fromisoformat нужен для сортировки)
+                        entry_status = entry.get('status')
+                        entry['parsed_date'] = datetime.fromisoformat(entry.get('created_at').replace('Z', '+00:00')) # Сохраняем дату
+                        latest_status_map[entry_status] = entry # Перезаписываем старые
+
+                    # 2. Получаем отфильтрованный список (значения словаря)
+                    filtered_history = latest_status_map.values()
+                    
+                    # 3. Сортируем по дате, так как словарь мог нарушить порядок
+                    sorted_filtered_history = sorted(filtered_history, key=lambda e: e['parsed_date'])
+                    # --- (КОНЕЦ НОВОГО БЛОКА) ---
+
+                    for entry in sorted_filtered_history: # <-- Используем отфильтрованный список
+                        # Конвертируем UTC в Бишкек
+                        bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
+                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
+                        message += f"  <i>- {hist_date}: {entry.get('status')}</i>\n"
+                except Exception as e_hist:
+                    logger.warning(f"Ошибка парсинга даты истории (my_orders): {e_hist}")
+                    message += "  <i>- (ошибка отображения истории)</i>\n"
+            # --- КОНЕЦ ИСТОРИИ ---
+                
+            message += "──────────────\n"
+
+    if not has_orders_in_message:
+        await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=markup)
+        return
 
     if len(message) > 4000:
-         message = message[:4000] + "\n... (список слишком длинный)"
+         message = message[:4000] + "\n... (список слишком длинный, показаны не все заказы)"
 
     await update.message.reply_html(message, reply_markup=markup)
 
 
 async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает адрес склада в Китае, (через API)."""
-    client_id = context.user_data.get('client_id')
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
@@ -1358,12 +1532,15 @@ async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error(f"Ошибка в china_addresses (API): {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при получении адреса склада.", reply_markup=markup)
 
-# bot_template.py
-
 async def bishkek_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Показывает список филиалов и общие ссылки (обновлено: График убран на уровень филиала).
     """
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    if await check_restart_or_get_client_id(update, context) is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     is_owner = context.user_data.get('is_owner', False)
     markup = owner_main_menu_markup if is_owner else client_main_menu_markup
 
@@ -1851,7 +2028,13 @@ async def handle_show_reactions_callback(update: Update, context: ContextTypes.D
 
 async def owner_all_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """(Владелец) Начинает диалог поиска 'Все Заказы'."""
-    logger.info(f"Владелец {context.user_data.get('client_id')} начинает поиск по всем заказам.")
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return ConversationHandler.END
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
+    logger.info(f"Владелец {client_id} начинает поиск по всем заказам.")
     await update.message.reply_text(
         "🔍 Введите трек-код, ФИО клиента или номер телефона для поиска заказа:",
         reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True)
@@ -1938,7 +2121,13 @@ async def handle_owner_order_search(update: Update, context: ContextTypes.DEFAUL
 
 async def owner_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """(Владелец) Начинает диалог поиска 'Клиенты'."""
-    logger.info(f"Владелец {context.user_data.get('client_id')} начинает поиск по клиентам.")
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return ConversationHandler.END
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
+    logger.info(f"Владелец {client_id} начинает поиск по клиентам.")
     await update.message.reply_text(
         "🔍 Введите ФИО, код клиента или номер телефона для поиска:",
         reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True, one_time_keyboard=True)
@@ -1994,7 +2183,12 @@ async def handle_owner_client_search(update: Update, context: ContextTypes.DEFAU
 
 async def owner_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """(Владелец) Показывает список его филиалов."""
-    client_id = context.user_data.get('client_id')
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     employee_id = context.user_data.get('employee_id')
     markup = owner_main_menu_markup
 
@@ -2028,7 +2222,12 @@ async def owner_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def owner_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """(Владелец) Показывает статистику по реакциям на рассылки."""
-    client_id = context.user_data.get('client_id')
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     employee_id = context.user_data.get('employee_id')
     markup = owner_main_menu_markup
 
@@ -2097,7 +2296,13 @@ async def owner_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def owner_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """(Владелец) Начинает диалог 'Объявление' (Рассылка), спрашивает про фото."""
-    logger.info(f"Владелец {context.user_data.get('client_id')} начинает рассылку.")
+    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    if client_id is None:
+        return ConversationHandler.END
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+    logger.info(f"Владелец {client_id} начинает рассылку.")
     context.user_data['broadcast_photo'] = None # Сбрасываем фото
     context.user_data['broadcast_text'] = None # Сбрасываем текст
 
@@ -2290,10 +2495,12 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     user = update.effective_user
     chat_id = str(user.id)
-    client_id = context.user_data.get('client_id')
+    # --- ИЗМЕНЕНИЕ: Используем проверку, а не просто .get() ---
+    client_id = await check_restart_or_get_client_id(update, context)
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     if not client_id:
-        logger.info(f"Пользователь {chat_id} уже вышел (/logout)")
+        logger.info(f"Пользователь {chat_id} уже вышел (/logout) или сессия потеряна.")
         await update.message.reply_text(
             "Вы уже вышли из системы.\nНажмите /start, чтобы войти.",
             reply_markup=ReplyKeyboardRemove()
@@ -2450,7 +2657,23 @@ def main() -> None:
     # Команда /cancel вне диалогов
     application.add_handler(CommandHandler('cancel', cancel_dialog))
 
-    # Обработчик ВСЕХ ОСТАЛЬНЫХ текстовых сообщений (меню)
+    # --- НОВЫЕ: Обработчики кнопок меню (для скорости и надежности) ---
+    # (Они должны стоять ПЕРЕД 'process_text_logic')
+    
+    # Общие кнопки (доступны всем авторизованным)
+    application.add_handler(MessageHandler(filters.Regex(r'^👤 Мой профиль$'), profile))
+    application.add_handler(MessageHandler(filters.Regex(r'^🇨🇳 Адреса складов$'), china_addresses))
+    application.add_handler(MessageHandler(filters.Regex(r'^🇰🇬 Наши контакты$'), bishkek_contacts))
+    
+    # Только для клиента (фильтр is_owner сработает внутри функции)
+    application.add_handler(MessageHandler(filters.Regex(r'^📦 Мои заказы$'), my_orders))
+
+    # Только для Владельца (фильтр is_owner сработает внутри функции)
+    application.add_handler(MessageHandler(filters.Regex(r'^🏢 Филиалы$'), owner_locations))
+    application.add_handler(MessageHandler(filters.Regex(r'^📊 Статистика$'), owner_statistics))
+
+    # Обработчик ВСЕХ ОСТАЛЬНЫХ текстовых сообщений (ИИ, авто-перехват треков)
+    # (Используем process_text_logic напрямую, т.к. handle_text_message удален)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     # Обработка Голоса (НОВОЕ)
