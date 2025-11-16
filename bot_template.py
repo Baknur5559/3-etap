@@ -909,11 +909,12 @@ import ast # Добавь этот импорт в начало файла, ес
 async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """
     (ФИНАЛ v22 - UZ/TIMING)
-    Добавлена логика удержания внимания (3с, 10с, 25с) и таймаут (60с).
+    (v6.4 - Исправлено форматирование get_user_orders_json)
     """
     from ai_tools import TOOLS_SYSTEM_PROMPT
     import ast
     import json
+    import html # Убедись, что этот импорт есть вверху файла
 
     user = update.effective_user
     client_id = context.user_data.get('client_id')
@@ -921,6 +922,17 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     is_owner = context.user_data.get('is_owner', False)
     chat_id = update.effective_chat.id
     
+    # === НАЧАЛО: ПРОВЕРКА ПЕРЕЗАПУСКА (v6.3) ===
+    if client_id is None and text.strip() not in ['/start', '/register']:
+        logger.warning(f"[Restart Check] client_id отсутствует для Chat ID {user.id}. Вероятен перезапуск. Просим нажать /start.")
+        await update.message.reply_html(
+            "<b>Бот был обновлен!</b> 🚀\n\n"
+            "Пожалуйста, нажмите /start, чтобы обновить ваше меню и продолжить работу.",
+            reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
+        )
+        return 
+    # === КОНЕЦ: ПРОВЕРКА ПЕРЕЗАПУСКА ===
+
     # 1. ИНДИКАТОР РЕАКЦИИ
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     
@@ -960,17 +972,11 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     valid_tracks = [t for t in potential_tracks if len(t) >= 8]
 
     if valid_tracks and len(valid_tracks) >= 1:
-        if not client_id:
-            await update.message.reply_text("🧐 Вижу трек-коды, но вы не зарегистрированы. Нажмите /register.", reply_markup=ReplyKeyboardRemove())
-            return
-        
         await update.message.reply_text(f"🔎 Найдено треков: {len(valid_tracks)}. Обрабатываю...", reply_markup=markup)
         
-        # ИНДИКАТОР
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         
         try:
-            # Ставим таймаут 60 секунд на запрос к серверу
             api_response = await asyncio.wait_for(
                 api_request("POST", "/api/bot/order_request", json={
                     "client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "request_text": text
@@ -1038,34 +1044,26 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
     current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    if client_id:
-        client_profile_str = "..."
-        orders_str = "..."
-        try:
-            c_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
-            if c_data:
-                 code = f"{c_data.get('client_code_prefix')}{c_data.get('client_code_num')}"
-                 client_profile_str = f"ФИО: {c_data.get('full_name')}\nКод: {code}\nТел: {c_data.get('phone')}"
-            
-            o_data = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "limit": 5})
-            if o_data:
-                 active = [o for o in o_data if o['status'] != 'Выдан']
-                 orders_str = f"Активных заказов: {len(active)}."
-        except: pass
+    client_profile_str = "..."
+    orders_str = "..."
+    try:
+        c_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
+        if c_data:
+             code = f"{c_data.get('client_code_prefix')}{c_data.get('client_code_num')}"
+             client_profile_str = f"ФИО: {c_data.get('full_name')}\nКод: {code}\nТел: {c_data.get('phone')}"
+        
+        o_data = await api_request("GET", "/api/orders", params={"client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "limit": 5})
+        if o_data:
+             active = [o for o in o_data if o['status'] != 'Выдан']
+             orders_str = f"Активных заказов: {len(active)}."
+    except: pass
 
-        system_role = (
-            f"СЕГОДНЯ: {current_date}. Ты — помощник Cargo CRM.\n"
-            f"КЛИЕНТ:\n{client_profile_str}\n"
-            f"ЗАКАЗЫ: {orders_str}\n"
-            "Твоя цель: Помогать с заказами, отвечать на вопросы."
-        )
-    else:
-        system_role = (
-            f"СЕГОДНЯ: {current_date}. Ты — консультант Cargo CRM.\n"
-            "Твой собеседник — ГОСТЬ.\n"
-            "1. Отвечай на вопросы о ценах (используй `get_shipping_price`) и адресах.\n"
-            "2. Если клиент хочет добавить заказ — говори: 'Нажмите /register'."
-        )
+    system_role = (
+        f"СЕГОДНЯ: {current_date}. Ты — помощник Cargo CRM.\n"
+        f"КЛИЕНТ:\n{client_profile_str}\n"
+        f"ЗАКАЗЫ: {orders_str}\n"
+        "Твоя цель: Помогать с заказами, отвечать на вопросы."
+    )
 
     system_role += (
         f"{company_info_text}\n"
@@ -1073,14 +1071,10 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     )
 
     # 6. ЗАПРОС ИИ (С ТАЙМЕРАМИ)
-    # Запускаем фоновую задачу для отправки "Подождите..."
     wait_task = asyncio.create_task(notify_progress(context, chat_id))
     
     try:
-        # Ставим жесткий таймаут 60 секунд на ответ ИИ
         ai_answer = await asyncio.wait_for(get_ai_response(history, system_role), timeout=60.0)
-        
-        # Если ИИ ответил - отменяем задачу ожидания
         wait_task.cancel()
         
         history.append({"role": "assistant", "content": ai_answer})
@@ -1130,7 +1124,37 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             res_json = json.loads(final_text)
                             if isinstance(res_json, dict) and "message" in res_json:
                                 final_text = res_json["message"]
+                            
+                            # === НАЧАЛО ИСПРАВЛЕНИЯ (v6.4) ===
+                            elif isinstance(res_json, dict) and "active_orders" in res_json:
+                                # Форматируем ответ от get_user_orders_json
+                                orders = res_json["active_orders"]
+                                if not orders:
+                                    final_text = "У вас пока нет активных заказов. 🚚"
+                                else:
+                                    formatted_text = "📦 <b>Ваши текущие заказы:</b>\n\n"
+                                    for o in orders:
+                                        formatted_text += f"<b>Трек:</b> <code>{o.get('трек', '?')}</code>\n"
+                                        formatted_text += f"<b>Статус:</b> {o.get('статус', '?')}\n"
+                                        comment = o.get('комментарий')
+                                        if comment:
+                                            # Используем html.escape для безопасности
+                                            formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
+                                        
+                                        calc_weight = o.get('расчет_вес_кг')
+                                        calc_cost = o.get('расчет_сумма_сом')
+                                        if calc_weight is not None and calc_cost is not None:
+                                            formatted_text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+                                            
+                                        formatted_text += "──────────────\n"
+                                    
+                                    if len(formatted_text) > 4000:
+                                         formatted_text = formatted_text[:4000] + "\n... (список слишком длинный)"
+                                    final_text = formatted_text
+                            # === КОНЕЦ ИСПРАВЛЕНИЯ ===
+
                             elif isinstance(res_json, list): 
+                                # (Это для get_company_locations)
                                 formatted_text = ""
                                 for l in res_json:
                                     nm = l.get("Филиал") or l.get("name") or "Филиал"
@@ -1154,12 +1178,9 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(ai_answer, reply_markup=markup)
 
     except asyncio.TimeoutError:
-        # --- 60 СЕКУНД ИСТЕКЛИ ---
         wait_task.cancel()
         logger.error("AI Response Timeout (60s)")
         
-        # Если есть ссылка на WhatsApp в настройках, можно добавить её в кнопку
-        # Но для надежности просто просим нажать кнопку меню
         await update.message.reply_text(
             "⚠️ **По техническим причинам я не могу сейчас подготовить ответ.**\n\n"
             "Пожалуйста, свяжитесь с нами через оператора:\n"
@@ -1203,12 +1224,6 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(text, reply_markup=markup) 
 
     logger.info(f"Запрос ссылки ЛК для клиента {client_id}")
-    # (В main.py /generate_lk_link требует аутентификации Владельца, 
-    # это нужно будет исправить в main.py, чтобы бот мог ее вызывать,
-    # или сделать для нее отдельный эндпоинт /api/bot/generate_lk)
-    #
-    # ПОКА МЫ ИСПОЛЬЗУЕМ API v5.0, где /generate_lk_link ПУБЛИЧНЫЙ
-    # и использует client_id.
     
     # --- ИЗМЕНЕНИЕ: /generate_lk_link - это POST ---
     api_response_link = await api_request("POST", f"/api/clients/{client_id}/generate_lk_link", json={'company_id': COMPANY_ID_FOR_BOT})
@@ -2453,7 +2468,6 @@ async def notify_owner_of_complaint(context: ContextTypes.DEFAULT_TYPE, complain
     logger.info(f"НОТИФИКАЦИЯ ЖАЛОБЫ (ЗАГЛУШКА): Текст: {complaint_text}")
     # TODO: Реализовать получение telegram_chat_id Владельца и отправку сообщения
     pass
-
 if __name__ == "__main__":
     main()
 
