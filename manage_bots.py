@@ -89,6 +89,18 @@ def main():
         logger.error("Переменная DATABASE_URL не найдена в .env или окружении.")
         sys.exit(1)
 
+    # --- (ИСПРАВЛЕНИЕ) Загружаем ключи ИИ СРАЗУ ---
+    GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+    DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    
+    if not GEMINI_KEY or not DEEPSEEK_KEY:
+        logger.warning("!!! ВНИМАНИЕ: GEMINI_API_KEY или DEEPSEEK_API_KEY не найдены в .env. ИИ не запустится.")
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+    # --- (ОТЛАДКА) ---
+    logger.info(f"DEBUG: Ключ GEMINI загружен: {bool(GEMINI_KEY)}. Ключ DEEPSEEK загружен: {bool(DEEPSEEK_KEY)}")
+    # --- (КОНЕЦ ОТЛАДКИ) ---
+
     # --- Подключение к БД ---
     try:
         engine = create_engine(database_url)
@@ -143,11 +155,15 @@ def main():
     configs_changed = False
     for program_name, company in required_programs.items():
         conf_path = os.path.join(SUPERVISOR_CONF_DIR, f"{program_name}.conf")
-        # --- ЛОГИКА ВКЛЮЧЕНИЯ ИИ ---
-        # Включаем ИИ только для компании с кодом 'TEST' (или можно добавить других)
-        env_extras = ""
+        
+        # --- (ИСПРАВЛЕНО) ЛОГИКА ВКЛЮЧЕНИЯ ИИ ---
+        # Передаем ключи ИИ в среду ВСЕГДА
+        env_extras = f',GEMINI_API_KEY="{GEMINI_KEY}",DEEPSEEK_API_KEY="{DEEPSEEK_KEY}"'
+        
+        # (Оставим старую логику для ENABLE_AI, если она нужна)
         if company.company_code == "TEST":
-            env_extras = ',ENABLE_AI="True"'
+            env_extras += ',ENABLE_AI="True"'
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
         conf_content = CONFIG_TEMPLATE.format(
             program_name=program_name,
@@ -178,17 +194,19 @@ def main():
 
 
         if needs_update:
+            # (ИСПРАВЛЕНО) Используем прямой Python write().
+            # Скрипт manage_bots.py ТЕПЕРЬ НУЖНО ЗАПУСКАТЬ ЧЕРЕЗ sudo.
             try:
-                # Используем sudo для записи в /etc
-                # Лучше запускать сам скрипт через sudo, чем вызывать sudo внутри
-                # НО! Для простоты пока оставим вызов sudo dd
-                # Важно: 'w' для open здесь не сработает из-за прав
-                command = f'echo "{conf_content.replace("\"", "\\\"")}" | sudo dd of={conf_path}'
-                subprocess.run(command, shell=True, check=True, capture_output=True)
+                with open(conf_path, 'w') as f:
+                    f.write(conf_content)
                 logger.info(f"Успешно записан файл: {conf_path}")
-                configs_changed = True
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Ошибка записи файла {conf_path} через sudo dd: {e.stderr.decode()}")
+                configs_changed = True # <-- Убедись, что эта строка есть
+            except PermissionError:
+                logger.critical(f"!!! КРИТИЧЕСКАЯ ОШИБКА: Отказано в доступе (PermissionError) при записи в {conf_path}.")
+                logger.critical("--- ПОЖАЛУЙСТА, ЗАПУСТИТЕ ЭТОТ СКРИПТ (manage_bots.py) ЧЕРЕЗ sudo ---")
+                # Завершаем, так как без sudo ничего не выйдет
+                db.close()
+                sys.exit(1)
             except Exception as e:
                 logger.error(f"Не удалось записать файл {conf_path}: {e}")
 
@@ -198,6 +216,7 @@ def main():
         conf_path = existing_conf_files[program_name]
         logger.info(f"Удаление устаревшего файла конфигурации: {conf_path}")
         try:
+            # (ИСПРАВЛЕНО) Используем sudo для rm, так как у юзера может не быть прав
             subprocess.run(["sudo", "rm", conf_path], check=True)
             configs_changed = True
         except subprocess.CalledProcessError as e:
