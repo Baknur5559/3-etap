@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 SUPERVISOR_CONF_DIR = "/etc/supervisor/conf.d"
 BOT_SCRIPT_PATH = "/home/baknur_user/cargo-crm/bot_template.py" # Путь к твоему скрипту бота
 PYTHON_EXECUTABLE = "/home/baknur_user/cargo-crm/venv/bin/python" # Путь к Python в твоем venv
-API_URL = "http://127.0.0.1:8000" # URL бэкенда для ботов
 USER = "baknur_user" # Имя пользователя Linux, от которого будут запускаться боты
 CONFIG_FILE_PREFIX = "cargo_bot_" # Префикс для файлов конфигурации
 
@@ -88,6 +87,16 @@ def main():
     if not database_url:
         logger.error("Переменная DATABASE_URL не найдена в .env или окружении.")
         sys.exit(1)
+
+    # --- (ИСПРАВЛЕНИЕ) Загружаем ADMIN_API_URL из .env ---
+    global API_URL
+    API_URL = os.getenv("ADMIN_API_URL")
+    if not API_URL:
+        logger.warning("!!! ВНИМАНИЕ: ADMIN_API_URL не найден в .env. Используется http://127.0.0.1:8000")
+        API_URL = "http://127.0.0.1:8000"
+    else:
+        logger.info(f"API_URL для ботов (из .env): {API_URL}")
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
     # --- (ИСПРАВЛЕНИЕ) Загружаем ключи ИИ СРАЗУ ---
     GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
