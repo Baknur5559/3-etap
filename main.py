@@ -5093,9 +5093,13 @@ def get_bot_current_price(
     db: Session = Depends(get_db)
 ):
     """
-    Возвращает актуальную цену за кг ($) для бота.
+    (ИСПРАВЛЕНО) Возвращает актуальную цену ($) И КУРС для бота.
     Логика: Активная смена -> Последняя закрытая смена -> 0.0
     """
+    price_usd = 0.0
+    exchange_rate = 0.0
+    source = "default"
+
     # 1. Проверяем активную смену (любую в этой компании)
     active_shift = db.query(Shift).filter(
         Shift.company_id == company_id,
@@ -5103,19 +5107,28 @@ def get_bot_current_price(
     ).order_by(Shift.start_time.desc()).first()
     
     if active_shift:
-        return {"price": active_shift.price_per_kg_usd, "source": "active_shift"}
+        price_usd = active_shift.price_per_kg_usd
+        exchange_rate = active_shift.exchange_rate_usd
+        source = "active_shift"
         
     # 2. Если нет активной, берем последнюю закрытую
-    last_shift = db.query(Shift).filter(
-        Shift.company_id == company_id,
-        Shift.end_time != None
-    ).order_by(Shift.end_time.desc()).first()
-    
-    if last_shift:
-        return {"price": last_shift.price_per_kg_usd, "source": "history"}
+    elif db.query(Shift.id).count() > 0: # Проверяем, есть ли вообще смены
+        last_shift = db.query(Shift).filter(
+            Shift.company_id == company_id,
+            Shift.end_time != None
+        ).order_by(Shift.end_time.desc()).first()
         
-    # 3. Если смен вообще не было
-    return {"price": 0.0, "source": "default"}
+        if last_shift:
+            price_usd = last_shift.price_per_kg_usd
+            exchange_rate = last_shift.exchange_rate_usd
+            source = "history"
+
+    # 3. Возвращаем полный объект
+    return {
+        "price_usd": price_usd, 
+        "exchange_rate": exchange_rate,
+        "source": source
+    }
 
 @app.get("/api/bot/locations", tags=["Telegram Bot"], response_model=List[LocationOut])
 def get_locations_for_bot(
