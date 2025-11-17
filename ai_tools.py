@@ -140,14 +140,21 @@ async def add_client_order_request(api_request_func, client_id: int, company_id:
 
 async def get_company_locations(api_request_func, company_id: int) -> str:
     """
-    Используется ТОЛЬКО для получения актуальной информации о филиалах компании: адресах, телефонах и графике работы.
+    (ИСПРАВЛЕНО) Используется ТОЛЬКО для получения актуальной информации о филиалах компании: адресах, телефонах и графике работы.
     :param api_request_func: Асинхронная функция для выполнения API запросов.
     :param company_id: ID текущей компании.
     :return: JSON-строка со списком филиалов.
     """
     try:
-        # Используем эндпоинт, который ты добавишь
-        response = await api_request_func("GET", f"/api/bot/locations?company_id={company_id}") 
+        # --- (ИСПРАВЛЕНИЕ) ---
+        # Убираем f-строку из URL и передаем company_id через 'params',
+        # как того ожидает 'api_request_func' в bot_template.py.
+        response = await api_request_func(
+            "GET", 
+            "/api/bot/locations", 
+            params={"company_id": company_id}
+        )
+        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
         
         if not response or "error" in response:
              return json.dumps({"status": "error", "message": "Не удалось загрузить данные о филиалах."}, ensure_ascii=False)
@@ -165,8 +172,7 @@ async def get_company_locations(api_request_func, company_id: int) -> str:
         return json.dumps(locations_info, ensure_ascii=False)
 
     except Exception as e:
-        return json.dumps({"status": "error", "message": f"Ошибка связи с сервером: {e}"}, ensure_ascii=False)
-
+        return json.dumps({"status": "error", "message": f"Ошибка связи с сервером: {e}"}, ensure_ascii=False)    
 
 async def alert_order_submission(track_codes: List[str]) -> str:
     """
@@ -179,19 +185,53 @@ async def alert_order_submission(track_codes: List[str]) -> str:
 
 async def get_shipping_price(api_request_func, company_id: int) -> str:
     """
-    Получает актуальную цену за доставку ($/кг).
+    (ИСПРАВЛЕНО) Получает актуальную цену ($/кг) И КУРС, возвращает JSON с расчетом.
     Используй, если клиент спрашивает "Сколько стоит?", "Цена за кг", "Тарифы".
     """
     try:
-        response = await api_request_func("GET", f"/api/bot/price?company_id={company_id}")
-        if response and "price" in response:
-            price = response["price"]
-            if price > 0:
-                return json.dumps({"price_usd": price, "message": f"Актуальная цена: {price}$ за кг."}, ensure_ascii=False)
-            else:
-                return json.dumps({"message": "Цена пока не установлена (смен не было)."}, ensure_ascii=False)
-        return json.dumps({"error": "Не удалось получить цену."}, ensure_ascii=False)
+        # --- (ИСПРАВЛЕНИЕ) ---
+        # 1. Запрос к API (main.py), используя 'params'
+        response = await api_request_func(
+            "GET", 
+            "/api/bot/price", 
+            params={"company_id": company_id}
+        )
+        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
+        
+        # 2. Проверка (ищем "price_usd", а не "price")
+        if not response or "price_usd" not in response:
+            logger.error(f"[AI Tool] get_shipping_price: API /api/bot/price вернул неверный формат: {response}")
+            return json.dumps({"error": "Не удалось получить данные о тарифах с сервера."}, ensure_ascii=False)
+
+        price_usd = response.get("price_usd", 0)
+        exchange_rate = response.get("exchange_rate", 0)
+
+        # 3. Проверка, что цены установлены
+        if price_usd > 0 and exchange_rate > 0:
+            # 4. Расчет цены в сомах
+            price_som = price_usd * exchange_rate
+            
+            # 5. Формируем JSON-ответ для ИИ (со всеми данными)
+            message = (
+                f"Актуальный тариф:\n"
+                f"<b>{price_usd}$</b> за кг.\n"
+                f"По текущему курсу смены ({exchange_rate} сом) это примерно <b>{price_som:.0f} сом</b> за кг."
+            )
+            
+            return json.dumps({
+                "price_usd": price_usd,
+                "exchange_rate": exchange_rate,
+                "price_som": round(price_som, 2),
+                "message": message
+            }, ensure_ascii=False)
+            
+        else:
+            # Если цена 0 (смен не было)
+            logger.warning(f"[AI Tool] get_shipping_price: Цена не установлена (price_usd={price_usd}, exchange_rate={exchange_rate})")
+            return json.dumps({"message": "Цена пока не установлена. Пожалуйста, уточните у менеджера (смены еще не открывались)."}, ensure_ascii=False)
+
     except Exception as e:
+        logger.error(f"!!! [AI Tool Exception] get_shipping_price: {e}", exc_info=True)
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 # =================================================================
