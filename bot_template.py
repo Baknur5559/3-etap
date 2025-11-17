@@ -943,6 +943,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     (ФИНАЛ v22 - UZ/TIMING)
     (v6.4 - Исправлено форматирование get_user_orders_json)
     (v6.6 - ИСПРАВЛЕНА СИГНАТУРА: 'text: str' ВОЗВРАЩЕН)
+    (v6.7 - ИСПРАВЛЕН КОНТЕКСТ ЦЕНЫ)
     """
     from ai_brain import AI_SYSTEM_PROMPT # <-- (ИСПРАВЛЕНО) Импортируем "АЗЕМА"
     import ast
@@ -971,7 +972,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
         )
         return 
-    # === КОНЕЦ: ПРОВЕРКА ПЕРЕЗАПУСКА ===
+    # === КОНЕЦ: ПРОВЕРКА ПЕРЕЗАПУСKA ===
 
     # 1. ИНДИКАТОР РЕАКЦИИ
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1057,16 +1058,35 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         rule_keys = ['rule_buyout', 'rule_delivery', 'rule_general']
         rules_response = await api_request("GET", "/api/bot/settings", params={'company_id': COMPANY_ID_FOR_BOT, 'keys': rule_keys})
+        
         if rules_response and isinstance(rules_response, list):
             rules_dict = {r['key']: r['value'] for r in rules_response}
-            if rules_dict.get('rule_buyout'): company_info_text += f"\n🛒 **ВЫКУП:**\n{rules_dict['rule_buyout']}\n"
-            if rules_dict.get('rule_delivery'): company_info_text += f"\n🚚 **ДОСТАВКА:**\n{rules_dict['rule_delivery']}\n"
-            if rules_dict.get('rule_general'): company_info_text += f"\nℹ️ **ИНФО:**\n{rules_dict['rule_general']}\n"
+            
+            if rules_dict.get('rule_buyout'): 
+                company_info_text += f"\n🛒 **ВЫКУП:**\n{rules_dict['rule_buyout']}\n"
+            
+            # === НАЧАЛО ИСПРАВЛЕНИЯ ===
+            if rules_dict.get('rule_delivery'):
+                # Удаляем упоминания цены/тарифа из контекста
+                rule_delivery_text = rules_dict['rule_delivery']
+                # Заменяем (без учета регистра) слова "сом", "$", "usd", "цена", "тариф", "6.0", "5.5" и т.д.
+                rule_delivery_text = re.sub(r'(\d+(\.\d+)?\s*(\$|usd|сом|kgs|kgs|cом))|(\d+(\.\d+)?\s*(доллар|сом))|(цена|тариф)', 
+                                            '[...цена...]', # Цензурируем
+                                            rule_delivery_text, 
+                                            flags=re.IGNORECASE)
+                company_info_text += f"\n🚚 **ДОСТАВКА:**\n{rule_delivery_text}\n"
+            # === КОНЕЦ ИСПРАВЛЕНИЯ ===
+
+            if rules_dict.get('rule_general'): 
+                company_info_text += f"\nℹ️ **ИНФО:**\n{rules_dict['rule_general']}\n"
 
     except Exception:
         pass
     
-    current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # --- (ИСПРАВЛЕНИЕ) Устанавливаем часовой пояс Бишкека (GMT+6) ---
+    bishkek_tz = timezone(timedelta(hours=6))
+    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
+    current_date = datetime.now(tz=bishkek_tz).strftime("%Y-%m-%d %H:%M")
     
     client_profile_str = "..."
     orders_str = "..."
