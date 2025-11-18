@@ -38,7 +38,7 @@ ORDER_STATUSES = ["В обработке", "Ожидает выкупа", "Вы�
 from models import (
     Base, Company, Location, Client, Order, Role, Permission, Employee,
     ExpenseType, Shift, Expense, Setting,
-    Broadcast, BroadcastReaction, OrderHistory, # <-- ДОБАВЛЕНО
+    Broadcast, BroadcastReaction, OrderHistory, NotificationHistory, # <--- ДОБАВИЛИ СЮДА
     role_permissions_table
 )
 # Импортируем Session и List для типизации
@@ -2206,6 +2206,7 @@ class BotOrderRequest(BaseModel):
     client_id: int
     company_id: int
     request_text: str
+    check_only: bool = False
     
     class Config:
         from_attributes = True
@@ -4959,13 +4960,13 @@ def create_bot_order_request(
     db: Session = Depends(get_db)
 ):
     """
-    (ФИНАЛ v14 - БЕЗ ОШИБОК)
-    Исправлены импорты и переменные.
-    ИИ вызывает ту же функцию, что и кнопка -> Заказы 100% попадают в базу.
+    (ФИНАЛ v15 - PREVIEW)
+    Если check_only=True -> Только анализирует и возвращает статистику.
+    Если check_only=False -> Сохраняет заказы.
     """
-    import html # ИМПОРТ ДОБАВЛЕН
+    import html
     
-    logger.info(f"[AI Order Request] Запрос от клиента {request_data.client_id}")
+    logger.info(f"[AI Order Request] Запрос от клиента {request_data.client_id} (Check: {request_data.check_only})")
     
     try:
         # 1. Проверки
@@ -4977,31 +4978,96 @@ def create_bot_order_request(
         if not default_location: 
             raise HTTPException(status_code=400, detail="Ошибка: Нет филиалов.")
         
-        # 2. Парсим текст
+        # 2. Парсим текст (Единая логика парсинга)
         text_input = request_data.request_text
-        track_codes_found = re.findall(r'([a-zA-Z0-9]{8,30})', text_input)
+        # Ищем треки (цифра обязательна)
+        track_codes_found = [t for t in re.findall(r'\b[a-zA-Z0-9]{8,30}\b', text_input) if any(char.isdigit() for char in t)]
         
         if not track_codes_found:
-            raise HTTPException(status_code=400, detail="Трек-коды не найдены.")
+            return {"status": "empty", "message": "Трек-коды не найдены."}
 
-        parts_with_tracks = re.split(r'(\b[a-zA-Z0-9]{8,25}\b)', text_input)
+        # Разбиваем текст, чтобы найти комментарии
+        # (Упрощенная логика: берем текст ПОСЛЕ трека до следующего трека)
+        parts_with_tracks = re.split(r'(\b[a-zA-Z0-9]{8,30}\b)', text_input)
         items_map = {}
         last_track = None
 
         for part in parts_with_tracks:
-            if part in track_codes_found:
-                last_track = part
+            clean_part = part.strip()
+            # Если это трек-код из нашего списка
+            if clean_part in track_codes_found:
+                last_track = clean_part
                 if last_track not in items_map: items_map[last_track] = "" 
             elif last_track is not None:
-                items_map[last_track] += part
+                # Это комментарий к предыдущему треку
+                items_map[last_track] += " " + part
                 
-        # 3. Готовим данные для функции кнопки
         items_payload = []
         for track_code, raw_comment in items_map.items():
             clean_comment = raw_comment.strip().rstrip('.,;:') or None
             items_payload.append(BotBulkAddItem(track_code=track_code, comment=clean_comment))
+
+        # --- РЕЖИМ ПРОВЕРКИ (CHECK ONLY) ---
+        if request_data.check_only:
+            # Анализируем, что будет сделано
+            existing_orders = db.query(Order).filter(
+                Order.track_code.in_(items_map.keys()),
+                Order.company_id == request_data.company_id
+            ).all()
             
-        # 4. ВЫЗЫВАЕМ ФУНКЦИЮ КНОПКИ (Единый Двигатель)
+            existing_map = {o.track_code: o for o in existing_orders}
+            
+            stats = {"total": len(items_payload), "new": 0, "assigned": 0, "duplicates": 0}
+            
+            # Создаем три отдельных списка для группировки
+            groups = {
+                "new": [],
+                "assigned": [],
+                "duplicates": []
+            }
+
+            for item in items_payload:
+                track = item.track_code
+                new_comment = item.comment if item.comment else ""
+                exists = existing_map.get(track)
+                
+                if exists:
+                    if exists.client_id is None:
+                        # --- МАГИЯ ---
+                        stats["assigned"] += 1
+                        comment_str = f" | 📝: {new_comment}" if new_comment else ""
+                        groups["assigned"].append(f"✨ <code>{track}</code>{comment_str}")
+                    else:
+                        # --- ДУБЛИКАТ ---
+                        stats["duplicates"] += 1
+                        old_comment = exists.comment if exists.comment else ""
+                        
+                        # Проверка конфликта комментариев
+                        if new_comment and new_comment.strip().lower() != old_comment.strip().lower():
+                            # Подсвечиваем конфликт
+                            groups["duplicates"].append(
+                                f"⚠️ <b>{track}</b>\n"
+                                f"      (В базе: \"{old_comment}\" | Вы: \"{new_comment}\")"
+                            )
+                        else:
+                            # Обычный дубликат
+                            groups["duplicates"].append(f"🔒 <code>{track}</code> (Уже есть)")
+                else:
+                    # --- НОВЫЙ ---
+                    stats["new"] += 1
+                    comment_str = f" ({new_comment})" if new_comment else ""
+                    groups["new"].append(f"🆕 <code>{track}</code>{comment_str}")
+            
+            return {
+                "status": "check_result",
+                "stats": stats,
+                "groups": groups, # <-- Возвращаем сгруппированные списки
+                "message": f"Проанализировано {stats['total']} трек-кодов."
+            }
+        # -----------------------------------
+            
+        # 3. РЕЖИМ СОХРАНЕНИЯ (EXECUTE)
+        # Вызываем функцию кнопки
         bulk_payload = BotBulkAddPayload(
             client_id=request_data.client_id,
             location_id=default_location.id,
@@ -5009,12 +5075,8 @@ def create_bot_order_request(
             items=items_payload
         )
         
-        # Вызываем функцию, которая уже доказала свою работоспособность на кнопках
-        # Она вернет объект BotBulkAddResponse (где есть поля created, assigned...)
         result = bulk_add_orders_from_bot(bulk_payload, background_tasks, db)
         
-        # 5. Возвращаем результат ИИ
-        # ВАЖНО: Мы берем данные из result.created, а не просто created_count
         return {
             "status": "success",
             "message": "Обработано успешно.",
@@ -5093,7 +5155,7 @@ def get_bot_current_price(
     db: Session = Depends(get_db)
 ):
     """
-    (ИСПРАВЛЕНО) Возвращает актуальную цену ($) И КУРС для бота.
+    Возвращает актуальную цену ($) И КУРС для бота.
     Логика: Активная смена -> Последняя закрытая смена -> 0.0
     """
     price_usd = 0.0
@@ -5111,8 +5173,8 @@ def get_bot_current_price(
         exchange_rate = active_shift.exchange_rate_usd
         source = "active_shift"
         
-    # 2. Если нет активной, берем последнюю закрытую
-    elif db.query(Shift.id).count() > 0: # Проверяем, есть ли вообще смены
+    else:
+        # 2. Если нет активной, берем последнюю закрытую ИМЕННО ЭТОЙ КОМПАНИИ
         last_shift = db.query(Shift).filter(
             Shift.company_id == company_id,
             Shift.end_time != None
@@ -5123,12 +5185,25 @@ def get_bot_current_price(
             exchange_rate = last_shift.exchange_rate_usd
             source = "history"
 
-    # 3. Возвращаем полный объект
+    # 3. Возвращаем полный объект (всегда 200 OK)
     return {
         "price_usd": price_usd, 
         "exchange_rate": exchange_rate,
         "source": source
     }
+
+class BotDeliveryRequestPayload(BaseModel):
+    client_id: int
+    company_id: int
+    address: str
+    delivery_method: str
+    delivery_time: str = "Как можно скорее" # <-- Новое поле
+    comment: Optional[str] = None
+
+class BotComplaintPayload(BaseModel):
+    client_id: int
+    company_id: int
+    complaint_text: str
 
 @app.get("/api/bot/locations", tags=["Telegram Bot"], response_model=List[LocationOut])
 def get_locations_for_bot(
@@ -5703,34 +5778,35 @@ def claim_order_from_bot(
 # def get_order_statuses():  
 #     return {"status": "ok", "statuses": ORDER_STATUSES}
 
-# === НОВАЯ УНИВЕРСАЛЬНАЯ ФУНКЦИЯ УВЕДОМЛЕНИЯ ВЛАДЕЛЬЦЕВ ===
-async def notify_owners(company_id: int, message_text: str):
+# === УМНАЯ ФУНКЦИЯ УВЕДОМЛЕНИЯ ВЛАДЕЛЬЦЕВ (С УДАЛЕНИЕМ СТАРЫХ) ===
+async def notify_owners(
+    company_id: int, 
+    message_text: str, 
+    client_id: Optional[int] = None, 
+    notification_type: Optional[str] = None # 'buyout_request' или 'delivery_request'
+):
     """
-    (ФОНОВАЯ ЗАДАЧA) Отправляет сообщение всем Владельцам компании.
-    САМА СОЗДАЕТ СЕССИЮ.
+    (ФОНОВАЯ ЗАДАЧA) Отправляет сообщение владельцам.
+    Если передан notification_type и client_id:
+    1. Ищет старое сообщение этого типа для этого клиента.
+    2. Удаляет его.
+    3. Отправляет новое (с пометкой "Обновлено").
+    4. Сохраняет ID нового сообщения.
     """
-    db = SessionLocal() # <--- СОЗДАЕМ СВОЮ СЕССИЮ
+    db = SessionLocal()
     try:
-        logger.info(f"[Notify Owner] (BG Task) Поиск Владельцев для компании {company_id}...")
+        logger.info(f"[Notify Owner] Запуск для компании {company_id}. Тип: {notification_type}")
 
-        # 1. Находим токен бота компании
         company = db.query(Company).filter(Company.id == company_id).first()
         if not company or not company.telegram_bot_token:
-            logger.warning(f"[Notify Owner] Не найден токен для компании {company_id}.")
             return
 
-        # 2. Находим сотрудников-Владельцев
         owner_employees = db.query(Employee).join(Role).filter(
             Employee.company_id == company_id,
             Role.name == "Владелец",
             Employee.is_active == True
         ).all()
 
-        if not owner_employees:
-            logger.warning(f"[Notify Owner] Не найдены активные Владельцы для {company_id}.")
-            return
-
-        # 3. Находим их Клиентские аккаунты (для chat_id)
         owner_names = [emp.full_name for emp in owner_employees]
         owner_clients = db.query(Client).filter(
             Client.company_id == company_id,
@@ -5739,22 +5815,65 @@ async def notify_owners(company_id: int, message_text: str):
         ).all()
 
         if not owner_clients:
-            logger.warning(f"[Notify Owner] Найдены Владельцы ({owner_names}), но их Telegram не привязан.")
             return
 
-        # 4. Отправляем
-        tasks = []
-        for owner in owner_clients:
-            tasks.append(
-                send_telegram_message(
-                    token=company.telegram_bot_token,
-                    chat_id=owner.telegram_chat_id,
-                    text=message_text
-                )
-            )
+        bot = telegram.Bot(token=company.telegram_bot_token)
+        
+        # Время для пометки об изменении
+        bishkek_now = datetime.now(timezone(timedelta(hours=6))).strftime("%H:%M")
 
-        await asyncio.gather(*tasks) # <-- ДОБАВЛЕНА ЗВЕЗДОЧКА
-        print(f"[Notify Owner] Уведомления Владельцам ( {len(tasks)} ) отправлены.")
+        for owner in owner_clients:
+            chat_id = owner.telegram_chat_id
+            final_text = message_text
+            
+            # --- ЛОГИКА УДАЛЕНИЯ СТАРОГО СООБЩЕНИЯ ---
+            if client_id and notification_type:
+                # 1. Ищем запись о старом сообщении
+                history_record = db.query(NotificationHistory).filter(
+                    NotificationHistory.company_id == company_id,
+                    NotificationHistory.client_id == client_id,
+                    NotificationHistory.recipient_chat_id == chat_id,
+                    NotificationHistory.notification_type == notification_type
+                ).first()
+                
+                if history_record:
+                    # 2. Пробуем удалить старое сообщение в Telegram
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=history_record.message_id)
+                        print(f"[Notify Owner] Старое сообщение {history_record.message_id} удалено для {chat_id}")
+                        
+                        # Добавляем пометку в НОВОЕ сообщение
+                        final_text = f"🔄 <b>ОБНОВЛЕНО в {bishkek_now}</b> (Клиент изменил данные)\n\n" + message_text
+                        
+                    except Exception as e:
+                        print(f"[Notify Owner] Не удалось удалить старое сообщение (возможно, слишком старое): {e}")
+                    
+                    # 3. Удаляем запись из БД
+                    db.delete(history_record)
+                    db.commit() # Фиксируем удаление
+
+            # --- ОТПРАВКА НОВОГО ---
+            try:
+                sent_message = await bot.send_message(
+                    chat_id=chat_id,
+                    text=final_text,
+                    parse_mode='HTML'
+                )
+                
+                # --- СОХРАНЕНИЕ ID НОВОГО СООБЩЕНИЯ ---
+                if client_id and notification_type:
+                    new_history = NotificationHistory(
+                        company_id=company_id,
+                        client_id=client_id,
+                        recipient_chat_id=chat_id,
+                        message_id=sent_message.message_id,
+                        notification_type=notification_type
+                    )
+                    db.add(new_history)
+                    db.commit()
+                    
+            except Exception as e:
+                print(f"[Notify Owner] Ошибка отправки владельцу {chat_id}: {e}")
 
     except Exception as e:
         logger.error(f"!!! [Notify Owner] Ошибка в фоновой задаче: {e}", exc_info=True)
@@ -5982,11 +6101,88 @@ async def notify_owner_of_new_client(company_id: int, new_client_id: int, regist
             f"👉 <b>Действие:</b> Свяжитесь с клиентом и отправьте реквизиты!"
         )
 
-        # Отправляем Владельцу
+        # Отправляем Владельцу с параметрами для отслеживания
         background_tasks.add_task(
             notify_owners,
             company_id=payload.company_id,
-            message_text=message
+            message_text=message,
+            client_id=client.id,                 # <-- Добавлено
+            notification_type='buyout_request'   # <-- Добавлено
         )
-    
         return {"status": "success", "message": "Заявка отправлена владельцу."}
+    
+@app.post("/api/bot/notify_delivery", tags=["Telegram Bot"])
+def notify_owner_about_delivery(
+    payload: BotDeliveryRequestPayload,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Уведомляет Владельца о запросе на доставку.
+    """
+    client = db.query(Client).filter(Client.id == payload.client_id).first()
+    if not client:
+        return {"status": "error", "message": "Клиент не найден"}
+
+    # Формируем сообщение для Владельца
+    client_code = f"{client.client_code_prefix}{client.client_code_num}"
+
+    message = (
+        f"🚚 **ЗАЯВКА НА ДОСТАВКУ!**\n\n"
+        f"👤 Клиент: <b>{client.full_name}</b>\n"
+        f"🔢 Код: <code>{client_code}</code>\n"
+        f"📱 Телефон: <code>{client.phone}</code>\n\n"
+        f"🚕 Способ: <b>{payload.delivery_method}</b>\n"
+        f"📍 Адрес: <b>{payload.address}</b>\n"
+        f"⏰ Время: <b>{payload.delivery_time}</b>\n" # <-- Новая строка
+        f"💬 Комментарий: {payload.comment or 'Нет'}\n\n"
+        f"👉 <b>Действие:</b> Свяжитесь с клиентом, рассчитайте стоимость и отправьте!"
+    )
+
+    # Отправляем Владельцу с параметрами для отслеживания
+    background_tasks.add_task(
+        notify_owners,
+        company_id=payload.company_id,
+        message_text=message,
+        client_id=client.id,                  # <-- Добавлено
+        notification_type='delivery_request'  # <-- Добавлено
+    )
+
+    return {"status": "success", "message": "Заявка на доставку отправлена владельцу."}
+
+@app.post("/api/bot/notify_complaint", tags=["Telegram Bot"])
+def notify_owner_about_complaint_endpoint(
+    payload: BotComplaintPayload,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Уведомляет Владельца о жалобе/проблеме.
+    """
+    client = db.query(Client).filter(Client.id == payload.client_id).first()
+    if not client:
+        return {"status": "error", "message": "Клиент не найден"}
+
+    client_code = f"{client.client_code_prefix}{client.client_code_num}"
+    
+    # Формируем тревожное сообщение
+    message = (
+        f"🚨 **ЖАЛОБА / ОБРАЩЕНИЕ КЛИЕНТА** 🚨\n\n"
+        f"👤 Клиент: <b>{client.full_name}</b>\n"
+        f"🔢 Код: <code>{client_code}</code>\n"
+        f"📱 Телефон: <code>{client.phone}</code>\n\n"
+        f"💬 <b>Суть проблемы:</b>\n"
+        f"<i>{html.escape(payload.complaint_text)}</i>\n\n"
+        f"👉 <b>Рекомендация:</b> Прочитайте переписку в боте или свяжитесь лично, чтобы уладить конфликт!"
+    )
+
+    # Отправляем Владельцу с типом 'complaint' (чтобы обновлялось при дополнениях)
+    background_tasks.add_task(
+        notify_owners,
+        company_id=payload.company_id,
+        message_text=message,
+        client_id=client.id,
+        notification_type='complaint' # <-- Группировка жалоб
+    )
+
+    return {"status": "success", "message": "Жалоба передана руководству."}
