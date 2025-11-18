@@ -185,39 +185,33 @@ async def alert_order_submission(track_codes: List[str]) -> str:
 
 async def get_shipping_price(api_request_func, company_id: int) -> str:
     """
-    (ИСПРАВЛЕНО) Получает актуальную цену ($/кг) И КУРС, возвращает JSON с расчетом.
-    Используй, если клиент спрашивает "Сколько стоит?", "Цена за кг", "Тарифы".
+    Получает актуальную цену ($/кг) И КУРС.
     """
     try:
-        # --- (ИСПРАВЛЕНИЕ) ---
-        # 1. Запрос к API (main.py), используя 'params'
+        # 1. Запрос к API
         response = await api_request_func(
             "GET", 
             "/api/bot/price", 
             params={"company_id": company_id}
         )
-        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
         
-        # 2. Проверка (ищем "price_usd", а не "price")
+        # 2. Проверка ответа (API всегда должен возвращать JSON)
         if not response or "price_usd" not in response:
-            logger.error(f"[AI Tool] get_shipping_price: API /api/bot/price вернул неверный формат: {response}")
-            return json.dumps({"error": "Не удалось получить данные о тарифах с сервера."}, ensure_ascii=False)
+            logger.error(f"[AI Tool] get_shipping_price: Странный ответ API: {response}")
+            return json.dumps({"message": "Не удалось получить тарифы. Попробуйте позже."}, ensure_ascii=False)
 
-        price_usd = response.get("price_usd", 0)
-        exchange_rate = response.get("exchange_rate", 0)
+        price_usd = response.get("price_usd", 0.0)
+        exchange_rate = response.get("exchange_rate", 0.0)
 
-        # 3. Проверка, что цены установлены
+        # 3. Проверка, что цены установлены (не 0)
         if price_usd > 0 and exchange_rate > 0:
-            # 4. Расчет цены в сомах
             price_som = price_usd * exchange_rate
             
-            # 5. Формируем JSON-ответ для ИИ (со всеми данными)
             message = (
                 f"Актуальный тариф:\n"
                 f"<b>{price_usd}$</b> за кг.\n"
-                f"По текущему курсу смены ({exchange_rate} сом) это примерно <b>{price_som:.0f} сом</b> за кг."
+                f"По текущему курсу ({exchange_rate} сом) это примерно <b>{price_som:.0f} сом</b> за кг."
             )
-            
             return json.dumps({
                 "price_usd": price_usd,
                 "exchange_rate": exchange_rate,
@@ -227,11 +221,34 @@ async def get_shipping_price(api_request_func, company_id: int) -> str:
             
         else:
             # Если цена 0 (смен не было)
-            logger.warning(f"[AI Tool] get_shipping_price: Цена не установлена (price_usd={price_usd}, exchange_rate={exchange_rate})")
-            return json.dumps({"message": "Цена пока не установлена. Пожалуйста, уточните у менеджера (смены еще не открывались)."}, ensure_ascii=False)
+            return json.dumps({"message": "Тариф пока не установлен (нет активных или закрытых смен). Уточните у менеджера."}, ensure_ascii=False)
 
     except Exception as e:
         logger.error(f"!!! [AI Tool Exception] get_shipping_price: {e}", exc_info=True)
+        # Возвращаем мягкое сообщение, а не JSON-ошибку
+        return json.dumps({"message": "Временно не могу узнать цену. Напишите менеджеру."}, ensure_ascii=False)
+    
+async def create_delivery_request(api_request_func, client_id: int, company_id: int, address: str, method: str, delivery_time: str) -> str:
+    """
+    Создает заявку на доставку и уведомляет владельца.
+    """
+    try:
+        if not client_id: return json.dumps({"error": "Вы не авторизованы."}, ensure_ascii=False)
+
+        response = await api_request_func(
+            "POST",
+            "/api/bot/notify_delivery",
+            json={
+                "client_id": client_id,
+                "company_id": company_id,
+                "address": address,
+                "delivery_method": method,
+                "delivery_time": delivery_time, # <-- Передаем время
+                "comment": "Заявка через AI"
+            }
+        )
+        return json.dumps({"status": "success", "message": "✅ Заявка принята! Менеджер получил данные и скоро свяжется."}, ensure_ascii=False)
+    except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 # =================================================================
@@ -288,6 +305,58 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             tool_command.get("amount_som", 0)
         )
     # ...
+
+    elif tool == "create_delivery_request":
+        if not client_id: return "Ошибка: Вы не зарегистрированы."
+        
+        address = str(tool_command.get("address", "")).strip()
+        method = str(tool_command.get("method", "")).strip()
+        delivery_time = str(tool_command.get("delivery_time", "Как можно скорее")).strip()
+        
+        # 1. СПИСОК СТОП-СЛОВ (Явные галлюцинации)
+        stop_words = ["не указан", "не знаю", "нет", "unknown", "адрес", "null", "none", ""]
+        if address.lower() in stop_words:
+             return "Пожалуйста, напишите точный адрес доставки. ✍️"
+
+        # 2. ПРАВИЛО ЦИФРЫ (Главная защита)
+        # Если в адресе нет ни одной цифры — это не адрес, а улица или район.
+        has_digit = any(char.isdigit() for char in address)
+        
+        # Слова-маркеры неточных адресов
+        vague_words = ["возле", "рядом", "напротив", "пересечение", "угла", "район", "пер.", "перекресток"]
+        is_vague = any(word in address.lower() for word in vague_words)
+        
+        if not has_digit:
+            if is_vague:
+                return f"Вы написали ориентир: '{address}'. Курьеру нужен точный адрес. Пожалуйста, напишите **номер дома** или здания."
+            else:
+                return f"Уточните, пожалуйста: '{address}' — это улица или район? Напишите **номер дома**, чтобы я мог оформить доставку."
+
+        # 3. ПРОВЕРКА МЕТОДА
+        if not method or len(method) < 2 or method.lower() in stop_words:
+             # Здесь ИИ должен посмотреть в правила компании, но если он тупит, подскажем:
+             return "Уточните, пожалуйста, какой службой отправить? (Например: Яндекс, СДЭК) 🚚"
+        
+        # Если адрес содержит цифру и метод указан — создаем
+        return await create_delivery_request(
+            api_request_func, 
+            client_id, 
+            company_id, 
+            address, 
+            method,
+            delivery_time # <-- Передаем время
+        )
+    
+    elif tool == "submit_complaint":
+        text = tool_command.get("text")
+        if not text: return "Ошибка: Пустой текст жалобы."
+        
+        return await submit_complaint(
+            api_request_func, 
+            client_id, 
+            company_id, 
+            text
+        )
 
     elif tool == "alert_order_submission":
         tracks = tool_command.get("track_codes")
@@ -461,3 +530,24 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
     except Exception as e:
         logger.error(f"AI Tool Error: {e}")
         return "❌ Ошибка выполнения команды."
+    
+async def submit_complaint(api_request_func, client_id: int, company_id: int, text: str) -> str:
+    """
+    Отправляет жалобу клиента руководству.
+    """
+    try:
+        if not client_id: return json.dumps({"error": "Вы не авторизованы."}, ensure_ascii=False)
+        
+        response = await api_request_func(
+            "POST",
+            "/api/bot/notify_complaint",
+            json={
+                "client_id": client_id,
+                "company_id": company_id,
+                "complaint_text": text
+            }
+        )
+        # Возвращаем ИИ инструкцию, что сказать клиенту (ИИ перефразирует это тепло)
+        return json.dumps({"status": "success", "message": "✅ Ваша жалоба официально зарегистрирована и передана руководству. Мы разберемся в ближайшее время."}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
