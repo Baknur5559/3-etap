@@ -345,3 +345,28 @@ class OrderHistory(Base):
     # Связь с заказом
     order_id = Column(Integer, ForeignKey('orders.id', ondelete="CASCADE"), nullable=False, index=True)
     order = relationship("Order", back_populates="history_entries")
+
+# --- НОВАЯ МОДЕЛЬ: История уведомлений (для удаления старых) ---
+class NotificationHistory(Base):
+    """
+    Хранит ID сообщений, отправленных владельцам, чтобы удалять их при обновлении заявки.
+    """
+    __tablename__ = 'notification_history'
+    id = Column(Integer, primary_key=True)
+    
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=False, index=True)
+    
+    # ID чата владельца и ID сообщения в этом чате
+    recipient_chat_id = Column(String, nullable=False)
+    message_id = Column(Integer, nullable=False)
+    
+    # Тип уведомления: 'buyout_request', 'delivery_request'
+    notification_type = Column(String, nullable=False)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # Индекс для быстрого поиска последнего сообщения по типу для конкретного владельца
+        UniqueConstraint('recipient_chat_id', 'client_id', 'notification_type', name='_notify_recipient_client_type_uc'),
+    )
