@@ -4409,7 +4409,7 @@ async function handleOrderExcelImport() {
         console.log("[Import Orders] Server response:", response);
 
         // --- Шаг 5: Отображение результата ---
-        let resultHtml = `<p class="text-green-600 font-semibold"><strong>Импорт завершен! Успешно создано: ${response.created_clients || 0}</strong></p>`; // Используем поле created_clients
+        let resultHtml = `<p class="text-green-600 font-semibold"><strong>${response.message}</strong></p>`; // Используем поле created_clients
         if (response.warnings && response.warnings.length > 0) {
             resultHtml += `<p class="text-yellow-600 mt-2 font-semibold"><strong>Предупреждения (${response.warnings.length}):</strong></p><ul class="list-disc list-inside text-xs">${response.warnings.map(w => `<li>${w}</li>`).join('')}</ul>`;
         }
