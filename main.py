@@ -2926,129 +2926,141 @@ def bulk_order_action(
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
 def bulk_import_orders(
     payload: BulkOrderImportPayload,
-    employee: Employee = Depends(get_current_active_employee), # Используем общую зависимость
+    employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
-    """Массовый импорт заказов из Excel для ТЕКУЩЕЙ компании с привязкой к филиалу."""
-    if employee.company_id is None: # SuperAdmin не может
+    """
+    Массовый импорт заказов.
+    ЛОГИКА "СЛИЯНИЯ": Если заказ уже есть (добавлен клиентом ранее), 
+    мы ОБНОВЛЯЕМ его дату партии и филиал, чтобы он попал в отчет.
+    """
+    if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно.")
 
     created_count = 0
+    updated_count = 0 # Новый счетчик
     errors = []
     warnings = []
-    # Дата партии по умолчанию - сегодня, если не указана в payload
+    
     import_party_date = payload.party_date if payload.party_date else date.today()
 
-    # --- ЛОГИКА ОПРЕДЕЛЕНИЯ ФИЛИАЛА ДЛЯ ИМПОРТА ---
+    # --- ЛОГИКА ОПРЕДЕЛЕНИЯ ФИЛИАЛОВ ---
     import_location_id = None
     if employee.role.name == 'Владелец':
-        # Владелец: Используем location_id из payload ИЛИ его собственный location_id
         if payload.location_id:
-            # Владелец выбрал филиал в интерфейсе, проверяем его
             loc_check = db.query(Location).filter(Location.id == payload.location_id, Location.company_id == employee.company_id).first()
-            if not loc_check:
-                raise HTTPException(status_code=404, detail="Выбранный для импорта филиал не найден в вашей компании.")
+            if not loc_check: raise HTTPException(status_code=404, detail="Филиал не найден.")
             import_location_id = payload.location_id
-            print(f"[Import Orders] Владелец ID={employee.id} импортирует в филиал ID={import_location_id}")
         elif employee.location_id:
-             # Используем основной филиал Владельца, если не выбран другой
              import_location_id = employee.location_id
-             print(f"[Import Orders] Владелец ID={employee.id} импортирует в свой филиал ID={import_location_id} (по умолчанию)")
         else:
-             # Если у Владельца нет location_id и он не выбрал филиал, ищем первый филиал компании
              first_location = db.query(Location).filter(Location.company_id == employee.company_id).first()
-             if not first_location:
-                  # Это не должно произойти, т.к. при создании компании создается "Главный филиал"
-                  raise HTTPException(status_code=400, detail="Критическая ошибка: Не найден ни один филиал в компании для импорта заказов.")
+             if not first_location: raise HTTPException(status_code=400, detail="Нет филиалов.")
              import_location_id = first_location.id
-             print(f"[Import Orders] Владелец ID={employee.id} не привязан к филиалу, импорт в первый найденный: ID={import_location_id}")
     else:
-        # Обычный сотрудник: Всегда импортирует в свой филиал
-        if not employee.location_id:
-            raise HTTPException(status_code=400, detail="Ошибка: Ваш профиль не привязан к филиалу, импорт невозможен.")
+        if not employee.location_id: raise HTTPException(status_code=400, detail="Вы не привязаны к филиалу.")
         import_location_id = employee.location_id
-        print(f"[Import Orders] Сотрудник ID={employee.id} импортирует в свой филиал ID={import_location_id}")
-    # --- КОНЕЦ ЛОГИКИ ОПРЕДЕЛЕНИЯ ФИЛИАЛА ---
+    # --- КОНЕЦ ЛОГИКИ ---
 
-    # --- Загрузка существующих данных для проверок ---
+    # Загружаем существующие трек-коды для проверки
+    existing_orders = db.query(Order).filter(Order.company_id == employee.company_id).all()
+    # Создаем словарь для быстрого поиска объекта заказа по трек-коду
+    existing_orders_map = {o.track_code: o for o in existing_orders}
+
+    # Подготовка кэша клиентов (если в excel есть коды)
     company_clients = db.query(Client).filter(Client.company_id == employee.company_id).all()
-    clients_by_phone = {c.phone: c for c in company_clients}
     clients_by_code_num = {c.client_code_num: c for c in company_clients if c.client_code_num is not None}
-    existing_track_codes = {o.track_code for o in db.query(Order.track_code).filter(Order.company_id == employee.company_id)}
-    unknown_client_counter = 1
-    # --- Конец загрузки ---
+    clients_by_phone = {c.phone: c for c in company_clients}
 
-    # --- Обработка каждой строки из payload ---
     for item in payload.orders_data:
-        # Валидация трек-кода
         if not item.track_code or not item.track_code.strip():
-            errors.append(f"Пропущена строка: отсутствует трек-код.")
+            errors.append("Пропущена строка без трек-кода.")
             continue
+        
         track_code = item.track_code.strip()
-        if track_code in existing_track_codes:
-             warnings.append(f"Заказ с трек-кодом '{track_code}' уже существует (пропущен).")
-             continue
+        
+        # === ГЛАВНОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА НА СУЩЕСТВОВАНИЕ ===
+        if track_code in existing_orders_map:
+            # --- СЦЕНАРИЙ: ЗАКАЗ УЖЕ ЕСТЬ (Клиент добавил сам или прошлый импорт) ---
+            existing_order = existing_orders_map[track_code]
+            
+            # Мы обновляем дату партии, ЧТОБЫ СИНХРОНИЗИРОВАТЬ СПИСКИ
+            # (Но только если заказ еще не выдан, чтобы не ломать историю закрытых)
+            if existing_order.status != "Выдан":
+                old_date = existing_order.party_date
+                existing_order.party_date = import_party_date
+                existing_order.location_id = import_location_id # Перемещаем в филиал приема
+                
+                # Если в Excel есть данные выкупа, обновляем их
+                if item.purchase_type == "Выкуп":
+                    existing_order.purchase_type = "Выкуп"
+                    if item.buyout_item_cost_cny: existing_order.buyout_item_cost_cny = item.buyout_item_cost_cny
+                    if item.buyout_rate_for_client: existing_order.buyout_rate_for_client = item.buyout_rate_for_client
+                
+                if old_date != import_party_date:
+                    updated_count += 1
+                    # warnings.append(f"Заказ {track_code}: Дата обновлена на {import_party_date}")
+            else:
+                warnings.append(f"Заказ {track_code}: Уже выдан, дата партии не изменена.")
+            
+            continue # Переходим к следующему, так как обновили существующий
+        # =====================================================
 
-        # Поиск/создание клиента
-        # Поиск клиента (БЕЗ СОЗДАНИЯ)
+        # --- СЦЕНАРИЙ: ЗАКАЗА НЕТ (Создаем новый) ---
+        
+        # Поиск клиента (если указан в файле)
         client = None
-        client_identifier = ""
         if item.client_code:
-             code_str = str(item.client_code).strip()
-             client_identifier = f"код '{code_str}'"
-             match_num = re.search(r'(\d+)$', code_str)
-             if match_num:
-                 try:
-                     num_val = int(match_num.group(1))
-                     client = clients_by_code_num.get(num_val)
-                 except ValueError: pass
+             match = re.search(r'(\d+)$', str(item.client_code))
+             if match: client = clients_by_code_num.get(int(match.group(1)))
         if not client and item.phone:
-             cleaned_phone = re.sub(r'\D', '', str(item.phone))
-             if not client_identifier: client_identifier = f"тел. '{cleaned_phone}'"
-             if cleaned_phone: client = clients_by_phone.get(cleaned_phone)
-
-        # (БЛОК СОЗДАНИЯ "НЕИЗВЕСТНОГО КЛИЕНТА" УДАЛЕН)
+             ph = re.sub(r'\D', '', str(item.phone))
+             client = clients_by_phone.get(ph)
 
         if not client:
-            warnings.append(f"Для заказа '{track_code}' не найден клиент ({client_identifier or 'нет идентификатора'}). Заказ импортирован как 'Невостребованный'.")
+             # Если клиента нет - это "Невостребованный"
+             pass 
 
-        # Определение статуса
         order_status = "Ожидает выкупа" if item.purchase_type == "Выкуп" else "В обработке"
 
-        # Создание объекта Order с ОБЯЗАТЕЛЬНЫМ location_id
         new_order = Order(
             track_code=track_code,
-            client_id=client.id if client else None, # <-- ГЛАВНОЕ ИЗМЕНЕНИЕ
+            client_id=client.id if client else None,
             company_id=employee.company_id,
-            location_id=import_location_id, # <-- ПРИВЯЗКА К ФИЛИАЛУ
+            location_id=import_location_id,
             purchase_type=item.purchase_type or "Доставка",
             status=order_status,
-            party_date=import_party_date,
+            party_date=import_party_date, # <-- Вот наша дата!
             comment=item.comment,
             buyout_item_cost_cny=item.buyout_item_cost_cny,
             buyout_rate_for_client=item.buyout_rate_for_client,
             buyout_commission_percent=item.buyout_commission_percent or 10.0
         )
         db.add(new_order)
-        existing_track_codes.add(track_code)
+        
+        # Добавляем в map, чтобы избежать дублей внутри одного файла
+        existing_orders_map[track_code] = new_order 
         created_count += 1
 
-        # Периодический flush
         if created_count % 100 == 0:
             try: db.flush()
-            except Exception as e_f:
-                 db.rollback(); errors.append(f"Ошибка flush (~{created_count}): {e_f}"); break
-    # --- Конец цикла обработки строк ---
+            except: db.rollback(); break
 
-    # Финальный commit
-    try: db.commit()
-    except Exception as e_c:
-         db.rollback(); errors.append(f"Критическая ошибка commit: {e_c}"); created_count = 0
+    try: 
+        db.commit()
+    except Exception as e: 
+        db.rollback()
+        errors.append(f"Ошибка сохранения: {e}")
+
+    # Формируем сообщение
+    msg = f"Импорт завершен. Создано новых: {created_count}."
+    if updated_count > 0:
+        msg += f" Обновлена дата партии у {updated_count} существующих заказов."
 
     return {
         "status": "ok",
-        "message": "Импорт заказов завершен.",
-        "created_clients": created_count, # Название поля неудачное, но оставим
+        "message": msg,
+        "created_clients": created_count,
         "errors": errors,
         "warnings": warnings
     }
