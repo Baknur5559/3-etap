@@ -266,6 +266,18 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
     (ВЕРСИЯ 3.0 - Добавлены клиентские инструменты)
     """
     tool = tool_command.get("tool")
+
+    # ===========================================================
+    # 🛡 ЗАЩИТА ОТ ВЛОЖЕННОСТИ (ЕСЛИ БОТ ПРОПУСТИЛ)
+    # ===========================================================
+    # Если параметры спрятаны внутри 'parameters', 'arguments' или 'args' — вытаскиваем их!
+    for key in ['parameters', 'arguments', 'args', 'params']:
+        if key in tool_command:
+            nested = tool_command[key]
+            if isinstance(nested, dict):
+                tool_command.update(nested) # Сливаем параметры в основной словарь
+                logger.info(f"[AI Tool] Unpacked nested '{key}': {nested}")
+    # ===========================================================
     
     # --- БЛОК КЛИЕНТСКИХ ИНСТРУМЕНТОВ ---
     
@@ -363,6 +375,27 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
         if not tracks or len(tracks) < 2: 
              return "❌ Ошибка логики: Инструмент вызван с недостаточным количеством трек-кодов."
         return await alert_order_submission(tracks)
+    
+    # === НОВЫЕ ИНСТРУМЕНТЫ (ШАГ 1) ===
+        
+    elif tool == "get_orders_by_date":
+            target_date = tool_command.get("target_date")
+            return await get_orders_by_date(api_request_func, employee_id, company_id, target_date)
+
+    elif tool == "calculate_orders":
+            client_search = tool_command.get("client_search")
+            total_weight = float(tool_command.get("total_weight", 0))
+            return await prepare_calculation(api_request_func, employee_id, company_id, client_search, total_weight)
+
+    elif tool == "update_client_data":
+            client_search = tool_command.get("client_search")
+            new_phone = tool_command.get("new_phone")
+            new_code = tool_command.get("new_code")
+            # Преобразуем код в число, если передан
+            if new_code and str(new_code).isdigit(): new_code = int(new_code)
+            return await prepare_client_update(api_request_func, employee_id, company_id, client_search, new_phone, new_code)
+            
+        # =================================
 
     # --- БЛОК АДМИНСКИХ ИНСТРУМЕНТОВ (требует employee_id) ---
     
@@ -416,14 +449,53 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
         # === БЛОК 2: КЛИЕНТЫ ===
 
         elif tool == "search_client":
-            query = tool_command.get("query")
-            clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": query, "company_id": company_id})
-            if not clients: return "❌ Клиенты не найдены."
-            text = f"🔍 **Поиск клиента '{query}':**\n"
+            # ЗАЩИТА: ИИ может перепутать 'query' и 'client_search'. Проверяем оба.
+            query = tool_command.get("query") or tool_command.get("client_search") or tool_command.get("name")
+            
+            if not query: 
+                return "❌ Ошибка: ИИ не передал текст для поиска."
+
+            clients = await api_request_func(
+                "GET", 
+                "/api/clients/search", 
+                employee_id=employee_id, 
+                params={"q": query, "company_id": company_id}
+            )
+
+            if isinstance(clients, dict) and "error" in clients:
+                return f"⚠️ Ошибка поиска: {clients['error']}"
+
+            if not clients: 
+                return f"❌ Клиенты по запросу '{query}' не найдены."
+
+            # Формируем красивый список
+            text = f"🔍 <b>Результаты поиска '{query}':</b>\n\n"
+            
             for c in clients:
                 code = f"{c.get('client_code_prefix')}{c.get('client_code_num')}"
-                text += f"- **{c['full_name']}** (Код: {code})\n  📞 {c['phone']}\n"
+                # Безопасное имя
+                safe_name = c['full_name'].replace("<", "&lt;").replace(">", "&gt;") if c['full_name'] else "Без имени"
+                
+                # --- ВАЖНО: Формируем строку со всеми данными ---
+                text += (
+                    f"🆔 ID: <b>{c['id']}</b>\n"
+                    f"👤 Имя: <b>{safe_name}</b>\n"
+                    f"🔢 Код: <b>{code}</b>\n"
+                    f"📞 Тел: <b>{c['phone']}</b>\n"
+                    f"────────────────\n"
+                )
+            
+            # --- ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ ИИ ---
+            if len(clients) > 1:
+                text += "\n⚠️ <b>СИСТЕМНОЕ ТРЕБОВАНИЕ:</b> Найдено несколько людей. ТЫ ОБЯЗАН ВЫВЕСТИ ЭТОТ СПИСОК ЦЕЛИКОМ (включая КОД и ТЕЛЕФОН), чтобы Владелец мог выбрать. Не сокращай данные! В конце спроси: 'С каким ID работаем?'"
+            
             return text
+        
+        elif tool == "admin_get_client_orders":
+            target_id = tool_command.get("target_client_id")
+            if not target_id: return "❌ Ошибка: Не передан ID клиента."
+            # Используем существующую функцию, но подставляем ID нужного клиента
+            return await get_user_orders_json(api_request_func, int(target_id), company_id)
 
         elif tool == "change_client_code":
             search = tool_command.get("client_search")
@@ -551,3 +623,133 @@ async def submit_complaint(api_request_func, client_id: int, company_id: int, te
         return json.dumps({"status": "success", "message": "✅ Ваша жалоба официально зарегистрирована и передана руководству. Мы разберемся в ближайшее время."}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    
+async def get_orders_by_date(api_request_func, employee_id: int, company_id: int, target_date: str) -> str:
+    """
+    Инструмент: Поиск заказов по конкретной дате партии.
+    """
+    try:
+        # Запрашиваем заказы за эту дату
+        orders = await api_request_func(
+            "GET", 
+            "/api/orders", 
+            employee_id=employee_id, 
+            params={"party_dates": target_date, "company_id": company_id}
+        )
+        
+        if not orders: 
+            return f"📅 Заказов за дату **{target_date}** не найдено."
+            
+        # Формируем красивый список
+        text = f"📅 **Заказы партии от {target_date} ({len(orders)} шт):**\n\n"
+        
+        # Группировка по статусам
+        status_counts = {}
+        for o in orders:
+            s = o.get('status', 'Неизвестно')
+            status_counts[s] = status_counts.get(s, 0) + 1
+            
+        # Вывод статистики
+        for s, count in status_counts.items():
+            text += f"• {s}: {count}\n"
+            
+        text += "\n👇 *Примеры (последние 5):*\n"
+        for o in orders[:5]:
+            client_name = o.get('client', {}).get('full_name', 'Без клиента')
+            text += f"- `{o['track_code']}` ({client_name}) -> {o['status']}\n"
+            
+        return text
+    except Exception as e:
+        return f"❌ Ошибка поиска по дате: {e}"
+
+async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_search: str, total_weight: float) -> str:
+    """
+    Инструмент: Подготовка расчета (Калькулятор).
+    Находит клиента -> Находит активные заказы -> Считает предварительную сумму -> Возвращает JSON для подтверждения.
+    """
+    try:
+        # 1. Ищем клиента
+        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        if len(clients) > 1:
+            # Если нашли нескольких, просим уточнить (возвращаем список)
+            list_str = "\n".join([f"- {c['full_name']} (Код: {c.get('client_code_prefix')}{c.get('client_code_num')})" for c in clients[:5]])
+            return f"⚠️ Найдено несколько клиентов. Уточните, кто именно:\n{list_str}"
+        
+        client = clients[0]
+        
+        # 2. Ищем заказы "В пути" или "На складе" (подходящие для выдачи)
+        active_statuses = ["В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа"] # Берем всё, что едет
+        orders = await api_request_func(
+            "GET", 
+            "/api/orders", 
+            employee_id=employee_id, 
+            params={"client_id": client['id'], "statuses": active_statuses, "company_id": company_id}
+        )
+        
+        if not orders: return f"❌ У клиента **{client['full_name']}** нет активных заказов для расчета."
+        
+        # 3. Получаем тарифы (через API цены)
+        price_data = await api_request_func("GET", "/api/bot/price", params={"company_id": company_id})
+        price = price_data.get("price_usd", 5.5)
+        rate = price_data.get("exchange_rate", 89.5)
+        
+        # 4. Считаем
+        count = len(orders)
+        cost_som = total_weight * price * rate
+        
+        # 5. Возвращаем JSON подтверждения
+        return json.dumps({
+            "confirm_action": "confirm_calc",
+            "client_id": client['id'],
+            "client_name": client['full_name'],
+            "order_ids": [o['id'] for o in orders],
+            "count": count,
+            "weight": total_weight,
+            "price": price,
+            "rate": rate,
+            "total_sum": round(cost_som, 0),
+            "message": (
+                f"🧮 **РАСЧЕТ И ПРИЕМКА**\n"
+                f"👤 Клиент: **{client['full_name']}**\n"
+                f"📦 Заказов: **{count} шт** (распределю вес поровну)\n"
+                f"⚖️ Вес: **{total_weight} кг**\n"
+                f"💰 К оплате: **{round(cost_som)} сом**\n"
+                f"ℹ️ Тариф: {price}$ / Курс: {rate}\n\n"
+                f"❓ **Подтверждаете расчет и смену статуса на 'Готов к выдаче'?**"
+            )
+        }, ensure_ascii=False)
+        
+    except Exception as e:
+        return f"❌ Ошибка расчета: {e}"
+
+async def prepare_client_update(api_request_func, employee_id: int, company_id: int, client_search: str, new_phone: str = None, new_code: str = None) -> str:
+    """
+    Инструмент: Подготовка изменения данных клиента.
+    """
+    try:
+        # 1. Ищем клиента
+        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        client = clients[0]
+        
+        changes_text = ""
+        if new_phone: changes_text += f"📱 Телефон: {client.get('phone')} ➡️ **{new_phone}**\n"
+        if new_code: changes_text += f"🔢 Код номера: {client.get('client_code_num')} ➡️ **{new_code}**\n"
+        
+        if not changes_text: return "⚠️ Вы не указали, что менять (телефон или код)."
+        
+        return json.dumps({
+            "confirm_action": "confirm_client_edit",
+            "client_id": client['id'],
+            "new_phone": new_phone,
+            "new_code": new_code,
+            "message": (
+                f"📝 **РЕДАКТИРОВАНИЕ КЛИЕНТА**\n"
+                f"👤 {client['full_name']}\n\n"
+                f"{changes_text}\n"
+                f"❓ **Сохранить изменения?**"
+            )
+        }, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Ошибка подготовки обновления: {e}"
