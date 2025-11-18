@@ -15,9 +15,9 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, date
 import json # <-- Добавляем json
-from ai_brain import get_ai_response
+from ai_brain import get_ai_response, AI_CLIENT_PROMPT, AI_OWNER_PROMPT # <-- Импортируем оба промпта
 from ai_tools import execute_ai_tool # <-- Убрали старый промпт
-from ai_brain import AI_SYSTEM_PROMPT # <-- Добавили НОВЫЙ промпт "АЗЕМ"
+import openpyxl
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -102,15 +102,18 @@ owner_main_menu_markup = ReplyKeyboardMarkup(owner_main_menu_keyboard, resize_ke
     ADD_ORDER_TRACK_CODE,
     ADD_ORDER_COMMENT,
 
-# --- НОВЫЕ ДИАЛОГИ ВЛАДЕЛЬЦА ---
+    # Диалоги Владельца
     OWNER_ASK_ORDER_SEARCH,
     OWNER_ASK_CLIENT_SEARCH,
-    OWNER_ASK_BROADCAST_PHOTO, # <-- ДОБАВЛЕНО
+    OWNER_ASK_BROADCAST_PHOTO,
     OWNER_ASK_BROADCAST_TEXT,
-    OWNER_REASK_BROADCAST_TEXT, # <-- ДОБАВЛЕНО
-    OWNER_CONFIRM_BROADCAST
+    OWNER_REASK_BROADCAST_TEXT,
+    OWNER_CONFIRM_BROADCAST,
+    
+    # Импорт Excel
+    OWNER_WAIT_IMPORT_DATE # <-- НОВОЕ (12-е состояние)
 
-) = range(11) # Теперь 11 состояний
+) = range(12) # Теперь 11 состояний
 
 # --- 4. Функции-помощники ---
 
@@ -947,7 +950,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     3. Получает ответ ИИ.
     4. Если ИИ вернул Текст + Инструмент -> Сначала отправляет текст, потом выполняет инструмент.
     """
-    from ai_brain import AI_SYSTEM_PROMPT # Импортируем "АЗЕМА"
+    from ai_brain import AI_CLIENT_PROMPT, AI_OWNER_PROMPT # <-- Импортируем ОБА промпта
     import ast
     import json
     import html
@@ -991,6 +994,14 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # 4. АВТО-ПЕРЕХВАТ ТРЕК-КОДОВ
     potential_tracks = re.findall(r'\b[a-zA-Z0-9]{8,25}\b', text)
     valid_tracks = [t for t in potential_tracks if any(char.isdigit() for char in t)]
+
+    # --- УМНЫЙ ФИЛЬТР (ИСПРАВЛЕНИЕ) ---
+    # Если пишет Владелец и код ВСЕГО ОДИН, мы НЕ перехватываем его.
+    # Мы отдаем его ИИ, чтобы ИИ мог поискать клиента или заказ.
+    should_intercept = True
+    if is_owner and len(valid_tracks) == 1:
+         should_intercept = False
+    # ----------------------------------
 
     if valid_tracks and len(valid_tracks) >= 1:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1128,7 +1139,18 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except: pass
 
     # Формируем системный промпт
-    system_role = AI_SYSTEM_PROMPT.format(company_name=COMPANY_NAME_FOR_BOT)
+    # --- УМНЫЙ ВЫБОР МОЗГА (ШАГ 3) ---
+    if is_owner:
+        base_prompt = AI_OWNER_PROMPT
+        # logger.info(f"Режим Владельца для {client_id}")
+    else:
+        base_prompt = AI_CLIENT_PROMPT
+        # logger.info(f"Режим Клиента для {client_id}")
+
+    # Формируем системный промпт
+    system_role = base_prompt.format(company_name=COMPANY_NAME_FOR_BOT)
+    
+    # Добавляем контекст (дату, профиль)
     system_role += (
         f"\n\n--- КОНТЕКСТ ДИАЛОГА ---\n"
         f"СЕГОДНЯ: {current_date}.\n"
@@ -1137,20 +1159,91 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"{company_info_text}\n"
         f"--- КОНЕЦ КОНТЕКСТА ---"
     )
+    # ---------------------------------
 
     # 6. ЗАПРОС ИИ
     wait_task = asyncio.create_task(notify_progress(context, chat_id))
     
     try:
+        # 1. Получаем ответ от ИИ
         ai_answer = await asyncio.wait_for(get_ai_response(history, system_role), timeout=60.0)
         wait_task.cancel()
-        
-        # Сохраняем ответ в историю
+
+        # 2. Исправляем форматирование (Markdown -> HTML)
+        if "**" in ai_answer:
+            ai_answer = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', ai_answer)
+            
+        # Сохраняем в историю
         history.append({"role": "assistant", "content": ai_answer})
         context.user_data['dialog_history'] = history
 
+        # ====================================================================================
+        # --- УНИВЕРСАЛЬНЫЙ ПАРСЕР КОМАНД v4.0 (Nested Support) ---
+        # ====================================================================================
+        command = None
+        clean_ans = ai_answer.strip()
+        
+        # ЛОГИКА "СКОБКИ": Ищем первую { и последнюю } во всем тексте.
+        # Это работает лучше регулярок для вложенных структур.
+        json_start = clean_ans.find('{')
+        json_end = clean_ans.rfind('}') + 1
+        
+        if json_start != -1 and json_end > json_start:
+            json_str = clean_ans[json_start:json_end]
+            try: 
+                command = json.loads(json_str)
+                logger.info(f"[JSON Parser] Successfully parsed JSON via loads: {command}")
+            except: 
+                try: 
+                    # Если json.loads не справился (например, одинарные кавычки), пробуем ast
+                    command = ast.literal_eval(json_str)
+                    logger.info(f"[JSON Parser] Successfully parsed JSON via ast: {command}")
+                except Exception as e: 
+                    logger.warning(f"[JSON Parser] Failed to parse string: {json_str[:50]}... Error: {e}")
+                    pass
+
+        # ЛОГИКА "АДАПТЕР": Нормализуем любые форматы (Action, Function, Params)
+        if command and isinstance(command, dict):
+            # Приводим ключи к нижнему регистру
+            command = {k.lower(): v for k, v in command.items()}
+            
+            # 1. Action/Function -> Tool
+            if "tool" not in command:
+                if "function" in command: command["tool"] = command.pop("function")
+                elif "action" in command: command["tool"] = command.pop("action")
+            
+            # 2. Arguments/Parameters -> Плоская структура
+            # Ищем вложенные словари и вытаскиваем их наверх
+            for key in ["arguments", "parameters", "params", "args"]:
+                if key in command:
+                    nested = command.pop(key)
+                    if isinstance(nested, str):
+                        try: nested = json.loads(nested)
+                        except: pass
+                    if isinstance(nested, dict):
+                        command.update(nested)
+            
+            logger.info(f"[Smart Adapter] FINAL COMMAND: {command}")
+
+        # ЛОГИКА "СПАСАТЕЛЬНЫЙ КРУГ" (Если JSON вообще не найден, ищем func())
+        if not command:
+            func_match = re.search(r'([a-zA-Z_]+)\((.*)\)', clean_ans)
+            if func_match:
+                tool_name = func_match.group(1)
+                if tool_name in ["search_client", "search_order", "calculate_orders", "update_client_data", "get_orders_by_date", "bulk_update_party", "add_expense", "get_settings", "get_shipping_price", "get_company_locations", "get_user_orders_json", "add_client_order_request", "admin_get_client_orders"]:
+                    command = {"tool": tool_name}
+                    # Парсим параметры грубой силой
+                    args_str = func_match.group(2)
+                    for match in re.finditer(r'(\w+)=["\'](.*?)["\']', args_str):
+                        command[match.group(1)] = match.group(2)
+                    for match in re.finditer(r'(\w+)=(\d+(\.\d+)?)', args_str):
+                        if match.group(1) not in command: command[match.group(1)] = float(match.group(2)) if '.' in match.group(2) else int(match.group(2))
+                    logger.info(f"[Text Parser] Parsed text command: {command}")
+        # ====================================================================================
+
         # 7. ВЫПОЛНЕНИЕ КОМАНД
-        if "tool" in ai_answer or "confirm_action" in ai_answer:
+        if command and isinstance(command, dict) and "tool" in command:
+             # ... (код выполнения остается без изменений)
             try:
                 # --- (НОВОЕ) ОТПРАВКА ТЕКСТА ПЕРЕД ИНСТРУМЕНТОМ ---
                 json_start = ai_answer.find('{')
@@ -1175,6 +1268,23 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     except:
                         try: command = ast.literal_eval(json_str)
                         except: pass
+
+                # --- ПАТЧ ДЛЯ НЕСЛУХА (Адаптер JSON) ---
+                if command and isinstance(command, dict):
+                    # Если ИИ решил выпендриться и написал "function" вместо "tool"
+                    if "function" in command and "tool" not in command:
+                        command["tool"] = command.pop("function") # Переименовываем в tool
+                        
+                        # Если параметры спрятаны внутри "arguments"
+                        if "arguments" in command:
+                            args = command.pop("arguments")
+                            # Иногда аргументы приходят как строка JSON, иногда как словарь
+                            if isinstance(args, str):
+                                try: args = json.loads(args)
+                                except: pass
+                            if isinstance(args, dict):
+                                command.update(args) # Вытаскиваем параметры наверх
+                # ---------------------------------------
 
                 if command and isinstance(command, dict) and "tool" in command:
                     if command['tool'] != 'get_user_orders_json':
@@ -1935,6 +2045,45 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_text(f"✅ Статус обновлен для {len(ids)} заказов.")
             else:
                 await query.edit_message_text("❌ Заказы не найдены.")
+        # --- 6. РАСЧЕТ ЗАКАЗОВ (НОВОЕ) ---
+        # Callback будет выглядеть как ai_confirm_confirm_calc (из-за префикса ai_confirm_)
+        elif data == "ai_confirm_confirm_calc":
+            # 1. Формируем список заказов с весом (распределяем общий вес поровну)
+            weight_per_item = action_data['weight'] / action_data['count']
+            orders_payload = [{"order_id": oid, "weight_kg": weight_per_item} for oid in action_data['order_ids']]
+            
+            payload = {
+                "orders": orders_payload,
+                "price_per_kg_usd": action_data['price'],
+                "exchange_rate_usd": action_data['rate'],
+                "new_status": "Готов к выдаче" # Сразу меняем статус
+            }
+            
+            # 2. Вызываем API расчета
+            await api_request("POST", "/api/orders/calculate", employee_id=employee_id, json=payload)
+            
+            # 3. Отчет
+            await query.edit_message_text(
+                f"✅ <b>Расчет выполнен!</b>\n"
+                f"📦 Заказов: {action_data['count']}\n"
+                f"⚖️ Вес: {action_data['weight']} кг\n"
+                f"💰 Итог: <b>{action_data['total_sum']} сом</b>\n"
+                f"📍 Статус изменен на 'Готов к выдаче'. Клиент уведомлен.",
+                parse_mode=ParseMode.HTML
+            )
+
+        # --- 7. РЕДАКТИРОВАНИЕ КЛИЕНТА (НОВОЕ) ---
+        elif data == "ai_confirm_confirm_client_edit":
+            client_id = action_data['client_id']
+            payload = {}
+            # Добавляем только те поля, которые меняли
+            if action_data.get('new_phone'): payload['phone'] = action_data['new_phone']
+            if action_data.get('new_code'): payload['client_code_num'] = action_data['new_code']
+            
+            # Вызываем API обновления
+            await api_request("PATCH", f"/api/clients/{client_id}", employee_id=employee_id, json=payload)
+            
+            await query.edit_message_text(f"✅ Данные клиента успешно обновлены!", parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.error(f"Action Error: {e}")
@@ -2468,6 +2617,134 @@ async def handle_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+# --- МОДУЛЬ ИМПОРТА EXCEL (ВЛАДЕЛЕЦ) ---
+
+async def owner_handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Принимает Excel-файл и спрашивает дату."""
+    # Проверка прав
+    if not context.user_data.get('is_owner'):
+        await update.message.reply_text("Извините, я не умею работать с файлами.")
+        return ConversationHandler.END
+
+    doc = update.message.document
+    file_ext = doc.file_name.split('.')[-1].lower()
+    
+    if file_ext not in ['xlsx', 'xls']:
+        await update.message.reply_text("❌ Я понимаю только Excel файлы (.xlsx).")
+        return ConversationHandler.END
+
+    # Скачиваем файл
+    file = await doc.get_file()
+    file_path = f"/tmp/{doc.file_name}" # Сохраняем во временную папку
+    await file.download_to_drive(file_path)
+    
+    context.user_data['import_file_path'] = file_path
+    
+    await update.message.reply_html(
+        f"📂 Получил файл: <b>{doc.file_name}</b>\n\n"
+        "📅 <b>Какой датой записать эту партию?</b>\n"
+        "Напишите дату (например: <code>2023-11-18</code>) или слова <i>'сегодня'</i>, <i>'вчера'</i>.",
+        reply_markup=ReplyKeyboardMarkup([["Сегодня"], ["Отмена"]], resize_keyboard=True, one_time_keyboard=True)
+    )
+    return OWNER_WAIT_IMPORT_DATE
+
+async def owner_handle_import_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """(Владелец) Получает дату, парсит Excel и отправляет в API."""
+    date_text = update.message.text.strip().lower()
+    file_path = context.user_data.get('import_file_path')
+    client_id = context.user_data.get('client_id') # ID Владельца
+    
+    if not file_path or not os.path.exists(file_path):
+        await update.message.reply_text("❌ Ошибка: Файл потерян. Попробуйте отправить снова.")
+        return ConversationHandler.END
+
+    # 1. Определяем дату
+    target_date = date.today().isoformat() # По умолчанию сегодня
+    
+    if date_text in ['сегодня', 'today']:
+        target_date = date.today().isoformat()
+    elif date_text in ['вчера', 'yesterday']:
+        target_date = (date.today() - timedelta(days=1)).isoformat()
+    else:
+        # Пытаемся найти дату в тексте (YYYY-MM-DD)
+        import re
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', date_text)
+        if match:
+            target_date = match.group(1)
+        else:
+            # Если формат сложный, оставим "сегодня" но предупредим? 
+            # Для простоты пока так. Можно расширить логику.
+            pass
+
+    await update.message.reply_text(f"⏳ Обрабатываю файл... Партия от: {target_date}")
+
+    # 2. Парсим Excel (openpyxl)
+    try:
+        wb = openpyxl.load_workbook(file_path)
+        sheet = wb.active
+        
+        orders_data = []
+        # Ищем колонки (простая логика: ищем 'track' или берем 1-ю колонку)
+        # Предполагаем: 1 колонка - Трек, 2 - Код клиента (опц), 3 - Тел (опц), 4 - Коммент
+        
+        for row in sheet.iter_rows(min_row=2, values_only=True): # Пропускаем заголовок
+            if not row or not row[0]: continue
+            
+            track = str(row[0]).strip()
+            client_code = str(row[1]).strip() if len(row) > 1 and row[1] else None
+            phone = str(row[2]).strip() if len(row) > 2 and row[2] else None
+            comment = str(row[3]).strip() if len(row) > 3 and row[3] else None
+            
+            orders_data.append({
+                "track_code": track,
+                "client_code": client_code,
+                "phone": phone,
+                "comment": comment
+            })
+        
+        if not orders_data:
+            await update.message.reply_text("❌ Файл пуст или не содержит трек-кодов.")
+            return ConversationHandler.END
+
+        # 3. Отправляем в API
+        payload = {
+            "orders_data": orders_data,
+            "party_date": target_date,
+            # location_id возьмется из профиля владельца в API
+        }
+        
+        # Используем employee_id Владельца для авторизации запроса
+        employee_id = context.user_data.get('employee_id')
+        
+        api_response = await api_request(
+            "POST", 
+            "/api/orders/bulk_import", 
+            employee_id=employee_id,
+            json=payload
+        )
+        
+        if not api_response or "error" in api_response:
+            err = api_response.get("error", "Сбой API") if api_response else "Нет ответа"
+            await update.message.reply_text(f"❌ Ошибка импорта: {err}")
+        else:
+            msg = api_response.get("message", "Импорт завершен")
+            await update.message.reply_html(
+                f"✅ <b>Успешно!</b>\n\n{msg}\n"
+                f"📅 Дата партии: <b>{target_date}</b>",
+                reply_markup=owner_main_menu_markup
+            )
+
+    except Exception as e:
+        logger.error(f"Excel Import Error: {e}")
+        await update.message.reply_text("❌ Ошибка обработки файла. Убедитесь, что это правильный Excel.")
+    
+    finally:
+        # Удаляем файл
+        if os.path.exists(file_path): os.remove(file_path)
+        context.user_data.pop('import_file_path', None)
+
+    return ConversationHandler.END
+
 # --- 11. Отмена диалога ---
 
 async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2697,6 +2974,19 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
     logger.info(f"Бот (ID: {COMPANY_ID_FOR_BOT}) запущен и готов к работе...")
+    # --- Диалог Импорта Excel (Владелец) ---
+    owner_import_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Document.FileExtension("xlsx"), owner_handle_document)],
+        states={
+            OWNER_WAIT_IMPORT_DATE: [
+                MessageHandler(filters.Regex('^Отмена$'), cancel_dialog),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, owner_handle_import_date)
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_dialog)],
+        per_user=True, per_chat=True, name="owner_import"
+    )
+    application.add_handler(owner_import_conv)
     application.run_polling()
     
 # --- НОВАЯ ФУНКЦИЯ (ЗАГЛУШКА): Уведомление Владельца о Жалобе ---
