@@ -940,21 +940,21 @@ import ast # Добавь этот импорт в начало файла, ес
 
 async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """
-    (ФИНАЛ v22 - UZ/TIMING)
-    (v6.4 - Исправлено форматирование get_user_orders_json)
-    (v6.6 - ИСПРАВЛЕНА СИГНАТУРА: 'text: str' ВОЗВРАЩЕН)
-    (v6.7 - ИСПРАВЛЕН КОНТЕКСТ ЦЕНЫ)
+    (ФИНАЛ v8.0 - ГИБРИДНЫЙ ИНТЕЛЛЕКТ)
+    Обрабатывает текст от пользователя или Агрегатора.
+    1. Проверяет трек-коды (с защитой от слов типа 'WhatsApp').
+    2. Формирует контекст (Сыворотка Правды).
+    3. Получает ответ ИИ.
+    4. Если ИИ вернул Текст + Инструмент -> Сначала отправляет текст, потом выполняет инструмент.
     """
-    from ai_brain import AI_SYSTEM_PROMPT # <-- (ИСПРАВЛЕНО) Импортируем "АЗЕМА"
+    from ai_brain import AI_SYSTEM_PROMPT # Импортируем "АЗЕМА"
     import ast
     import json
-    import html # Убедись, что этот импорт есть вверху файла
+    import html
 
-    # --- (ИСПРАВЛЕНИЕ) Текст 'text' теперь приходит как аргумент ---
     if not text:
         logger.warning("process_text_logic получила пустой текст. Игнорируем.")
-        return # Если текст пустой, выходим
-    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
+        return
 
     user = update.effective_user
     client_id = context.user_data.get('client_id')
@@ -962,19 +962,17 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     is_owner = context.user_data.get('is_owner', False)
     chat_id = update.effective_chat.id
     
-    # === НАЧАЛО: ПРОВЕРКА ПЕРЕЗАПУСКА (v6.3) ===
-    # (Эта проверка теперь использует 'text', который пришел как аргумент)
+    # === 1. ПРОВЕРКА ПЕРЕЗАПУСКА ===
     if client_id is None and text.strip() not in ['/start', '/register']:
-        logger.warning(f"[Restart Check] client_id отсутствует для Chat ID {user.id}. Вероятен перезапуск. Просим нажать /start.")
+        logger.warning(f"[Restart Check] client_id отсутствует для Chat ID {user.id}. Вероятен перезапуск.")
         await update.message.reply_html(
             "<b>Бот был обновлен!</b> 🚀\n\n"
             "Пожалуйста, нажмите /start, чтобы обновить ваше меню и продолжить работу.",
             reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
         )
         return 
-    # === КОНЕЦ: ПРОВЕРКА ПЕРЕЗАПУСKA ===
 
-    # 1. ИНДИКАТОР РЕАКЦИИ
+    # 2. ИНДИКАТОР РЕАКЦИИ
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     
     if client_id:
@@ -982,9 +980,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         markup = ReplyKeyboardRemove()
 
-    # (Блок #2. МЕНЮ был удален в прошлом рефакторинге - это ПРАВИЛЬНО)
-
-    # 3. ПРОВЕРКА РУБИЛЬНИКА
+    # 3. ПРОВЕРКА РУБИЛЬНИКА (AI Toggle)
     if not (await is_ai_enabled()):
         if not client_id:
              await update.message.reply_text("Здравствуйте! Для начала работы нажмите /register.", reply_markup=ReplyKeyboardRemove())
@@ -993,56 +989,78 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     # 4. АВТО-ПЕРЕХВАТ ТРЕК-КОДОВ
-    potential_tracks = re.findall(r'([a-zA-Z0-9]{8,25})', text)
-    valid_tracks = [t for t in potential_tracks if len(t) >= 8]
+    potential_tracks = re.findall(r'\b[a-zA-Z0-9]{8,25}\b', text)
+    valid_tracks = [t for t in potential_tracks if any(char.isdigit() for char in t)]
 
     if valid_tracks and len(valid_tracks) >= 1:
-        await update.message.reply_text(f"🔎 Найдено треков: {len(valid_tracks)}. Обрабатываю...", reply_markup=markup)
-        
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         
         try:
-            api_response = await asyncio.wait_for(
-                api_request("POST", "/api/bot/order_request", json={
-                    "client_id": client_id, "company_id": COMPANY_ID_FOR_BOT, "request_text": text
-                }),
-                timeout=60.0
-            )
+            # 1. ДЕЛАЕМ ПРОВЕРКУ (Check Only)
+            api_response = await api_request("POST", "/api/bot/order_request", json={
+                "client_id": client_id, 
+                "company_id": COMPANY_ID_FOR_BOT, 
+                "request_text": text,
+                "check_only": True 
+            })
             
             if not api_response or "error" in api_response:
-                err = api_response.get('error', 'Нет ответа') if api_response else 'Нет связи'
-                await update.message.reply_text(f"❌ Ошибка: {err}")
-                return
+                return # Пропускаем к ИИ при ошибке
 
-            created = api_response.get("created", 0)
-            assigned = api_response.get("assigned", 0)
-            skipped = api_response.get("skipped", 0)
-            
-            msg = "📋 <b>Результат:</b>\n"
-            if created > 0: msg += f"✅ Создано: {created}\n"
-            if assigned > 0: msg += f"🎉 Присвоено: {assigned}\n"
-            if skipped > 0: msg += f"⚠️ Уже в базе: {skipped}\n"
-            if created == 0 and assigned == 0 and skipped == 0: msg += "Не удалось добавить (возможно, формат неверен)."
+            if api_response.get("status") == "check_result":
+                stats = api_response.get("stats", {})
+                groups = api_response.get("groups", {})
+                
+                # --- ФОРМИРУЕМ КРАСИВЫЙ ОТЧЕТ ПО БЛОКАМ ---
+                msg = f"🔎 <b>Я нашел {stats.get('total')} трек-кодов:</b>\n"
 
-            await update.message.reply_html(msg, reply_markup=markup)
-            return 
+                # Блок 1: НОВЫЕ
+                if groups.get("new"):
+                    msg += f"\n🆕 <b>Новых: {stats.get('new')}</b>\n"
+                    msg += "   └ <i>Новый трек, создадим заказ.</i>\n"
+                    msg += "\n".join(groups["new"]) + "\n"
 
-        except asyncio.TimeoutError:
-             await update.message.reply_text("⚠️ Сервер долго не отвечает. Попробуйте позже.", reply_markup=markup)
-             return
+                # Блок 2: ПРИСВОЕНИЕ (МАГИЯ)
+                if groups.get("assigned"):
+                    msg += f"\n✨ <b>Присвоим (Магия): {stats.get('assigned')}</b>\n"
+                    msg += "   └ <i>Найден на складе (невостребованный). Присвоим вам!</i>\n"
+                    msg += "\n".join(groups["assigned"]) + "\n"
+
+                # Блок 3: ДУБЛИКАТЫ
+                if groups.get("duplicates"):
+                    msg += f"\n⚠️ <b>Дубликатов (пропустим): {stats.get('duplicates')}</b>\n"
+                    msg += "   └ <i>Эти заказы уже есть в базе. <b>Проверьте разницу в описании!</b></i>\n"
+                    msg += "\n".join(groups["duplicates"]) + "\n"
+
+                msg += "\n<b>Добавить эти заказы?</b>"
+                
+                # Сохраняем текст для подтверждения
+                context.user_data['pending_order_text'] = text
+                
+                # Кнопки
+                keyboard = [
+                    [InlineKeyboardButton("✅ Да, добавить всё", callback_data="confirm_add_orders")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_add_orders")]
+                ]
+                
+                # Отправляем БЕЗ обрезки (Telegram вмещает 4096 символов, этого хватит на ~100 треков)
+                # Если треков ОЧЕНЬ много (>100), Telegram сам разобьет сообщение, но мы пока отправим одним.
+                await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+                return 
+
         except Exception as e:
-            logger.error(f"Auto-Add Error: {e}")
-            await update.message.reply_text("Сбой при добавлении.", reply_markup=markup)
-            return
+            logger.error(f"Auto-Add Check Error: {e}")
+            pass
 
-    # 5. ПОДГОТОВКА ИИ
+    # 5. ПОДГОТОВКА КОНТЕКСТА ДЛЯ ИИ
     history = context.user_data.get('dialog_history', [])
     history.append({"role": "user", "content": text})
-    if len(history) > 10: history = history[-10:]
+    if len(history) > 10: history = history[-10:] # Храним последние 10 сообщений
 
-    # --- СЫВОРОТКА ПРАВДЫ ---
+    # --- СЫВОРОТКА ПРАВДЫ (Сбор данных о компании) ---
     company_info_text = ""
     try:
+        # 1. Филиалы
         loc_data = await api_request("GET", "/api/bot/locations", params={"company_id": COMPANY_ID_FOR_BOT})
         if loc_data:
             company_info_text += "\n🏢 **НАШИ АДРЕСА:**\n"
@@ -1056,6 +1074,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
              company_info_text += "Адреса филиалов пока не настроены.\n"
 
+        # 2. Правила (Settings)
         rule_keys = ['rule_buyout', 'rule_delivery', 'rule_general']
         rules_response = await api_request("GET", "/api/bot/settings", params={'company_id': COMPANY_ID_FOR_BOT, 'keys': rule_keys})
         
@@ -1065,17 +1084,14 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if rules_dict.get('rule_buyout'): 
                 company_info_text += f"\n🛒 **ВЫКУП:**\n{rules_dict['rule_buyout']}\n"
             
-            # === НАЧАЛО ИСПРАВЛЕНИЯ ===
             if rules_dict.get('rule_delivery'):
-                # Удаляем упоминания цены/тарифа из контекста
+                # Цензурируем цены в правилах доставки, чтобы ИИ использовал инструмент
                 rule_delivery_text = rules_dict['rule_delivery']
-                # Заменяем (без учета регистра) слова "сом", "$", "usd", "цена", "тариф", "6.0", "5.5" и т.д.
                 rule_delivery_text = re.sub(r'(\d+(\.\d+)?\s*(\$|usd|сом|kgs|kgs|cом))|(\d+(\.\d+)?\s*(доллар|сом))|(цена|тариф)', 
-                                            '[...цена...]', # Цензурируем
+                                            '[...цена...]', 
                                             rule_delivery_text, 
                                             flags=re.IGNORECASE)
-                company_info_text += f"\n🚚 **ДОСТАВКА:**\n{rule_delivery_text}\n"
-            # === КОНЕЦ ИСПРАВЛЕНИЯ ===
+                company_info_text += f"\n🚚 **ПРАВИЛА ДОСТАВКИ:**\n{rule_delivery_text}\n"
 
             if rules_dict.get('rule_general'): 
                 company_info_text += f"\nℹ️ **ИНФО:**\n{rules_dict['rule_general']}\n"
@@ -1083,38 +1099,36 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception:
         pass
     
-    # --- (ИСПРАВЛЕНИЕ) Устанавливаем часовой пояс Бишкека (GMT+6) ---
+    # Время (Бишкек)
     bishkek_tz = timezone(timedelta(hours=6))
-    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
     current_date = datetime.now(tz=bishkek_tz).strftime("%Y-%m-%d %H:%M")
     
+    # Профиль клиента и счетчик заказов
     client_profile_str = "..."
     orders_str = "..."
     try:
+        # Профиль
         c_data = await api_request("GET", f"/api/clients/{client_id}", params={"company_id": COMPANY_ID_FOR_BOT})
         if c_data:
              code = f"{c_data.get('client_code_prefix','')}{c_data.get('client_code_num','')}"
              client_profile_str = f"ФИО: {c_data.get('full_name')}\nКод: {code}\nТел: {c_data.get('phone')}"
         
-        # --- (ИСПРАВЛЕНО) Запрашиваем АКТУАЛЬНЫЕ статусы (как в 'my_orders') ---
+        # Заказы (только активные статусы)
         active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
         o_data = await api_request("GET", "/api/orders", params={
             "client_id": client_id, 
             "company_id": COMPANY_ID_FOR_BOT, 
-            "statuses": active_statuses, # <-- Используем фильтр статусов
-            "limit": 50 # <-- Увеличиваем лимит
+            "statuses": active_statuses, 
+            "limit": 50
         })
         if o_data and isinstance(o_data, list):
              orders_str = f"Активных заказов: {len(o_data)}."
         else:
              orders_str = "Активных заказов: 0."
-        # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
     except: pass
 
-    # (ИСПРАВЛЕНО) Используем AI_SYSTEM_PROMPT ("АЗЕМ") и форматируем его
+    # Формируем системный промпт
     system_role = AI_SYSTEM_PROMPT.format(company_name=COMPANY_NAME_FOR_BOT)
-    
-    # Добавляем "Сыворотку Правды" (контекст)
     system_role += (
         f"\n\n--- КОНТЕКСТ ДИАЛОГА ---\n"
         f"СЕГОДНЯ: {current_date}.\n"
@@ -1124,25 +1138,39 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"--- КОНЕЦ КОНТЕКСТА ---"
     )
 
-    # 6. ЗАПРОС ИИ (С ТАЙМЕРАМИ)
+    # 6. ЗАПРОС ИИ
     wait_task = asyncio.create_task(notify_progress(context, chat_id))
     
     try:
         ai_answer = await asyncio.wait_for(get_ai_response(history, system_role), timeout=60.0)
         wait_task.cancel()
         
+        # Сохраняем ответ в историю
         history.append({"role": "assistant", "content": ai_answer})
         context.user_data['dialog_history'] = history
 
         # 7. ВЫПОЛНЕНИЕ КОМАНД
         if "tool" in ai_answer or "confirm_action" in ai_answer:
             try:
+                # --- (НОВОЕ) ОТПРАВКА ТЕКСТА ПЕРЕД ИНСТРУМЕНТОМ ---
+                json_start = ai_answer.find('{')
+                
+                # Если перед JSON есть текст (извинения, комментарии) — отправляем его
+                if json_start > 0:
+                    text_before = ai_answer[:json_start].strip()
+                    if text_before:
+                        await update.message.reply_html(text_before)
+                # --------------------------------------------------
+
                 clean_ans = ai_answer.replace("```json", "").replace("```", "").strip()
                 command = None
-                if "{" in clean_ans:
-                    json_start = clean_ans.find('{')
-                    json_end = clean_ans.rfind('}') + 1
-                    json_str = clean_ans[json_start:json_end]
+                
+                # Парсинг JSON
+                json_start_clean = clean_ans.find('{')
+                json_end_clean = clean_ans.rfind('}') + 1
+                
+                if json_start_clean != -1 and json_end_clean > json_start_clean:
+                    json_str = clean_ans[json_start_clean:json_end_clean]
                     try: command = json.loads(json_str)
                     except:
                         try: command = ast.literal_eval(json_str)
@@ -1152,6 +1180,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     if command['tool'] != 'get_user_orders_json':
                          await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
+                    # ВЫПОЛНЯЕМ ИНСТРУМЕНТ (Здесь сработают наши новые функции доставки/жалоб)
                     tool_result = await execute_ai_tool(
                         tool_command=command, 
                         api_request_func=api_request, 
@@ -1160,6 +1189,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         client_id=client_id
                     )
                     
+                    # Логика подтверждений для Владельца (остается)
                     try:
                         if is_owner and isinstance(tool_result, str) and tool_result.strip().startswith("{") and "confirm_action" in tool_result:
                             confirm_data = json.loads(tool_result)
@@ -1172,21 +1202,22 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             return
                     except: pass
                     
+                    # Обработка результата инструмента
                     final_text = str(tool_result)
                     try:
                         if final_text.strip().startswith(("{", "[")):
                             res_json = json.loads(final_text)
+                            
                             if isinstance(res_json, dict) and "message" in res_json:
                                 final_text = res_json["message"]
                             
-                            # === НАЧАЛО ИСПРАВЛЕНИЯ (v6.4) ===
                             elif isinstance(res_json, dict) and "active_orders" in res_json:
-                                # (v2.0) Форматируем ответ от get_user_orders_json с историей и группировкой
+                                # Логика форматирования списка заказов
                                 orders = res_json.get("active_orders", [])
                                 if not orders:
                                     final_text = "У вас пока нет активных заказов. 🚚"
                                 else:
-                                    # Группировка
+                                    # Группировка по статусам
                                     active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
                                     grouped_orders = {}
                                     for status in active_statuses:
@@ -1198,65 +1229,48 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
                                     formatted_text = "📦 <b>Ваши текущие заказы:</b>\n"
                                     has_orders_in_message = False
-                                    bishkek_tz = timezone(timedelta(hours=6)) # Часовой пояс Бишкека 
+                                    bishkek_tz = timezone(timedelta(hours=6)) 
 
                                     for status, status_orders in grouped_orders.items():
-                                        if not status_orders:
-                                            continue
-                                        
+                                        if not status_orders: continue
                                         has_orders_in_message = True
                                         formatted_text += f"\n\n═════ <b>{status.upper()}</b> ({len(status_orders)} шт) ═════\n\n"
 
                                         for o in status_orders:
                                             formatted_text += f"<b>Трек:</b> <code>{o.get('трек', '?')}</code>\n"
-                                            # formatted_text += f"<b>Статус:</b> {o.get('статус', '?')}\n"
                                             comment = o.get('комментарий')
-                                            if comment:
-                                                formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
+                                            if comment: formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
                                             
                                             calc_weight = o.get('расчет_вес_кг')
                                             calc_cost = o.get('расчет_сумма_сом')
                                             if calc_weight is not None and calc_cost is not None:
                                                 formatted_text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
                                             
-                                            # --- НОВАЯ ЛОГИКА: Показ истории (v3.0 - Дедупликация) ---
+                                            # История
                                             history = o.get('history_entries', [])
                                             if history:
                                                 formatted_text += "<b>История:</b>\n"
                                                 try:
-                                                    # --- (НОВЫЙ БЛОК) ---
                                                     latest_status_map = {}
                                                     for entry in history:
                                                         entry_status = entry.get('status')
-                                                        # (AI tool уже конвертировал дату в строку .isoformat())
                                                         entry['parsed_date'] = datetime.fromisoformat(entry.get('date').replace('Z', '+00:00'))
-                                                        latest_status_map[entry_status] = entry # Перезаписываем
-
-                                                    filtered_history = latest_status_map.values()
-                                                    sorted_filtered_history = sorted(filtered_history, key=lambda e: e['parsed_date'])
-                                                    # --- (КОНЕЦ НОВОГО БЛОКА) ---
-
-                                                    for entry in sorted_filtered_history: # <-- Используем отфильтрованный список
+                                                        latest_status_map[entry_status] = entry
+                                                    
+                                                    sorted_history = sorted(latest_status_map.values(), key=lambda e: e['parsed_date'])
+                                                    for entry in sorted_history:
                                                         bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
-                                                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
-                                                        formatted_text += f"  <i>- {hist_date}: {entry.get('status')}</i>\n"
-                                                except Exception as e_hist:
-                                                    logger.warning(f"Ошибка парсинга даты истории (AI format): {e_hist}")
-                                                    formatted_text += "  <i>- (ошибка отображения истории)</i>\n"
-                                            # --- КОНЕЦ ИСТОРИИ ---
-
+                                                        formatted_text += f"  <i>- {bishkek_date.strftime('%d.%m %H:%M')}: {entry.get('status')}</i>\n"
+                                                except Exception:
+                                                    formatted_text += "  <i>- (ошибка истории)</i>\n"
                                             formatted_text += "──────────────\n"
                                     
-                                    if not has_orders_in_message:
-                                         formatted_text = "У вас пока нет активных заказов. 🚚"
-
-                                    if len(formatted_text) > 4000:
-                                         formatted_text = formatted_text[:4000] + "\n... (список слишком длинный)"
+                                    if not has_orders_in_message: formatted_text = "У вас пока нет активных заказов. 🚚"
+                                    if len(formatted_text) > 4000: formatted_text = formatted_text[:4000] + "\n..."
                                     final_text = formatted_text
-                            # === КОНЕЦ ИСПРАВЛЕНИЯ ===
 
                             elif isinstance(res_json, list): 
-                                # (Это для get_company_locations)
+                                # Список филиалов
                                 formatted_text = ""
                                 for l in res_json:
                                     nm = l.get("Филиал") or l.get("name") or "Филиал"
@@ -1268,47 +1282,28 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     if ph: formatted_text += f"📞 {ph}\n"
                                     formatted_text += "\n"
                                 if formatted_text: final_text = formatted_text
-                            
-                            # --- (НОВЫЙ БЛОК ELSE) ---
                             else:
-                                # Если JSON не подошел ни под один формат (например, это {"error": "..."})
-                                # Просто берем его как текст, он уже содержит сообщение об ошибке.
                                 final_text = str(tool_result)
-                            # --- (КОНЕЦ НОВОГО БЛОКА) ---
 
                     except Exception as e_json:
-                        # (ИСПРАВЛЕНО) Если не JSON, просто используем как текст
-                        logger.warning(f"Tool result was not JSON ({e_json}), using raw text.")
-                        final_text = str(tool_result) 
-                    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
+                        logger.warning(f"Tool result was not JSON, using raw text: {e_json}")
+                        final_text = str(tool_result)
                     
                     await update.message.reply_text(final_text[:4000], parse_mode=ParseMode.HTML)
                     return
 
             except Exception as e_tool:
-                # (ИСПРАВЛЕНО) Отправляем ошибку пользователю
-                logger.error(f"!!! [Tool Error] Ошибка при выполнении execute_ai_tool: {e_tool}", exc_info=True)
-                await update.message.reply_html(
-                    f"⚠️ <b>Произошла ошибка при выполнении команды.</b>\n"
-                    f"<i>Техническая деталь: {html.escape(str(e_tool))}</i>"
-                )
-                return # <-- (ВАЖНО) Выходим, чтобы не отправить ai_answer
-        
-        # (ИСПРАВЛЕНО) Этот блок теперь НЕ ДОЛЖЕН отправлять ai_answer, если был вызван инструмент
-        # (Мы уже вышли через 'return' внутри блока `if command...`)
+                logger.error(f"!!! [Tool Error]: {e_tool}", exc_info=True)
+                await update.message.reply_html(f"⚠️ Ошибка выполнения: {html.escape(str(e_tool))}")
+                return 
+
+        # Если инструментов нет - просто отправляем ответ ИИ
         await update.message.reply_html(ai_answer, reply_markup=markup)
 
     except asyncio.TimeoutError:
         wait_task.cancel()
         logger.error("AI Response Timeout (60s)")
-        
-        await update.message.reply_text(
-            "⚠️ **По техническим причинам я не могу сейчас подготовить ответ.**\n\n"
-            "Пожалуйста, свяжитесь с нами через оператора:\n"
-            "👉 Нажмите кнопку **«🇰🇬 Наши контакты»** в меню ниже.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup
-        )
+        await update.message.reply_text("⚠️ ИИ долго не отвечает. Пожалуйста, попробуйте позже или используйте меню.", reply_markup=markup)
 
     except Exception as e:
         wait_task.cancel()
@@ -2676,6 +2671,8 @@ def main() -> None:
 
     # Команда /cancel вне диалогов
     application.add_handler(CommandHandler('cancel', cancel_dialog))
+    application.add_handler(CallbackQueryHandler(handle_confirm_add_orders, pattern=r'^confirm_add_orders$'))
+    application.add_handler(CallbackQueryHandler(cancel_dialog, pattern=r'^cancel_add_orders$'))
 
     # --- НОВЫЕ: Обработчики кнопок меню (для скорости и надежности) ---
     # (Они должны стоять ПЕРЕД 'process_text_logic')
@@ -2711,6 +2708,43 @@ async def notify_owner_of_complaint(context: ContextTypes.DEFAULT_TYPE, complain
     logger.info(f"НОТИФИКАЦИЯ ЖАЛОБЫ (ЗАГЛУШКА): Текст: {complaint_text}")
     # TODO: Реализовать получение telegram_chat_id Владельца и отправку сообщения
     pass
+async def handle_confirm_add_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка кнопки 'Да, добавить всё'."""
+    query = update.callback_query
+    await query.answer()
+    
+    text = context.user_data.get('pending_order_text')
+    client_id = context.user_data.get('client_id')
+    
+    if not text or not client_id:
+        await query.edit_message_text("⚠️ Данные устарели. Отправьте список заново.")
+        return
+
+    await query.edit_message_text("⏳ Сохраняю...")
+    
+    try:
+        # Реальное сохранение (check_only=False)
+        api_response = await api_request("POST", "/api/bot/order_request", json={
+            "client_id": client_id, 
+            "company_id": COMPANY_ID_FOR_BOT, 
+            "request_text": text,
+            "check_only": False 
+        })
+        
+        created = api_response.get("created", 0)
+        assigned = api_response.get("assigned", 0)
+        skipped = api_response.get("skipped", 0)
+        
+        msg = f"✅ <b>Готово!</b>\n\n🆕 Добавлено: {created}\n✨ Присвоено: {assigned}\n⚠️ Пропущено: {skipped}"
+        
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode=ParseMode.HTML)
+        
+        # Очистка
+        context.user_data.pop('pending_order_text', None)
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Ошибка при сохранении: {e}")
+
 if __name__ == "__main__":
     main()
 
