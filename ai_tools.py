@@ -15,23 +15,13 @@ logger = logging.getLogger(__name__)
 
 async def get_user_orders_json(api_request_func, client_id: int, company_id: int, status_filter: Optional[List[str]] = None) -> str:
     """
-    Получает список заказов клиента, опционально фильтруя по статусу.
-    (ВЕРСИЯ 3.0 - Поддержка status_filter)
-    :param api_request_func: Асинхронная функция для выполнения API запросов.
-    :param client_id: ID текущего клиента.
-    :param company_id: ID текущей компании.
-    :param status_filter: (НОВОЕ) Список статусов для фильтрации.
-    :return: JSON-строка со списком заказов и их историей.
+    Умный инструмент: Возвращает список заказов И (НОВОЕ) считает ИТОГО внизу.
     """
     
-    # --- (ИСПРАВЛЕНО) ---
-    # Если фильтр не передан, используем стандартный набор "активных"
     if not status_filter:
         statuses_to_fetch = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
     else:
-        # Если фильтр передан (например, ["Готов к выдаче"]), используем его
         statuses_to_fetch = status_filter
-    # --- (КОНЕЦ ИСПРАВЛЕНИЯ) ---
     
     orders = await api_request_func(
         "GET",
@@ -39,38 +29,97 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
         params={
             "client_id": client_id,
             "company_id": company_id,
-            "statuses": statuses_to_fetch, # <-- Используем наш динамический список
-            "limit": 50 # (ИСПРАВЛЕНО) Синхронизировано с 'my_orders'
+            "statuses": statuses_to_fetch,
+            "limit": 100 
         }
     )
 
-    if not orders or "error" in orders:
-        # (ИСПРАВЛЕНО) Уточняем сообщение об ошибке
-        if not orders:
-            return json.dumps({"active_orders": [], "message": "По этому фильтру заказов не найдено."}, ensure_ascii=False)
-        return json.dumps({"error": "Не удалось загрузить заказы или их нет."}, ensure_ascii=False)
-
-    formatted_orders = []
-    for o in orders:
-        # Форматируем историю
-        history_entries = []
-        if o.get('history_entries'):
-            for entry in o['history_entries']:
-                history_entries.append({
-                    "status": entry.get('status'),
-                    "date": entry.get('created_at') # (ИСПРАВЛЕНО) Просто передаем строку
-                })
-        
-        formatted_orders.append({
-            "трек": o.get('track_code'),
-            "статус": o.get('status'),
-            "комментарий": o.get('comment'),
-            "расчет_вес_кг": o.get('calculated_weight_kg'),
-            "расчет_сумма_сом": o.get('calculated_final_cost_som'),
-            "history_entries": history_entries 
-        })
+    if not orders or (isinstance(orders, dict) and "error" in orders):
+        return json.dumps({"message": "📭 У этого клиента сейчас нет таких заказов."}, ensure_ascii=False)
     
-    return json.dumps({"active_orders": formatted_orders}, ensure_ascii=False)
+    if not isinstance(orders, list):
+        return json.dumps({"error": "Ошибка формата данных."}, ensure_ascii=False)
+
+    # --- РЕЖИМ 1: ДЕТАЛЬНЫЙ СПИСОК + ИТОГИ ---
+    if status_filter:
+        formatted_orders = []
+        
+        # Переменные для подсчета итогов
+        total_weight = 0.0
+        total_cost = 0.0
+        count_calculated = 0
+
+        for o in orders:
+            # Собираем историю
+            history_entries = []
+            if o.get('history_entries'):
+                for entry in o['history_entries']:
+                    history_entries.append({
+                        "status": entry.get('status'),
+                        "date": entry.get('created_at')
+                    })
+            
+            # Собираем данные для вывода
+            order_data = {
+                "трек": o.get('track_code'),
+                "статус": o.get('status'),
+                "комментарий": o.get('comment'),
+                "партия": o.get('party_date'), 
+                "history_entries": history_entries 
+            }
+
+            # Логика подсчета
+            w = o.get('calculated_weight_kg') or o.get('weight_kg')
+            c = o.get('calculated_final_cost_som') or o.get('final_cost_som')
+            
+            if w is not None and c is not None:
+                order_data["расчет"] = f"{w} кг / {c} сом"
+                total_weight += float(w)
+                total_cost += float(c)
+                count_calculated += 1
+            else:
+                order_data["расчет"] = None
+
+            formatted_orders.append(order_data)
+        
+        # Формируем итоговое сообщение
+        response_json = {"active_orders": formatted_orders}
+        
+        # Если есть посчитанные заказы, добавляем блок итогов
+        if count_calculated > 0:
+            summary_text = (
+                f"\n💰 <b>ИТОГО ПО СПИСКУ ({count_calculated} шт):</b>\n"
+                f"⚖️ Общий вес: <b>{total_weight:.2f} кг</b>\n"
+                f"💵 Общая сумма: <b>{total_cost:.2f} сом</b>"
+            )
+            response_json["summary_footer"] = summary_text # Бот добавит это в конец сообщения
+
+        return json.dumps(response_json, ensure_ascii=False)
+
+    # --- РЕЖИМ 2: СВОДКА (Без изменений) ---
+    else:
+        stats = {}
+        parties = set()
+        transit_statuses = ["В пути", "На складе в Китае", "На складе в КР"]
+
+        for o in orders:
+            status = o.get('status', 'Неизвестно')
+            stats[status] = stats.get(status, 0) + 1
+            if status in transit_statuses and o.get('party_date'):
+                parties.add(o.get('party_date'))
+
+        summary_msg = "📊 <b>Сводка по клиенту:</b>\n\n"
+        priority_order = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке"]
+        
+        for st in priority_order:
+            if stats.get(st, 0) > 0:
+                icon = "✅" if st == "Готов к выдаче" else "🚚" if st == "В пути" else "📦"
+                summary_msg += f"{icon} <b>{st}:</b> {stats[st]} шт.\n"
+
+        if parties:
+            summary_msg += f"\n📅 <b>Партии в пути:</b> {', '.join(sorted(list(parties), reverse=True))}"
+
+        return json.dumps({"message": summary_msg}, ensure_ascii=False)
 
 async def notify_buyout_request(api_request_func, client_id: int, company_id: int, amount_yuan: float = 0, amount_som: float = 0) -> str:
     """
@@ -383,9 +432,22 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             return await get_orders_by_date(api_request_func, employee_id, company_id, target_date)
 
     elif tool == "calculate_orders":
+            client_id = tool_command.get("target_client_id")
             client_search = tool_command.get("client_search")
             total_weight = float(tool_command.get("total_weight", 0))
-            return await prepare_calculation(api_request_func, employee_id, company_id, client_search, total_weight)
+            
+            # --- [NEW] Извлекаем дату партии ---
+            party_date = tool_command.get("party_date")
+            
+            return await prepare_calculation(
+                api_request_func, 
+                employee_id, 
+                company_id, 
+                client_id=client_id, 
+                client_search=client_search, 
+                total_weight=total_weight,
+                party_date=party_date # <-- Передаем дату
+            )
 
     elif tool == "update_client_data":
             client_search = tool_command.get("client_search")
@@ -396,6 +458,15 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             return await prepare_client_update(api_request_func, employee_id, company_id, client_search, new_phone, new_code)
             
         # =================================
+    elif tool == "bulk_update_client_orders":
+        client_id = tool_command.get("target_client_id")
+        old_status = tool_command.get("old_status")
+        new_status = tool_command.get("new_status")
+        if not client_id: return "❌ Нет ID клиента."
+        return await bulk_update_client_orders(api_request_func, employee_id, company_id, int(client_id), old_status, new_status)
+    
+    elif tool == "get_all_party_dates":
+        return await get_all_party_dates(api_request_func, company_id)
 
     # --- БЛОК АДМИНСКИХ ИНСТРУМЕНТОВ (требует employee_id) ---
     
@@ -485,17 +556,27 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                     f"────────────────\n"
                 )
             
-            # --- ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ ИИ ---
+            # Подсказка для ИИ, невидимая для пользователя (системный комментарий)
             if len(clients) > 1:
-                text += "\n⚠️ <b>СИСТЕМНОЕ ТРЕБОВАНИЕ:</b> Найдено несколько людей. ТЫ ОБЯЗАН ВЫВЕСТИ ЭТОТ СПИСОК ЦЕЛИКОМ (включая КОД и ТЕЛЕФОН), чтобы Владелец мог выбрать. Не сокращай данные! В конце спроси: 'С каким ID работаем?'"
+                 text += "\n\n👉 <i>(Системно: Найдено несколько. Спроси владельца: 'С каким ID работаем?')</i>"
             
             return text
         
         elif tool == "admin_get_client_orders":
             target_id = tool_command.get("target_client_id")
             if not target_id: return "❌ Ошибка: Не передан ID клиента."
-            # Используем существующую функцию, но подставляем ID нужного клиента
-            return await get_user_orders_json(api_request_func, int(target_id), company_id)
+            
+            # --- [FIX] ИЗВЛЕКАЕМ ФИЛЬТР СТАТУСОВ ИЗ КОМАНДЫ ИИ ---
+            # Раньше мы это игнорировали, поэтому бот всегда возвращал сводку
+            status_filter = tool_command.get("statuses") 
+            
+            # Передаем status_filter в функцию получения заказов
+            return await get_user_orders_json(
+                api_request_func, 
+                int(target_id), 
+                company_id, 
+                status_filter=status_filter # <--- ВОТ ЭТОГО НЕ ХВАТАЛО
+            )
 
         elif tool == "change_client_code":
             search = tool_command.get("client_search")
@@ -627,9 +708,14 @@ async def submit_complaint(api_request_func, client_id: int, company_id: int, te
 async def get_orders_by_date(api_request_func, employee_id: int, company_id: int, target_date: str) -> str:
     """
     Инструмент: Поиск заказов по конкретной дате партии.
+    (Safe Version)
     """
+    # --- [FIX] ЗАЩИТА ОТ ПУСТОЙ ДАТЫ ---
+    if not target_date or len(target_date) < 5:
+        return "❌ Ошибка: Не указана корректная дата (формат YYYY-MM-DD)."
+    # -----------------------------------
+
     try:
-        # Запрашиваем заказы за эту дату
         orders = await api_request_func(
             "GET", 
             "/api/orders", 
@@ -637,59 +723,92 @@ async def get_orders_by_date(api_request_func, employee_id: int, company_id: int
             params={"party_dates": target_date, "company_id": company_id}
         )
         
+        # --- ЗАЩИТА ОТ КРАША (FIX 'str' object has no attribute 'get') ---
+        # 1. Если вернулся словарь с ошибкой
+        if isinstance(orders, dict) and "error" in orders:
+            return f"⚠️ Ошибка API: {orders.get('error')}"
+        
+        # 2. Если вернулось что-то, что не список
+        if not isinstance(orders, list):
+             return f"⚠️ Некорректный ответ сервера (ожидался список, получено: {type(orders)})."
+        # ---------------------------------------------------------------
+        
         if not orders: 
             return f"📅 Заказов за дату **{target_date}** не найдено."
             
-        # Формируем красивый список
         text = f"📅 **Заказы партии от {target_date} ({len(orders)} шт):**\n\n"
         
-        # Группировка по статусам
         status_counts = {}
         for o in orders:
             s = o.get('status', 'Неизвестно')
             status_counts[s] = status_counts.get(s, 0) + 1
             
-        # Вывод статистики
         for s, count in status_counts.items():
             text += f"• {s}: {count}\n"
             
         text += "\n👇 *Примеры (последние 5):*\n"
+        # Берем последние 5 для примера
         for o in orders[:5]:
-            client_name = o.get('client', {}).get('full_name', 'Без клиента')
-            text += f"- `{o['track_code']}` ({client_name}) -> {o['status']}\n"
+            client_info = o.get('client', {}) or {} # Защита от None
+            client_name = client_info.get('full_name', 'Без клиента')
+            track = o.get('track_code', 'Нет трека')
+            status = o.get('status', 'Нет статуса')
+            text += f"- `{track}` ({client_name}) -> {status}\n"
             
         return text
-    except Exception as e:
-        return f"❌ Ошибка поиска по дате: {e}"
 
-async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_search: str, total_weight: float) -> str:
+    except Exception as e:
+        logger.error(f"Date Search Error: {e}", exc_info=True)
+        return f"❌ Ошибка поиска по дате: {str(e)}"
+
+async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_id: Optional[int], client_search: Optional[str], total_weight: float, party_date: Optional[str] = None) -> str:
     """
     Инструмент: Подготовка расчета (Калькулятор).
-    Находит клиента -> Находит активные заказы -> Считает предварительную сумму -> Возвращает JSON для подтверждения.
+    Теперь поддерживает фильтрацию по ДАТЕ ПАРТИИ.
     """
     try:
-        # 1. Ищем клиента
-        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
-        if not clients: return f"❌ Клиент '{client_search}' не найден."
-        if len(clients) > 1:
-            # Если нашли нескольких, просим уточнить (возвращаем список)
-            list_str = "\n".join([f"- {c['full_name']} (Код: {c.get('client_code_prefix')}{c.get('client_code_num')})" for c in clients[:5]])
-            return f"⚠️ Найдено несколько клиентов. Уточните, кто именно:\n{list_str}"
+        client = None
         
-        client = clients[0]
+        # 1. Находим клиента
+        if client_id:
+            client_data = await api_request_func("GET", f"/api/clients/{client_id}", params={"company_id": company_id})
+            if client_data and "id" in client_data:
+                client = client_data
         
-        # 2. Ищем заказы "В пути" или "На складе" (подходящие для выдачи)
-        active_statuses = ["В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа"] # Берем всё, что едет
-        orders = await api_request_func(
-            "GET", 
-            "/api/orders", 
-            employee_id=employee_id, 
-            params={"client_id": client['id'], "statuses": active_statuses, "company_id": company_id}
-        )
+        if not client and client_search:
+             clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+             if clients:
+                 if len(clients) > 1:
+                     list_str = "\n".join([f"- {c['full_name']} (ID: {c['id']})" for c in clients[:5]])
+                     return f"⚠️ Найдено несколько клиентов. Уточните ID:\n{list_str}"
+                 client = clients[0]
+
+        if not client:
+             return "❌ Клиент не найден."
+
+        # 2. Ищем заказы ДЛЯ РАСЧЕТА
+        calc_statuses = ["В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа", "Готов к выдаче"]
         
-        if not orders: return f"❌ У клиента **{client['full_name']}** нет активных заказов для расчета."
+        params = {
+            "client_id": client['id'], 
+            "statuses": calc_statuses, 
+            "company_id": company_id,
+            "limit": 100
+        }
         
-        # 3. Получаем тарифы (через API цены)
+        # --- [NEW] ФИЛЬТР ПО ДАТЕ ---
+        if party_date:
+            params["party_dates"] = party_date
+        # ----------------------------
+
+        orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params=params)
+        
+        if not orders: 
+            msg = f"❌ У клиента **{client['full_name']}** нет подходящих заказов."
+            if party_date: msg += f" (От даты {party_date})"
+            return msg
+        
+        # 3. Получаем тарифы
         price_data = await api_request_func("GET", "/api/bot/price", params={"company_id": company_id})
         price = price_data.get("price_usd", 5.5)
         rate = price_data.get("exchange_rate", 89.5)
@@ -698,6 +817,8 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
         count = len(orders)
         cost_som = total_weight * price * rate
         
+        date_info = f" (Партия: {party_date})" if party_date else ""
+
         # 5. Возвращаем JSON подтверждения
         return json.dumps({
             "confirm_action": "confirm_calc",
@@ -710,9 +831,9 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
             "rate": rate,
             "total_sum": round(cost_som, 0),
             "message": (
-                f"🧮 **РАСЧЕТ И ПРИЕМКА**\n"
+                f"🧮 **РАСЧЕТ И ПРИЕМКА**{date_info}\n"
                 f"👤 Клиент: **{client['full_name']}**\n"
-                f"📦 Заказов: **{count} шт** (распределю вес поровну)\n"
+                f"📦 Заказов: **{count} шт**\n"
                 f"⚖️ Вес: **{total_weight} кг**\n"
                 f"💰 К оплате: **{round(cost_som)} сом**\n"
                 f"ℹ️ Тариф: {price}$ / Курс: {rate}\n\n"
@@ -753,3 +874,66 @@ async def prepare_client_update(api_request_func, employee_id: int, company_id: 
         }, ensure_ascii=False)
     except Exception as e:
         return f"❌ Ошибка подготовки обновления: {e}"
+    
+async def bulk_update_client_orders(api_request_func, employee_id, company_id, client_id, old_status, new_status):
+    """
+    Инструмент: Находит все заказы клиента в статусе old_status и переводит их в new_status.
+    """
+    try:
+        # 1. Находим заказы этого клиента с старым статусом
+        orders = await api_request_func(
+            "GET", 
+            "/api/orders", 
+            params={
+                "client_id": client_id, 
+                "statuses": [old_status], 
+                "company_id": company_id,
+                "limit": 1000
+            }
+        )
+        
+        if not orders or (isinstance(orders, dict) and "error" in orders):
+            return f"❌ У этого клиента нет заказов в статусе '{old_status}'."
+            
+        order_ids = [o['id'] for o in orders]
+        count = len(order_ids)
+        
+        if count == 0:
+            return f"❌ Нет заказов для обновления."
+
+        # 2. Возвращаем JSON для кнопки подтверждения
+        return json.dumps({
+            "confirm_action": "bulk_status", 
+            "order_ids": order_ids, # Бэккенд должен поддерживать передачу ID или мы используем логику ниже
+            # ВНИМАНИЕ: Твой бэкенд для bulk_status принимает "party_date" или "order_ids".
+            # Но в execute_ai_tool для "bulk_status" сейчас жесткая привязка к дате.
+            # Мы сделаем ХИТРОСТЬ: Мы вернем специальный confirm_action, который мы обработаем в bot_template.
+            # НО ПРОЩЕ: Давай сделаем это через "ai_confirm_bulk_status_by_ids"
+            
+            # Вернем простой текст с JSON для подтверждения через bot_template
+            "confirm_action": "bulk_status_manual", # Новый тип подтверждения
+            "ids": order_ids,
+            "new_status": new_status,
+            "count": count,
+            "message": f"❓ Перевести **{count} заказов** клиента из '{old_status}' в **'{new_status}'**?"
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+    
+async def get_all_party_dates(api_request_func, company_id: int) -> str:
+    """
+    Инструмент: Получает список всех активных партий (дат).
+    """
+    try:
+        parties = await api_request_func("GET", "/api/orders/parties", params={"company_id": company_id})
+        
+        if not parties or not isinstance(parties, list):
+            return "📅 Активных партий не найдено."
+            
+        text = "📅 **Список всех партий:**\n"
+        for p in parties:
+            text += f"- {p}\n"
+        return text
+    except Exception as e:
+        return f"❌ Ошибка получения партий: {e}"
