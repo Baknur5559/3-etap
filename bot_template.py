@@ -1328,7 +1328,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     final_text = "У вас пока нет активных заказов. 🚚"
                                 else:
                                     # Группировка по статусам
-                                    active_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
+                                    active_statuses = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке"]
                                     grouped_orders = {}
                                     for status in active_statuses:
                                         grouped_orders[status] = []
@@ -1377,6 +1377,9 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     
                                     if not has_orders_in_message: formatted_text = "У вас пока нет активных заказов. 🚚"
                                     if len(formatted_text) > 4000: formatted_text = formatted_text[:4000] + "\n..."
+                                    # --- ДОБАВЛЕНИЕ ИТОГОВ (FOOTER) ---
+                                    if "summary_footer" in res_json:
+                                        formatted_text += "\n──────────────\n" + res_json["summary_footer"]
                                     final_text = formatted_text
 
                             elif isinstance(res_json, list): 
@@ -1399,7 +1402,65 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         logger.warning(f"Tool result was not JSON, using raw text: {e_json}")
                         final_text = str(tool_result)
                     
-                    await update.message.reply_text(final_text[:4000], parse_mode=ParseMode.HTML)
+                    # --- [ULTRA MEMORY FIX] ЭКОНОМИЯ ПАМЯТИ ---
+                    # Если ответ длинный (список заказов), мы НЕ пишем его в память ИИ целиком.
+                    # Мы пишем только краткую суть, чтобы ИИ не зависал.
+                    
+                    history_content = final_text
+                    
+                    # Если это JSON (список заказов или сводка)
+                    if final_text.strip().startswith("{") and "active_orders" in final_text:
+                         # Парсим, чтобы понять, сколько там заказов
+                         try:
+                             data = json.loads(final_text)
+                             count = len(data.get("active_orders", []))
+                             history_content = f"[Системно: Я вывел пользователю список из {count} заказов. Если он попросит что-то сделать с 'ними' или 'этим списком', используй ID клиента из контекста.]"
+                         except:
+                             history_content = "[Системно: Я показал пользователю список заказов.]"
+                    
+                    # Если это просто длинный текст
+                    elif len(final_text) > 200:
+                        history_content = final_text[:200] + "... [Текст сокращен для экономии памяти]"
+
+                    history.append({"role": "assistant", "content": history_content})
+                    context.user_data['dialog_history'] = history
+                    # ----------------------------------------------------------------------
+
+                    # --- SMART PAGINATION: Разбивка длинных сообщений ---
+                    if len(final_text) < 4000:
+                        # Короткое сообщение - отправляем сразу
+                        try:
+                            await update.message.reply_text(final_text, parse_mode=ParseMode.HTML)
+                        except Exception:
+                            await update.message.reply_text(final_text, parse_mode=None)
+                    else:
+                        # Длинное сообщение - разбиваем по заказам (разделитель)
+                        # Разделитель в ai_tools/bot_template обычно такой: "──────────────\n"
+                        # Но лучше разбивать по двойному переносу, чтобы наверняка
+                        parts = final_text.split('──────────────\n')
+                        current_chunk = ""
+                        
+                        for part in parts:
+                            # Восстанавливаем разделитель (кроме, возможно, последнего, но это не страшно)
+                            if not part.strip(): continue
+                            part_to_add = part + '──────────────\n'
+                            
+                            # Если добавление куска превысит лимит - отправляем текущий буфер
+                            if len(current_chunk) + len(part_to_add) > 4000:
+                                try:
+                                    await update.message.reply_text(current_chunk, parse_mode=ParseMode.HTML)
+                                except Exception:
+                                    await update.message.reply_text(current_chunk, parse_mode=None)
+                                current_chunk = part_to_add # Начинаем новый буфер
+                            else:
+                                current_chunk += part_to_add
+                        
+                        # Отправляем остаток
+                        if current_chunk:
+                             try:
+                                await update.message.reply_text(current_chunk, parse_mode=ParseMode.HTML)
+                             except Exception:
+                                await update.message.reply_text(current_chunk, parse_mode=None)
                     return
 
             except Exception as e_tool:
@@ -1408,7 +1469,11 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 return 
 
         # Если инструментов нет - просто отправляем ответ ИИ
-        await update.message.reply_html(ai_answer, reply_markup=markup)
+        # Если JSON не найден или это просто текст
+        try:
+            await update.message.reply_html(ai_answer, reply_markup=markup)
+        except Exception:
+            await update.message.reply_text(ai_answer, reply_markup=markup) # Fallback
 
     except asyncio.TimeoutError:
         wait_task.cancel()
@@ -2035,16 +2100,14 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
             count = resp.get('sent_to_clients', 0) if resp else 0
             await query.edit_message_text(f"✅ Рассылка отправлена {count} клиентам.")
 
-        # --- 5. МАССОВОЕ ---
-        elif data == "ai_confirm_bulk_status":
-            # (Получаем ID заказов заново, это безопаснее)
-            orders = await api_request("GET", "/api/orders", employee_id=employee_id, params={"party_dates": action_data['party_date'], "company_id": COMPANY_ID_FOR_BOT})
-            ids = [o['id'] for o in orders] if orders else []
+        # --- 5. МАССОВОЕ (ПО ID) ---
+        elif data == "ai_confirm_bulk_status_manual":
+            ids = action_data['ids']
             if ids:
                 await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json={"action": "update_status", "order_ids": ids, "new_status": action_data['new_status']})
                 await query.edit_message_text(f"✅ Статус обновлен для {len(ids)} заказов.")
             else:
-                await query.edit_message_text("❌ Заказы не найдены.")
+                await query.edit_message_text("❌ Ошибка данных.")
         # --- 6. РАСЧЕТ ЗАКАЗОВ (НОВОЕ) ---
         # Callback будет выглядеть как ai_confirm_confirm_calc (из-за префикса ai_confirm_)
         elif data == "ai_confirm_confirm_calc":
