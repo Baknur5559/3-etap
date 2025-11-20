@@ -39,7 +39,8 @@ from models import (
     Base, Company, Location, Client, Order, Role, Permission, Employee,
     ExpenseType, Shift, Expense, Setting,
     Broadcast, BroadcastReaction, OrderHistory, NotificationHistory, # <--- ДОБАВИЛИ СЮДА
-    role_permissions_table
+    role_permissions_table,
+    BulkOperation
 )
 # Импортируем Session и List для типизации
 from sqlalchemy.orm import Session
@@ -2295,11 +2296,12 @@ from sqlalchemy.orm import contains_eager # <-- ДОБАВЬ ЭТОТ ИМПОР
 def get_orders(
     company_id: int = Query(...), 
     client_id: Optional[int] = Query(None), 
-
-    # --- НОВОЕ: Добавлен поиск и лимит ---
-    q: Optional[str] = Query(None, description="Поиск по трек-коду, ФИО клиента или телефону"),
-    limit: Optional[int] = Query(None, description="Лимит результатов (по умолчанию нет)"),
-    # --- КОНЕЦ НОВОГО ---
+    q: Optional[str] = Query(None, description="Поиск"),
+    limit: Optional[int] = Query(None, description="Лимит"),
+    
+    # --- ВОТ ЭТО ДОБАВИТЬ ---
+    uncalculated_only: Optional[bool] = Query(None),
+    # ------------------------
 
     party_dates: Optional[List[date]] = Query(None),
     statuses: Optional[List[str]] = Query(default=None),
@@ -2426,6 +2428,16 @@ def get_orders(
     # Применяем фильтр по статусам, если он есть
     if statuses_to_filter:
         query = query.filter(Order.status.in_(statuses_to_filter))
+
+    # --- ИСПРАВЛЕННЫЙ ФИЛЬТР НЕПОСЧИТАННЫХ ---
+    if uncalculated_only:
+        # Ищем заказы, где сумма NULL ИЛИ 0
+        query = query.filter(or_(
+            Order.calculated_final_cost_som == None,
+            Order.calculated_final_cost_som == 0
+        ))
+        print("[Get Orders] Применен фильтр: Не посчитанные (NULL или 0).")
+    # -----------------------------------------
 
     # --- НОВОЕ: Добавляем limit к запросу ---
     query = query.order_by(Order.party_date.desc().nullslast(), Order.id.desc())
@@ -2745,58 +2757,82 @@ def bulk_order_action(
     if payload.action == 'update_status':
         new_status = payload.new_status
         if not new_status or new_status not in ORDER_STATUSES:
-            raise HTTPException(status_code=400, detail="Недопустимый статус для массового обновления.")
+            raise HTTPException(status_code=400, detail="Недопустимый статус.")
 
-        # --- Логика уведомлений (Группировка) ---
-        notifications_to_send = {}
-        for order in orders_to_action:
-            if order.status != new_status and order.client and order.client.telegram_chat_id:
-                if order.client.id not in notifications_to_send:
-                    notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
-                notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
+        # 1. Запоминаем СТАРЫЕ статусы (Snapshot) и собираем ID
+        snapshot_data = {}
+        affected_ids_list = []
         
-        print(f"[Notification] Найдено {len(notifications_to_send)} клиентов для массовой рассылки.")
-        # --- КОНЕЦ Группировки ---
+        for order in orders_to_action:
+            # Записываем только если статус реально меняется
+            if order.status != new_status:
+                snapshot_data[str(order.id)] = order.status 
+                affected_ids_list.append(order.id)
 
-        # 'fetch' обновляет объекты в сессии, что ломает нашу проверку 'order.status != new_status'
-        # 'False' (по умолчанию) просто выполняет UPDATE и не трогает сессию.
-        count = query.update({"status": new_status}, synchronize_session=False)
+        if not affected_ids_list:
+             return {"status": "ok", "message": "Нет заказов для обновления (статусы уже совпадают)."}
+
+        # 2. Создаем запись об операции (Undo Log)
+        undo_log = BulkOperation(
+            employee_id=employee.id,
+            company_id=employee.company_id,
+            operation_type='update_status',
+            description=f"Массовая смена статуса на '{new_status}' ({len(affected_ids_list)} шт.)",
+            affected_data=snapshot_data,
+            affected_ids=affected_ids_list
+        )
+        db.add(undo_log)
+        
+        # 3. Выполняем обновление (ИСПРАВЛЕНИЕ: ИСПОЛЬЗУЕМ ЧИСТЫЙ ЗАПРОС)
+        # Мы используем db.query(Order) заново, без joinedload, чтобы update сработал корректно
+        count = db.query(Order).filter(
+            Order.id.in_(affected_ids_list)
+        ).update(
+            {"status": new_status}, 
+            synchronize_session=False
+        )
         
         # (Задача 3) Добавляем записи в историю
         if count > 0:
             history_entries = []
-            for order in orders_to_action: # Используем 'orders_to_action', которые мы уже загрузили
-                if order.status != new_status: 
-                    history_entries.append(
-                        OrderHistory(
-                            order_id=order.id,
-                            status=new_status,
-                            employee_id=employee.id
-                        )
+            for order_id in affected_ids_list: 
+                history_entries.append(
+                    OrderHistory(
+                        order_id=order_id,
+                        status=new_status,
+                        employee_id=employee.id
                     )
+                )
             if history_entries:
                 db.bulk_save_objects(history_entries)
+                
         db.commit()
 
-        # --- Отправка (ПОСЛЕ commit) ---
-        if notifications_to_send and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
-            print(f"[Notification] Добавление {len(notifications_to_send)} задач в фон...")
+        # --- Логика уведомлений (Группировка) ---
+        # (Используем orders_to_action, так как в них есть данные клиента)
+        notifications_to_send = {}
+        if new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
+            for order in orders_to_action:
+                if order.id in affected_ids_list and order.client and order.client.telegram_chat_id:
+                    if order.client.id not in notifications_to_send:
+                        notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
+                    notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
             
-            # ИСПРАВЛЕНИЕ: Добавляем async-функцию в BackgroundTasks ПРАВИЛЬНО
+            # Отправка
             for client_id, data in notifications_to_send.items():
                 background_tasks.add_task(
-                    generate_and_send_notification, # <--- Наша async-функция
+                    generate_and_send_notification,
                     client=data["client"], 
                     new_status=new_status, 
                     track_codes=data["track_codes"]
                 )
-            
-            print(f"[Notification] Все {len(notifications_to_send)} задач по отправке добавлены в фон.")
-        else:
-             print(f"[Notification] Массовая рассылка не требуется (статус: '{new_status}' или нет клиентов).")
-        # --- КОНЕЦ Отправки ---
 
-        return {"status": "ok", "message": f"Статус '{new_status}' установлен для {count} заказов."}
+        # Возвращаем ID операции
+        return {
+            "status": "ok", 
+            "message": f"Статус '{new_status}' установлен для {count} заказов.",
+            "operation_id": undo_log.id 
+        }
 
     # --- Остальные 'elif' ---
     elif payload.action == 'update_party_date':
@@ -6198,3 +6234,52 @@ def notify_owner_about_complaint_endpoint(
     )
 
     return {"status": "success", "message": "Жалоба передана руководству."}
+
+@app.post("/api/orders/undo/{operation_id}", tags=["Заказы (Владелец)"])
+def undo_bulk_action(
+    operation_id: int,
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """
+    ОТМЕНА массовой операции. Работает в течение 3 часов.
+    """
+    # 1. Ищем операцию
+    op = db.query(BulkOperation).filter(
+        BulkOperation.id == operation_id,
+        BulkOperation.company_id == employee.company_id
+    ).first()
+    
+    if not op:
+        raise HTTPException(status_code=404, detail="Операция не найдена.")
+
+    # 2. Проверка времени (3 часа)
+    # Время в БД может быть UTC или Local, сравниваем аккуратно
+    time_limit = timedelta(hours=3)
+    # Если created_at без timezone, считаем его UTC или Local как на сервере
+    # Для надежности лучше использовать datetime.now() того же типа
+    if datetime.now() - op.created_at > time_limit:
+         raise HTTPException(status_code=400, detail="Время для отмены истекло (более 3 часов).")
+
+    # 3. ОТКАТ (Rollback)
+    if op.operation_type == 'update_status':
+        restored_count = 0
+        snapshot = op.affected_data # {order_id: old_status}
+        
+        # Проходим по каждому заказу и возвращаем старый статус
+        for order_id_str, old_status in snapshot.items():
+            order_id = int(order_id_str)
+            # Обновляем точечно
+            db.query(Order).filter(Order.id == order_id).update({"status": old_status}, synchronize_session=False)
+            restored_count += 1
+            
+            # (Опционально) Можно добавить запись в OrderHistory: "Отмена массовой операции"
+        
+        # Удаляем запись об операции (или помечаем как отмененную), чтобы нельзя было отменить дважды
+        db.delete(op) 
+        
+        db.commit()
+        return {"status": "ok", "message": f"Успешно отменено изменений: {restored_count}. Статусы восстановлены."}
+
+    else:
+        raise HTTPException(status_code=400, detail="Отмена для этого типа операций пока не реализована.")
