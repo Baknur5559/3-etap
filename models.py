@@ -370,3 +370,36 @@ class NotificationHistory(Base):
         # Индекс для быстрого поиска последнего сообщения по типу для конкретного владельца
         UniqueConstraint('recipient_chat_id', 'client_id', 'notification_type', name='_notify_recipient_client_type_uc'),
     )
+
+# --- models.py ---
+
+# Для хранения JSON
+from sqlalchemy.dialects.postgresql import JSONB 
+# Если база не Postgres, используем просто JSON или String, но для Cargo CRM (Postgres) лучше JSONB
+# Если sqlalchemy не поддерживает JSONB из коробки в твоей версии, используем просто JSON
+from sqlalchemy import JSON 
+
+class BulkOperation(Base):
+    """
+    Журнал массовых операций для возможности ОТМЕНЫ (Undo).
+    Хранит 'снэпшот' состояния ДО изменения.
+    """
+    __tablename__ = 'bulk_operations'
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    employee_id = Column(Integer, ForeignKey('employees.id'), nullable=False)
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False)
+    
+    operation_type = Column(String, nullable=False) # 'update_status', 'import', 'buyout'
+    description = Column(String, nullable=True) # "Смена статуса на 'В пути' для 50 заказов"
+    
+    # Самое важное: Словарь {order_id: old_value}
+    # Например: {101: "В обработке", 102: "Ожидает выкупа"}
+    affected_data = Column(JSON, nullable=False) 
+    
+    # Список ID заказов, которые были затронуты (для быстрого поиска)
+    affected_ids = Column(JSON, nullable=False) 
+
+    employee = relationship("Employee")
