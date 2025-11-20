@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Все функции принимают api_request_func (асинхронный клиент) и данные сессии
 # =================================================================
 
-async def get_user_orders_json(api_request_func, client_id: int, company_id: int, status_filter: Optional[List[str]] = None) -> str:
+async def get_user_orders_json(api_request_func, client_id: int, company_id: int, status_filter: Optional[List[str]] = None, uncalculated_only: bool = False) -> str:
     """
     Умный инструмент: Возвращает список заказов И (НОВОЕ) считает ИТОГО внизу.
     """
@@ -23,16 +23,19 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
     else:
         statuses_to_fetch = status_filter
     
-    orders = await api_request_func(
-        "GET",
-        "/api/orders",
-        params={
-            "client_id": client_id,
-            "company_id": company_id,
-            "statuses": statuses_to_fetch,
-            "limit": 100 
-        }
-    )
+    params = {
+        "client_id": client_id,
+        "company_id": company_id,
+        "statuses": statuses_to_fetch,
+        "limit": 100
+    }
+    
+    # --- [NEW] ДОБАВЛЯЕМ ФИЛЬТР ---
+    if uncalculated_only:
+        params["uncalculated_only"] = True
+    # ------------------------------
+
+    orders = await api_request_func("GET", "/api/orders", params=params)
 
     if not orders or (isinstance(orders, dict) and "error" in orders):
         return json.dumps({"message": "📭 У этого клиента сейчас нет таких заказов."}, ensure_ascii=False)
@@ -96,24 +99,42 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
 
         return json.dumps(response_json, ensure_ascii=False)
 
-    # --- РЕЖИМ 2: СВОДКА (Без изменений) ---
+    # --- РЕЖИМ 2: СВОДКА + ОБЩИЙ СЧЕТЧИК ---
     else:
+        # Запрашиваем ВСЕ заказы (включая Выданные), чтобы дать точную цифру
+        # Для этого временно убираем фильтр статусов или добавляем "Выдан"
+        all_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче", "Выдан"]
+        
+        all_orders = await api_request_func(
+            "GET",
+            "/api/orders",
+            params={
+                "client_id": client_id,
+                "company_id": company_id,
+                "statuses": all_statuses,
+                "limit": 200 # Берем больше для статистики
+            }
+        )
+        
+        if not all_orders: return json.dumps({"message": "📭 История заказов пуста."}, ensure_ascii=False)
+        
         stats = {}
         parties = set()
         transit_statuses = ["В пути", "На складе в Китае", "На складе в КР"]
+        total_count = len(all_orders)
 
-        for o in orders:
+        for o in all_orders:
             status = o.get('status', 'Неизвестно')
             stats[status] = stats.get(status, 0) + 1
             if status in transit_statuses and o.get('party_date'):
                 parties.add(o.get('party_date'))
 
-        summary_msg = "📊 <b>Сводка по клиенту:</b>\n\n"
-        priority_order = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке"]
+        summary_msg = f"📊 **Сводка по клиенту (Всего: {total_count} шт):**\n\n"
+        priority_order = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке", "Выдан"]
         
         for st in priority_order:
             if stats.get(st, 0) > 0:
-                icon = "✅" if st == "Готов к выдаче" else "🚚" if st == "В пути" else "📦"
+                icon = "✅" if st == "Готов к выдаче" else "🚚" if st == "В пути" else "🏁" if st == "Выдан" else "📦"
                 summary_msg += f"{icon} <b>{st}:</b> {stats[st]} шт.\n"
 
         if parties:
@@ -309,6 +330,72 @@ async def create_delivery_request(api_request_func, client_id: int, company_id: 
 # --- 2. ФУНКЦИИ-ОБРАБОТЧИКИ (ПОЛНАЯ ПЕРЕПИСЬ) ---
 # =================================================================
 
+async def update_orders_by_tracks(api_request_func, employee_id, company_id, track_codes, new_status):
+    """
+    Инструмент: Ищет заказы по трек-кодам и готовит кнопку для смены статуса.
+    НЕ МЕНЯЕТ статус сам, только находит ID.
+    """
+    try:
+        # 1. Нормализуем треки
+        clean_tracks = [t.strip() for t in track_codes if t.strip()]
+        if not clean_tracks: return "❌ Нет трек-кодов."
+
+        found_ids = []
+        clients_found = set()
+        client_names = []
+        found_tracks_str = []
+        
+        # 2. Ищем каждый заказ
+        for track in clean_tracks:
+            orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params={"q": track, "company_id": company_id, "limit": 1})
+            if orders:
+                order = orders[0]
+                found_ids.append(order['id'])
+                found_tracks_str.append(order['track_code'])
+                
+                if order.get('client'):
+                    c = order['client']
+                    clients_found.add(c['id'])
+                    client_info = f"{c['full_name']} (ID {c['id']})"
+                    if client_info not in client_names:
+                        client_names.append(client_info)
+                else:
+                    clients_found.add("unclaimed")
+                    if "Невостребованный" not in client_names:
+                        client_names.append("Невостребованный")
+
+        if not found_ids:
+            return f"❌ Ни один из трек-кодов {clean_tracks} не найден в базе."
+
+        # 3. Проверка на "кашу" (разные клиенты)
+        if len(clients_found) > 1:
+             names_str = ", ".join(client_names)
+             return json.dumps({
+                 "status": "error",
+                 "message": f"⚠️ Внимание! Эти трек-коды принадлежат РАЗНЫМ клиентам ({names_str}).\nЯ не могу массово менять статус для разных людей одновременно во избежание ошибок."
+             }, ensure_ascii=False)
+
+        # 4. Возвращаем JSON для кнопки (БЕЗ ВЫПОЛНЕНИЯ ДЕЙСТВИЯ)
+        owner_str = client_names[0] if client_names else "Неизвестно"
+        count = len(found_ids)
+        
+        return json.dumps({
+            "confirm_action": "bulk_status_manual", # Тип действия для бота
+            "ids": found_ids,       # <-- ВАЖНО: Передаем ID, чтобы кнопка сработала
+            "new_status": new_status,
+            "count": count,
+            "message": (
+                f"🔄 <b>СМЕНА СТАТУСА</b>\n"
+                f"📦 Заказов: {count}\n"
+                f"👤 Владелец: <b>{owner_str}</b>\n"
+                f"📝 Статус: <b>'{new_status}'</b>\n\n"
+                f"❓ Подтверждаете изменение?"
+            )
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return f"❌ Ошибка поиска: {e}"
+
 async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int, employee_id: Optional[int], client_id: Optional[int] = None) -> str:
     """
     Выполняет "мысли" ИИ, превращая их в действия API или кнопки подтверждения.
@@ -332,15 +419,15 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
     
     if tool == "get_user_orders_json":
         if not client_id: return "❌ Ошибка: ID клиента не определен для инструмента."
-        # --- (НОВОЕ) ---
-        # Ищем опциональный фильтр статусов в команде ИИ
         status_list_filter = tool_command.get("statuses") 
-        # --- (КОНЕЦ НОВОГО) ---
+        uncalculated_only = tool_command.get("uncalculated_only") # <-- Извлекаем параметр
+        
         return await get_user_orders_json(
             api_request_func, 
             client_id, 
             company_id, 
-            status_filter=status_list_filter # <-- Передаем фильтр
+            status_filter=status_list_filter,
+            uncalculated_only=uncalculated_only # <-- Передаем
         )
 
     elif tool == "add_client_order_request":
@@ -434,10 +521,25 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
     elif tool == "calculate_orders":
             client_id = tool_command.get("target_client_id")
             client_search = tool_command.get("client_search")
-            total_weight = float(tool_command.get("total_weight", 0))
             
-            # --- [NEW] Извлекаем дату партии ---
+            # --- ЗАЩИТА ОТ ЗАПЯТЫХ ---
+            raw_weight = tool_command.get("total_weight", 0)
+            if isinstance(raw_weight, str):
+                raw_weight = raw_weight.replace(',', '.').strip()
+            try:
+                total_weight = float(raw_weight)
+            except ValueError:
+                return "❌ Ошибка: Некорректный формат веса."
+            # -------------------------
+            
             party_date = tool_command.get("party_date")
+            uncalculated_only = tool_command.get("uncalculated_only")
+            
+            # --- [NEW] ИЗВЛЕКАЕМ СПИСОК ТРЕКОВ ---
+            track_codes = tool_command.get("track_codes") # Ожидаем список строк
+            if isinstance(track_codes, str): # Если вдруг ИИ прислал строку "A, B", превращаем в список
+                track_codes = [t.strip() for t in track_codes.split(',')]
+            # -------------------------------------
             
             return await prepare_calculation(
                 api_request_func, 
@@ -446,7 +548,9 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 client_id=client_id, 
                 client_search=client_search, 
                 total_weight=total_weight,
-                party_date=party_date # <-- Передаем дату
+                party_date=party_date,
+                uncalculated_only=uncalculated_only,
+                track_codes=track_codes # <-- ПЕРЕДАЕМ СЮДА
             )
 
     elif tool == "update_client_data":
@@ -467,6 +571,21 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
     
     elif tool == "get_all_party_dates":
         return await get_all_party_dates(api_request_func, company_id)
+    
+    elif tool == "undo_last_operation":
+        op_id = tool_command.get("operation_id")
+        if not op_id: return "❌ Нет ID операции."
+        return await undo_last_operation(api_request_func, int(op_id))
+    
+    
+    elif tool == "update_orders_by_tracks":
+        tracks = tool_command.get("track_codes")
+        new_status = tool_command.get("new_status")
+        
+        # Обработка строки вместо списка
+        if isinstance(tracks, str): tracks = [t.strip() for t in tracks.split(',')]
+        
+        return await update_orders_by_tracks(api_request_func, employee_id, company_id, tracks, new_status)
 
     # --- БЛОК АДМИНСКИХ ИНСТРУМЕНТОВ (требует employee_id) ---
     
@@ -498,12 +617,22 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
 
         elif tool == "delete_order":
             track = tool_command.get("track_code")
+            if not track: return "❌ Ошибка: Не указан трек-код."
+
+            # Сначала ищем заказ, чтобы узнать его ID
             orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params={"q": track, "company_id": company_id, "limit": 1})
+            
             if not orders: return f"❌ Заказ `{track}` не найден."
+            
+            order = orders[0]
+            
+            # Возвращаем кнопку подтверждения
             return json.dumps({
-                "confirm_action": "delete_order", "order_id": orders[0]['id'], "track": track,
-                "message": f"🗑 **УДАЛЕНИЕ ЗАКАЗА**\nВы уверены, что хотите удалить заказ `{track}`? Это необратимо."
-            })
+                "confirm_action": "delete_order", 
+                "order_id": order['id'], 
+                "track": track,
+                "message": f"🗑 **УДАЛЕНИЕ ЗАКАЗА**\nТрек: `{track}`\nКлиент: {order.get('client', {}).get('full_name', 'Неизвестно')}\n\nВы уверены? Это необратимо."
+            }, ensure_ascii=False)
 
         elif tool == "assign_client":
             track = tool_command.get("track_code")
@@ -520,62 +649,61 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
         # === БЛОК 2: КЛИЕНТЫ ===
 
         elif tool == "search_client":
-            # ЗАЩИТА: ИИ может перепутать 'query' и 'client_search'. Проверяем оба.
             query = tool_command.get("query") or tool_command.get("client_search") or tool_command.get("name")
-            
-            if not query: 
-                return "❌ Ошибка: ИИ не передал текст для поиска."
+            if not query: return "❌ Ошибка: Пустой запрос поиска."
 
-            clients = await api_request_func(
-                "GET", 
-                "/api/clients/search", 
-                employee_id=employee_id, 
-                params={"q": query, "company_id": company_id}
-            )
+            # ИСПРАВЛЕНИЕ: используем api_request_func вместо api_request
+            clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": query, "company_id": company_id})
 
-            if isinstance(clients, dict) and "error" in clients:
-                return f"⚠️ Ошибка поиска: {clients['error']}"
+            if not clients: return f"❌ Клиенты по запросу '{query}' не найдены."
 
-            if not clients: 
-                return f"❌ Клиенты по запросу '{query}' не найдены."
-
-            # Формируем красивый список
-            text = f"🔍 <b>Результаты поиска '{query}':</b>\n\n"
-            
-            for c in clients:
-                code = f"{c.get('client_code_prefix')}{c.get('client_code_num')}"
-                # Безопасное имя
-                safe_name = c['full_name'].replace("<", "&lt;").replace(">", "&gt;") if c['full_name'] else "Без имени"
-                
-                # --- ВАЖНО: Формируем строку со всеми данными ---
-                text += (
-                    f"🆔 ID: <b>{c['id']}</b>\n"
-                    f"👤 Имя: <b>{safe_name}</b>\n"
-                    f"🔢 Код: <b>{code}</b>\n"
-                    f"📞 Тел: <b>{c['phone']}</b>\n"
-                    f"────────────────\n"
-                )
-            
-            # Подсказка для ИИ, невидимая для пользователя (системный комментарий)
+            # --- ЛОВУШКА ДЛЯ ДУБЛИКАТОВ ---
             if len(clients) > 1:
-                 text += "\n\n👉 <i>(Системно: Найдено несколько. Спроси владельца: 'С каким ID работаем?')</i>"
-            
-            return text
+                # Возвращаем JSON, чтобы ИИ понял: "СТОП, НУЖНО УТОЧНЕНИЕ"
+                options = []
+                for c in clients:
+                    code = f"{c.get('client_code_prefix')}{c.get('client_code_num')}"
+                    options.append(f"ID {c['id']}: {c['full_name']} ({code})")
+                
+                return json.dumps({
+                    "status": "multiple_results",
+                    "message": f"⚠️ Найдено {len(clients)} клиентов. Уточните, кто именно?",
+                    "options": options
+                }, ensure_ascii=False)
+            # ------------------------------
+
+            # Если найден один - показываем как обычно
+            c = clients[0]
+            code = f"{c.get('client_code_prefix')}{c.get('client_code_num')}"
+            return (
+                f"✅ **Клиент найден:**\n"
+                f"👤 {c['full_name']}\n"
+                f"🆔 ID: {c['id']}\n"
+                f"🔢 Код: {code}\n"
+                f"📞 {c['phone']}\n\n"
+                f"👉 *Работаем с ним?*"
+            )
         
         elif tool == "admin_get_client_orders":
             target_id = tool_command.get("target_client_id")
             if not target_id: return "❌ Ошибка: Не передан ID клиента."
             
-            # --- [FIX] ИЗВЛЕКАЕМ ФИЛЬТР СТАТУСОВ ИЗ КОМАНДЫ ИИ ---
-            # Раньше мы это игнорировали, поэтому бот всегда возвращал сводку
+            # --- ЗАЩИТА ОТ МУСОРА (FIX 'KBNone') ---
+            try:
+                client_id_int = int(target_id)
+            except (ValueError, TypeError):
+                return f"❌ Ошибка ИИ: ID клиента должен быть числом (например, 3031). Вы передали: '{target_id}'. Сначала выполните поиск клиента (search_client)."
+            # ---------------------------------------
+
             status_filter = tool_command.get("statuses") 
+            uncalculated_only = tool_command.get("uncalculated_only")
             
-            # Передаем status_filter в функцию получения заказов
             return await get_user_orders_json(
                 api_request_func, 
-                int(target_id), 
+                client_id_int, # Используем проверенное число
                 company_id, 
-                status_filter=status_filter # <--- ВОТ ЭТОГО НЕ ХВАТАЛО
+                status_filter=status_filter,
+                uncalculated_only=uncalculated_only
             )
 
         elif tool == "change_client_code":
@@ -761,10 +889,10 @@ async def get_orders_by_date(api_request_func, employee_id: int, company_id: int
         logger.error(f"Date Search Error: {e}", exc_info=True)
         return f"❌ Ошибка поиска по дате: {str(e)}"
 
-async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_id: Optional[int], client_search: Optional[str], total_weight: float, party_date: Optional[str] = None) -> str:
+async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_id: Optional[int], client_search: Optional[str], total_weight: float, party_date: Optional[str] = None, uncalculated_only: Optional[bool] = None, track_codes: Optional[List[str]] = None) -> str:
     """
-    Инструмент: Подготовка расчета (Калькулятор).
-    Теперь поддерживает фильтрацию по ДАТЕ ПАРТИИ.
+    Инструмент: Подготовка расчета.
+    Версия 2.0: Красивое форматирование чека.
     """
     try:
         client = None
@@ -779,69 +907,119 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
              clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
              if clients:
                  if len(clients) > 1:
-                     list_str = "\n".join([f"- {c['full_name']} (ID: {c['id']})" for c in clients[:5]])
-                     return f"⚠️ Найдено несколько клиентов. Уточните ID:\n{list_str}"
+                     return json.dumps({"status": "multiple_results", "message": f"Найдено {len(clients)} клиентов. Уточните ID."}, ensure_ascii=False)
                  client = clients[0]
 
         if not client:
-             return "❌ Клиент не найден."
+             if not client_id and not client_search:
+                  return "❌ Ошибка: ИИ не передал ни ID клиента, ни имя для поиска."
+             return f"❌ Клиент не найден (ID: {client_id}, Поиск: '{client_search}')."
 
-        # 2. Ищем заказы ДЛЯ РАСЧЕТА
-        calc_statuses = ["В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа", "Готов к выдаче"]
+        # 2. Ищем заказы
+        calc_statuses = ["В обработке", "В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа", "Готов к выдаче"]
         
         params = {
             "client_id": client['id'], 
             "statuses": calc_statuses, 
             "company_id": company_id,
-            "limit": 100
+            "limit": 200
         }
-        
-        # --- [NEW] ФИЛЬТР ПО ДАТЕ ---
-        if party_date:
-            params["party_dates"] = party_date
-        # ----------------------------
+        if party_date: params["party_dates"] = party_date
 
         orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params=params)
         
         if not orders: 
-            msg = f"❌ У клиента **{client['full_name']}** нет подходящих заказов."
-            if party_date: msg += f" (От даты {party_date})"
-            return msg
+            return f"❌ У клиента **{client['full_name']}** нет подходящих заказов."
+
+        # --- ФИЛЬТР ПО ТРЕК-КОДАМ ---
+        if track_codes and len(track_codes) > 0:
+            target_tracks = {t.strip() for t in track_codes}
+            filtered_orders = []
+            for o in orders:
+                if o.get('track_code', '').strip() in target_tracks:
+                    filtered_orders.append(o)
+            
+            if not filtered_orders:
+                return f"❌ Ни один из указанных треков не найден у клиента."
+            orders = filtered_orders
+
+        # --- ПРЕДОХРАНИТЕЛЬ (SAFETY LOGIC) ---
+        uncalculated_orders = []
+        calculated_orders = []
         
+        for o in orders:
+            cost = o.get('calculated_final_cost_som')
+            if cost is None or cost == 0:
+                uncalculated_orders.append(o)
+            else:
+                calculated_orders.append(o)
+        
+        target_orders = []
+        
+        if uncalculated_only:
+            target_orders = uncalculated_orders
+            if not target_orders: return "✅ Все заказы уже посчитаны."
+        elif len(uncalculated_orders) > 0:
+            target_orders = uncalculated_orders
+        else:
+            target_orders = orders
+
+        if not target_orders:
+            return "❌ Нет заказов для обработки."
+
         # 3. Получаем тарифы
         price_data = await api_request_func("GET", "/api/bot/price", params={"company_id": company_id})
         price = price_data.get("price_usd", 5.5)
         rate = price_data.get("exchange_rate", 89.5)
         
         # 4. Считаем
-        count = len(orders)
+        count = len(target_orders)
         cost_som = total_weight * price * rate
         
-        date_info = f" (Партия: {party_date})" if party_date else ""
-
-        # 5. Возвращаем JSON подтверждения
+        # --- КРАСИВОЕ ФОРМАТИРОВАНИЕ СПИСКА ---
+        tracks_preview = ""
+        # Используем enumerate для нумерации (1., 2., 3.)
+        for i, o in enumerate(target_orders[:15], 1): 
+            # Обработка комментария: если есть, добавляем курсивом через тире
+            comment = o.get('comment')
+            comment_str = f" — <i>{comment}</i>" if comment else ""
+            
+            tracks_preview += f"{i}. <code>{o.get('track_code')}</code>{comment_str}\n"
+        
+        if count > 15:
+            tracks_preview += f"<i>... и еще {count - 15} шт.</i>\n"
+        
+        # Форматирование денег (с пробелами: 4 288 вместо 4288)
+        formatted_cost = "{:,.0f}".format(cost_som).replace(",", " ")
+        
+        # 5. Возвращаем JSON
         return json.dumps({
             "confirm_action": "confirm_calc",
             "client_id": client['id'],
             "client_name": client['full_name'],
-            "order_ids": [o['id'] for o in orders],
+            "order_ids": [o['id'] for o in target_orders],
             "count": count,
             "weight": total_weight,
             "price": price,
             "rate": rate,
             "total_sum": round(cost_som, 0),
             "message": (
-                f"🧮 **РАСЧЕТ И ПРИЕМКА**{date_info}\n"
-                f"👤 Клиент: **{client['full_name']}**\n"
-                f"📦 Заказов: **{count} шт**\n"
-                f"⚖️ Вес: **{total_weight} кг**\n"
-                f"💰 К оплате: **{round(cost_som)} сом**\n"
-                f"ℹ️ Тариф: {price}$ / Курс: {rate}\n\n"
-                f"❓ **Подтверждаете расчет и смену статуса на 'Готов к выдаче'?**"
+                f"🧮 <b>РАСЧЕТ И ПРИЕМКА</b>\n"
+                f"👤 Клиент: <b>{client['full_name']}</b>\n\n"
+                f"👇 <b>Список заказов ({count} шт):</b>\n"
+                f"{tracks_preview}"
+                f"──────────────\n"
+                f"⚖️ Вес: <b>{total_weight} кг</b>\n"
+                f"💵 Тариф: {price}$ (курс {rate})\n"
+                f"💰 <b>К ОПЛАТЕ: {formatted_cost} сом</b>\n"
+                f"──────────────\n\n"
+                f"❓ <b>Подтверждаете?</b>\n"
+                f"<i>(Статус изменится на 'Готов к выдаче')</i>"
             )
         }, ensure_ascii=False)
         
     except Exception as e:
+        logger.error(f"Calc Error: {e}", exc_info=True)
         return f"❌ Ошибка расчета: {e}"
 
 async def prepare_client_update(api_request_func, employee_id: int, company_id: int, client_search: str, new_phone: str = None, new_code: str = None) -> str:
@@ -877,23 +1055,34 @@ async def prepare_client_update(api_request_func, employee_id: int, company_id: 
     
 async def bulk_update_client_orders(api_request_func, employee_id, company_id, client_id, old_status, new_status):
     """
-    Инструмент: Находит все заказы клиента в статусе old_status и переводит их в new_status.
+    Инструмент: Массовая смена статуса.
+    ЕСЛИ old_status не указан (None) -> Берет ВСЕ активные заказы.
     """
     try:
-        # 1. Находим заказы этого клиента с старым статусом
-        orders = await api_request_func(
-            "GET", 
-            "/api/orders", 
-            params={
-                "client_id": client_id, 
-                "statuses": [old_status], 
-                "company_id": company_id,
-                "limit": 1000
-            }
-        )
+        # Формируем параметры запроса
+        params = {
+            "client_id": client_id, 
+            "company_id": company_id,
+            "limit": 1000
+        }
+
+        # --- УМНАЯ ФИЛЬТРАЦИЯ ---
+        status_label = old_status
+        
+        # Если статус не указан или явно сказано "Все" -> берем все активные
+        if not old_status or str(old_status).lower() in ['none', 'null', 'все', 'all', 'any']:
+            # Берем все статусы, кроме "Выдан" (их обычно не трогают массово)
+            params["statuses"] = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
+            status_label = "ЛЮБОЙ АКТИВНЫЙ"
+        else:
+            # Если статус указан конкретно
+            params["statuses"] = [old_status]
+
+        # Запрашиваем заказы
+        orders = await api_request_func("GET", "/api/orders", params=params)
         
         if not orders or (isinstance(orders, dict) and "error" in orders):
-            return f"❌ У этого клиента нет заказов в статусе '{old_status}'."
+            return f"❌ У этого клиента нет заказов подходящих под критерий: '{status_label}'."
             
         order_ids = [o['id'] for o in orders]
         count = len(order_ids)
@@ -903,19 +1092,11 @@ async def bulk_update_client_orders(api_request_func, employee_id, company_id, c
 
         # 2. Возвращаем JSON для кнопки подтверждения
         return json.dumps({
-            "confirm_action": "bulk_status", 
-            "order_ids": order_ids, # Бэккенд должен поддерживать передачу ID или мы используем логику ниже
-            # ВНИМАНИЕ: Твой бэкенд для bulk_status принимает "party_date" или "order_ids".
-            # Но в execute_ai_tool для "bulk_status" сейчас жесткая привязка к дате.
-            # Мы сделаем ХИТРОСТЬ: Мы вернем специальный confirm_action, который мы обработаем в bot_template.
-            # НО ПРОЩЕ: Давай сделаем это через "ai_confirm_bulk_status_by_ids"
-            
-            # Вернем простой текст с JSON для подтверждения через bot_template
-            "confirm_action": "bulk_status_manual", # Новый тип подтверждения
+            "confirm_action": "bulk_status_manual", 
             "ids": order_ids,
             "new_status": new_status,
             "count": count,
-            "message": f"❓ Перевести **{count} заказов** клиента из '{old_status}' в **'{new_status}'**?"
+            "message": f"❓ Перевести **{count} заказов** клиента (Статус: {status_label}) в **'{new_status}'**?"
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -937,3 +1118,12 @@ async def get_all_party_dates(api_request_func, company_id: int) -> str:
         return text
     except Exception as e:
         return f"❌ Ошибка получения партий: {e}"
+    
+async def undo_last_operation(api_request_func, operation_id: int) -> str:
+    """Инструмент: Отмена массовой операции по ID."""
+    response = await api_request_func("POST", f"/api/orders/undo/{operation_id}")
+    
+    if isinstance(response, dict) and "error" in response:
+        return f"❌ Ошибка отмены: {response['error']}"
+    
+    return f"✅ Готово! {response.get('message')}"
