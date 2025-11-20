@@ -15,9 +15,19 @@ logger = logging.getLogger(__name__)
 
 async def get_user_orders_json(api_request_func, client_id: int, company_id: int, status_filter: Optional[List[str]] = None, uncalculated_only: bool = False) -> str:
     """
-    Умный инструмент: Возвращает список заказов И (НОВОЕ) считает ИТОГО внизу.
+    Умный инструмент: Возвращает список заказов + ИМЯ КЛИЕНТА для контекста.
     """
-    
+    # 1. Получаем имя клиента (чтобы ИИ помнил, с кем работает)
+    client_info_str = f"ID {client_id}"
+    try:
+        client_data = await api_request_func("GET", f"/api/clients/{client_id}", params={"company_id": company_id})
+        if client_data and "full_name" in client_data:
+            code = f"{client_data.get('client_code_prefix', '')}{client_data.get('client_code_num', '')}"
+            client_info_str = f"{client_data['full_name']} ({code}, ID {client_id})"
+    except:
+        pass
+
+    # 2. Параметры поиска
     if not status_filter:
         statuses_to_fetch = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче"]
     else:
@@ -29,31 +39,26 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
         "statuses": statuses_to_fetch,
         "limit": 100
     }
-    
-    # --- [NEW] ДОБАВЛЯЕМ ФИЛЬТР ---
     if uncalculated_only:
         params["uncalculated_only"] = True
-    # ------------------------------
 
+    # 3. Запрос заказов
     orders = await api_request_func("GET", "/api/orders", params=params)
 
     if not orders or (isinstance(orders, dict) and "error" in orders):
-        return json.dumps({"message": "📭 У этого клиента сейчас нет таких заказов."}, ensure_ascii=False)
+        return json.dumps({"message": f"📭 У клиента {client_info_str} нет таких заказов."}, ensure_ascii=False)
     
     if not isinstance(orders, list):
         return json.dumps({"error": "Ошибка формата данных."}, ensure_ascii=False)
 
-    # --- РЕЖИМ 1: ДЕТАЛЬНЫЙ СПИСОК + ИТОГИ ---
-    if status_filter:
+    # --- РЕЖИМ 1: ДЕТАЛЬНЫЙ СПИСОК ---
+    if status_filter or uncalculated_only:
         formatted_orders = []
-        
-        # Переменные для подсчета итогов
         total_weight = 0.0
         total_cost = 0.0
         count_calculated = 0
 
         for o in orders:
-            # Собираем историю
             history_entries = []
             if o.get('history_entries'):
                 for entry in o['history_entries']:
@@ -62,7 +67,6 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
                         "date": entry.get('created_at')
                     })
             
-            # Собираем данные для вывода
             order_data = {
                 "трек": o.get('track_code'),
                 "статус": o.get('status'),
@@ -71,7 +75,6 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
                 "history_entries": history_entries 
             }
 
-            # Логика подсчета
             w = o.get('calculated_weight_kg') or o.get('weight_kg')
             c = o.get('calculated_final_cost_som') or o.get('final_cost_som')
             
@@ -85,38 +88,27 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
 
             formatted_orders.append(order_data)
         
-        # Формируем итоговое сообщение
-        response_json = {"active_orders": formatted_orders}
+        response_json = {
+            "client_info": client_info_str, # <--- ВАЖНО: Передаем имя
+            "active_orders": formatted_orders
+        }
         
-        # Если есть посчитанные заказы, добавляем блок итогов
         if count_calculated > 0:
             summary_text = (
                 f"\n💰 <b>ИТОГО ПО СПИСКУ ({count_calculated} шт):</b>\n"
                 f"⚖️ Общий вес: <b>{total_weight:.2f} кг</b>\n"
                 f"💵 Общая сумма: <b>{total_cost:.2f} сом</b>"
             )
-            response_json["summary_footer"] = summary_text # Бот добавит это в конец сообщения
+            response_json["summary_footer"] = summary_text
 
         return json.dumps(response_json, ensure_ascii=False)
 
-    # --- РЕЖИМ 2: СВОДКА + ОБЩИЙ СЧЕТЧИК ---
+    # --- РЕЖИМ 2: СВОДКА ---
     else:
-        # Запрашиваем ВСЕ заказы (включая Выданные), чтобы дать точную цифру
-        # Для этого временно убираем фильтр статусов или добавляем "Выдан"
         all_statuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче", "Выдан"]
+        all_orders = await api_request_func("GET", "/api/orders", params={"client_id": client_id, "company_id": company_id, "statuses": all_statuses, "limit": 200})
         
-        all_orders = await api_request_func(
-            "GET",
-            "/api/orders",
-            params={
-                "client_id": client_id,
-                "company_id": company_id,
-                "statuses": all_statuses,
-                "limit": 200 # Берем больше для статистики
-            }
-        )
-        
-        if not all_orders: return json.dumps({"message": "📭 История заказов пуста."}, ensure_ascii=False)
+        if not all_orders: return json.dumps({"message": f"📭 История заказов клиента {client_info_str} пуста."}, ensure_ascii=False)
         
         stats = {}
         parties = set()
@@ -129,19 +121,19 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
             if status in transit_statuses and o.get('party_date'):
                 parties.add(o.get('party_date'))
 
-        summary_msg = f"📊 **Сводка по клиенту (Всего: {total_count} шт):**\n\n"
+        summary_msg = f"📊 **Сводка по клиенту {client_info_str} (Всего: {total_count} шт):**\n\n"
         priority_order = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке", "Выдан"]
         
         for st in priority_order:
             if stats.get(st, 0) > 0:
-                icon = "✅" if st == "Готов к выдаче" else "🚚" if st == "В пути" else "🏁" if st == "Выдан" else "📦"
+                icon = "✅" if st == "Готов к выдаче" else "🚚" if st == "В пути" else "📦"
                 summary_msg += f"{icon} <b>{st}:</b> {stats[st]} шт.\n"
 
         if parties:
             summary_msg += f"\n📅 <b>Партии в пути:</b> {', '.join(sorted(list(parties), reverse=True))}"
 
         return json.dumps({"message": summary_msg}, ensure_ascii=False)
-
+    
 async def notify_buyout_request(api_request_func, client_id: int, company_id: int, amount_yuan: float = 0, amount_som: float = 0) -> str:
     """
     Вызывает Владельца, когда клиент согласен на выкуп и хочет оплатить.
@@ -333,10 +325,13 @@ async def create_delivery_request(api_request_func, client_id: int, company_id: 
 async def update_orders_by_tracks(api_request_func, employee_id, company_id, track_codes, new_status):
     """
     Инструмент: Ищет заказы по трек-кодам и готовит кнопку для смены статуса.
-    НЕ МЕНЯЕТ статус сам, только находит ID.
+    (ВЕРСИЯ 2.0 - Разрешены массовые действия для РАЗНЫХ клиентов)
     """
     try:
         # 1. Нормализуем треки
+        if isinstance(track_codes, str): 
+            track_codes = [t.strip() for t in track_codes.split(',')]
+            
         clean_tracks = [t.strip() for t in track_codes if t.strip()]
         if not clean_tracks: return "❌ Нет трек-кодов."
 
@@ -347,6 +342,7 @@ async def update_orders_by_tracks(api_request_func, employee_id, company_id, tra
         
         # 2. Ищем каждый заказ
         for track in clean_tracks:
+            # Ищем заказ (limit=1, так как трек уникален в рамках компании)
             orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params={"q": track, "company_id": company_id, "limit": 1})
             if orders:
                 order = orders[0]
@@ -355,41 +351,47 @@ async def update_orders_by_tracks(api_request_func, employee_id, company_id, tra
                 
                 if order.get('client'):
                     c = order['client']
-                    clients_found.add(c['id'])
-                    client_info = f"{c['full_name']} (ID {c['id']})"
-                    if client_info not in client_names:
-                        client_names.append(client_info)
+                    c_id = c['id']
+                    if c_id not in clients_found:
+                        clients_found.add(c_id)
+                        # Формируем краткое имя для списка
+                        client_names.append(f"{c['full_name']}")
                 else:
-                    clients_found.add("unclaimed")
-                    if "Невостребованный" not in client_names:
+                    if "unclaimed" not in clients_found:
+                        clients_found.add("unclaimed")
                         client_names.append("Невостребованный")
 
         if not found_ids:
             return f"❌ Ни один из трек-кодов {clean_tracks} не найден в базе."
 
-        # 3. Проверка на "кашу" (разные клиенты)
-        if len(clients_found) > 1:
-             names_str = ", ".join(client_names)
-             return json.dumps({
-                 "status": "error",
-                 "message": f"⚠️ Внимание! Эти трек-коды принадлежат РАЗНЫМ клиентам ({names_str}).\nЯ не могу массово менять статус для разных людей одновременно во избежание ошибок."
-             }, ensure_ascii=False)
-
-        # 4. Возвращаем JSON для кнопки (БЕЗ ВЫПОЛНЕНИЯ ДЕЙСТВИЯ)
-        owner_str = client_names[0] if client_names else "Неизвестно"
+        # 3. Формирование описания владельцев (Убрана блокировка "каши")
         count = len(found_ids)
-        
+        unique_clients_count = len(clients_found)
+
+        if unique_clients_count > 1:
+            # Если клиентов много, показываем сводку
+            # Пример: "Алимбек, Мажид и др."
+            names_display = ", ".join(client_names[:2])
+            if len(client_names) > 2:
+                names_display += f" и еще {len(client_names) - 2}"
+            
+            owner_str = f"⚠️ <b>РАЗНЫЕ КЛИЕНТЫ ({unique_clients_count}):</b>\n({names_display})"
+        else:
+            # Если клиент один
+            owner_str = f"👤 Владелец: <b>{client_names[0] if client_names else 'Неизвестно'}</b>"
+
+        # 4. Возвращаем JSON для кнопки подтверждения
         return json.dumps({
             "confirm_action": "bulk_status_manual", # Тип действия для бота
-            "ids": found_ids,       # <-- ВАЖНО: Передаем ID, чтобы кнопка сработала
+            "ids": found_ids,       # Передаем ВСЕ найденные ID скопом
             "new_status": new_status,
             "count": count,
             "message": (
-                f"🔄 <b>СМЕНА СТАТУСА</b>\n"
-                f"📦 Заказов: {count}\n"
-                f"👤 Владелец: <b>{owner_str}</b>\n"
-                f"📝 Статус: <b>'{new_status}'</b>\n\n"
-                f"❓ Подтверждаете изменение?"
+                f"🔄 <b>МАССОВАЯ СМЕНА СТАТУСА</b>\n"
+                f"📦 Заказов найдено: <b>{count}</b>\n"
+                f"{owner_str}\n"
+                f"📝 Новый статус: <b>'{new_status}'</b>\n\n"
+                f"❓ Подтверждаете изменение для ВСЕХ этих заказов?"
             )
         }, ensure_ascii=False)
 
@@ -530,16 +532,15 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 total_weight = float(raw_weight)
             except ValueError:
                 return "❌ Ошибка: Некорректный формат веса."
-            # -------------------------
             
             party_date = tool_command.get("party_date")
             uncalculated_only = tool_command.get("uncalculated_only")
-            
-            # --- [NEW] ИЗВЛЕКАЕМ СПИСОК ТРЕКОВ ---
-            track_codes = tool_command.get("track_codes") # Ожидаем список строк
-            if isinstance(track_codes, str): # Если вдруг ИИ прислал строку "A, B", превращаем в список
+            track_codes = tool_command.get("track_codes")
+            if isinstance(track_codes, str):
                 track_codes = [t.strip() for t in track_codes.split(',')]
-            # -------------------------------------
+
+            # --- НОВОЕ ПОЛЕ ---
+            target_status = tool_command.get("target_status")
             
             return await prepare_calculation(
                 api_request_func, 
@@ -550,18 +551,31 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 total_weight=total_weight,
                 party_date=party_date,
                 uncalculated_only=uncalculated_only,
-                track_codes=track_codes # <-- ПЕРЕДАЕМ СЮДА
+                track_codes=track_codes,
+                target_status=target_status # <-- Передаем в функцию
             )
 
     elif tool == "update_client_data":
             client_search = tool_command.get("client_search")
             new_phone = tool_command.get("new_phone")
             new_code = tool_command.get("new_code")
+            new_name = tool_command.get("new_name")     # <-- Добавлено
+            new_prefix = tool_command.get("new_prefix") # <-- Добавлено
+            
             # Преобразуем код в число, если передан
             if new_code and str(new_code).isdigit(): new_code = int(new_code)
-            return await prepare_client_update(api_request_func, employee_id, company_id, client_search, new_phone, new_code)
             
-        # =================================
+            return await prepare_client_update(
+                api_request_func, 
+                employee_id, 
+                company_id, 
+                client_search, 
+                new_phone, 
+                new_code,
+                new_name,   # <-- Передаем
+                new_prefix  # <-- Передаем
+            )
+    
     elif tool == "bulk_update_client_orders":
         client_id = tool_command.get("target_client_id")
         old_status = tool_command.get("old_status")
@@ -729,29 +743,42 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
 
         # === БЛОК 3: ФИНАНСЫ И РАССЫЛКА ===
 
-        elif tool == "add_expense":
+        elif tool == "prepare_add_expense":
             amount = tool_command.get("amount")
             reason = tool_command.get("reason")
-            return json.dumps({
-                "confirm_action": "add_expense", "amount": amount, "reason": reason,
-                "message": f"💸 Записать расход **{amount} сом**?\nПричина: *{reason}*"
-            })
+            cat = tool_command.get("category")
+            src = tool_command.get("source", "shift")
+            loc_search = tool_command.get("location_search") # <-- Достаем параметр
+        
+            return await prepare_add_expense(
+                api_request_func, 
+                employee_id, 
+                company_id, 
+                float(amount), 
+                reason, 
+                cat, 
+                src,
+                loc_search # <-- Передаем
+            )
+        
+        elif tool == "get_shift_summary":
+            loc_id = tool_command.get("location_id") # Опционально
+            return await get_shift_summary(api_request_func, employee_id, company_id, loc_id)
 
-        elif tool == "broadcast":
-            text = tool_command.get("text")
-            return json.dumps({
-                "confirm_action": "broadcast", "text": text,
-                "message": f"📢 **ОТПРАВИТЬ РАССЫЛКУ ВСЕМ?**\n\nТекст:\n{text}"
-            })
+        elif tool == "request_broadcast_photo":
+           text = tool_command.get("text")
+           if not text: return "❌ Ошибка: Текст рассылки пустой."
+           return await request_broadcast_photo(api_request_func, text)
 
-        elif tool == "get_report":
-            start = tool_command.get("period_start")
-            end = tool_command.get("period_end")
-            report = await api_request_func("GET", "/api/reports/summary", employee_id=employee_id, params={"start_date": start, "end_date": end, "company_id": company_id})
-            if not report or "summary" not in report: return "❌ Ошибка отчета."
-            s = report['summary']
-            return f"📊 **Отчет ({start} - {end}):**\n💰 Выручка: {s['total_income']}\n📉 Расходы: {s['total_expenses']}\n💵 Чистая: {s['net_profit']}"
-
+        elif tool == "get_summary_by_date":
+            start = tool_command.get("start_date")
+            end = tool_command.get("end_date")
+            loc_search = tool_command.get("location_search")
+        
+            if not start or not end:
+                return "❌ Ошибка ИИ: Не указаны даты начала или конца периода."
+            
+            return await get_summary_report_by_range(api_request_func, employee_id, company_id, start, end, loc_search)
         # === БЛОК 4: ПАРТИИ ===
         
         elif tool == "get_active_parties":
@@ -889,10 +916,10 @@ async def get_orders_by_date(api_request_func, employee_id: int, company_id: int
         logger.error(f"Date Search Error: {e}", exc_info=True)
         return f"❌ Ошибка поиска по дате: {str(e)}"
 
-async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_id: Optional[int], client_search: Optional[str], total_weight: float, party_date: Optional[str] = None, uncalculated_only: Optional[bool] = None, track_codes: Optional[List[str]] = None) -> str:
+async def prepare_calculation(api_request_func, employee_id: int, company_id: int, client_id: Optional[int], client_search: Optional[str], total_weight: float, party_date: Optional[str] = None, uncalculated_only: Optional[bool] = None, track_codes: Optional[List[str]] = None, target_status: str = None) -> str:
     """
     Инструмент: Подготовка расчета.
-    Версия 2.0: Красивое форматирование чека.
+    ВЕРСИЯ 3.0: Поддержка фильтрации по текущему статусу (target_status).
     """
     try:
         client = None
@@ -916,7 +943,14 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
              return f"❌ Клиент не найден (ID: {client_id}, Поиск: '{client_search}')."
 
         # 2. Ищем заказы
-        calc_statuses = ["В обработке", "В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа", "Готов к выдаче"]
+        # --- НОВАЯ ЛОГИКА: Фильтр по статусу ---
+        if target_status:
+            # Если ИИ сказал "те что в пути", ищем только их
+            calc_statuses = [target_status]
+        else:
+            # Иначе берем стандартный набор (исключая уже выданные)
+            calc_statuses = ["В обработке", "В пути", "На складе в Китае", "На складе в КР", "Ожидает выкупа"]
+        # ---------------------------------------
         
         params = {
             "client_id": client['id'], 
@@ -929,9 +963,10 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
         orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params=params)
         
         if not orders: 
-            return f"❌ У клиента **{client['full_name']}** нет подходящих заказов."
+            status_msg = f"со статусом '{target_status}'" if target_status else "для расчета"
+            return f"❌ У клиента **{client['full_name']}** нет заказов {status_msg}."
 
-        # --- ФИЛЬТР ПО ТРЕК-КОДАМ ---
+        # --- ФИЛЬТР ПО ТРЕК-КОДАМ (если переданы явно) ---
         if track_codes and len(track_codes) > 0:
             target_tracks = {t.strip() for t in track_codes}
             filtered_orders = []
@@ -945,23 +980,22 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
 
         # --- ПРЕДОХРАНИТЕЛЬ (SAFETY LOGIC) ---
         uncalculated_orders = []
-        calculated_orders = []
         
         for o in orders:
             cost = o.get('calculated_final_cost_som')
             if cost is None or cost == 0:
                 uncalculated_orders.append(o)
-            else:
-                calculated_orders.append(o)
         
         target_orders = []
         
         if uncalculated_only:
             target_orders = uncalculated_orders
-            if not target_orders: return "✅ Все заказы уже посчитаны."
+            if not target_orders: return "✅ Все подходящие заказы уже посчитаны."
         elif len(uncalculated_orders) > 0:
+            # Если есть непосчитанные, берем только их (по умолчанию)
             target_orders = uncalculated_orders
         else:
+            # Если все посчитаны, но мы все равно вызвали функцию — берем все (пересчет)
             target_orders = orders
 
         if not target_orders:
@@ -978,18 +1012,15 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
         
         # --- КРАСИВОЕ ФОРМАТИРОВАНИЕ СПИСКА ---
         tracks_preview = ""
-        # Используем enumerate для нумерации (1., 2., 3.)
         for i, o in enumerate(target_orders[:15], 1): 
-            # Обработка комментария: если есть, добавляем курсивом через тире
             comment = o.get('comment')
             comment_str = f" — <i>{comment}</i>" if comment else ""
-            
-            tracks_preview += f"{i}. <code>{o.get('track_code')}</code>{comment_str}\n"
+            status_icon = "🚚" if o.get('status') == "В пути" else "📦"
+            tracks_preview += f"{i}. {status_icon} <code>{o.get('track_code')}</code>{comment_str}\n"
         
         if count > 15:
             tracks_preview += f"<i>... и еще {count - 15} шт.</i>\n"
         
-        # Форматирование денег (с пробелами: 4 288 вместо 4288)
         formatted_cost = "{:,.0f}".format(cost_som).replace(",", " ")
         
         # 5. Возвращаем JSON
@@ -1019,37 +1050,91 @@ async def prepare_calculation(api_request_func, employee_id: int, company_id: in
         }, ensure_ascii=False)
         
     except Exception as e:
-        logger.error(f"Calc Error: {e}", exc_info=True)
         return f"❌ Ошибка расчета: {e}"
 
-async def prepare_client_update(api_request_func, employee_id: int, company_id: int, client_search: str, new_phone: str = None, new_code: str = None) -> str:
+async def prepare_client_update(api_request_func, employee_id: int, company_id: int, client_search: str, new_phone: str = None, new_code: str = None, new_name: str = None, new_prefix: str = None) -> str:
     """
-    Инструмент: Подготовка изменения данных клиента.
+    Инструмент: Подготовка изменения данных клиента (ФИО, Телефон, Код, Префикс).
     """
     try:
+        # --- ЗАЩИТА ОТ ПУСТОГО ПОИСКА ---
+        if not client_search or not str(client_search).strip():
+            return "⚠️ Ошибка: Вы не указали, кого редактировать (имя или телефон). Пожалуйста, повторите команду, указав имя клиента."
+        # -------------------------------
+
         # 1. Ищем клиента
         clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
-        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        
+        # Проверка на ошибку от сервера
+        if isinstance(clients, dict) and "error" in clients:
+            return f"❌ Ошибка поиска: {clients.get('error')}"
+            
+        if not isinstance(clients, list):
+             return f"❌ Ошибка: Сервер вернул некорректные данные (не список)."
+
+        if not clients: 
+            return f"❌ Клиент по запросу '{client_search}' не найден. Уточните ФИО или телефон."
+        
+        if len(clients) > 1:
+             # Если нашли несколько, возвращаем список для уточнения
+             options = []
+             for c in clients:
+                 code = f"{c.get('client_code_prefix')}{c.get('client_code_num')}"
+                 options.append(f"ID {c['id']}: {c['full_name']} ({code})")
+             return json.dumps({
+                 "status": "multiple_results",
+                 "message": f"⚠️ Найдено {len(clients)} клиентов. Уточните ID или точное имя:",
+                 "options": options
+             }, ensure_ascii=False)
+
         client = clients[0]
         
+        # 2. Формируем список изменений
         changes_text = ""
-        if new_phone: changes_text += f"📱 Телефон: {client.get('phone')} ➡️ **{new_phone}**\n"
-        if new_code: changes_text += f"🔢 Код номера: {client.get('client_code_num')} ➡️ **{new_code}**\n"
+        payload_data = {}
+
+        # Смена ФИО
+        if new_name and new_name != client.get('full_name'):
+            changes_text += f"👤 ФИО: {client.get('full_name')} ➡️ <b>{new_name}</b>\n"
+            payload_data['new_name'] = new_name
+
+        # Смена Телефона
+        if new_phone and new_phone != client.get('phone'):
+            changes_text += f"📱 Телефон: {client.get('phone')} ➡️ <b>{new_phone}</b>\n"
+            payload_data['new_phone'] = new_phone
+
+        # Смена Кода (Цифры)
+        if new_code:
+            old_code_num = str(client.get('client_code_num')) if client.get('client_code_num') else ""
+            if str(new_code) != old_code_num:
+                changes_text += f"🔢 Номер кода: {old_code_num} ➡️ <b>{new_code}</b>\n"
+                payload_data['new_code'] = int(new_code)
+
+        # Смена Префикса
+        if new_prefix:
+            new_prefix = new_prefix.upper()
+            if new_prefix != client.get('client_code_prefix'):
+                changes_text += f"🔤 Префикс: {client.get('client_code_prefix')} ➡️ <b>{new_prefix}</b>\n"
+                payload_data['new_prefix'] = new_prefix
         
-        if not changes_text: return "⚠️ Вы не указали, что менять (телефон или код)."
+        if not changes_text: 
+            return "⚠️ Вы не указали никаких новых данных, отличающихся от текущих."
+        
+        # 3. Возвращаем JSON для кнопки подтверждения
+        payload_data['client_id'] = client['id']
         
         return json.dumps({
             "confirm_action": "confirm_client_edit",
-            "client_id": client['id'],
-            "new_phone": new_phone,
-            "new_code": new_code,
+            "payload": payload_data,
             "message": (
                 f"📝 **РЕДАКТИРОВАНИЕ КЛИЕНТА**\n"
-                f"👤 {client['full_name']}\n\n"
+                f"Клиент: {client['full_name']} (ID {client['id']})\n"
+                f"--------------------------\n"
                 f"{changes_text}\n"
-                f"❓ **Сохранить изменения?**"
+                f"❓ **Подтверждаете изменения?**"
             )
         }, ensure_ascii=False)
+
     except Exception as e:
         return f"❌ Ошибка подготовки обновления: {e}"
     
@@ -1127,3 +1212,246 @@ async def undo_last_operation(api_request_func, operation_id: int) -> str:
         return f"❌ Ошибка отмены: {response['error']}"
     
     return f"✅ Готово! {response.get('message')}"
+
+async def get_expense_types_list(api_request_func, company_id: int, employee_id: int) -> dict:
+    """Вспомогательная функция: Получает словарь {имя_типа: id_типа}."""
+    # ВАЖНО: Передаем employee_id, так как эндпоинт защищен
+    types = await api_request_func("GET", "/api/expense_types", employee_id=employee_id, params={"company_id": company_id})
+    
+    if not types or not isinstance(types, list):
+        return {}
+    # Создаем словарь для нечеткого поиска: {"хознужды": 1, "питание": 2, ...}
+    return {t['name'].lower(): t['id'] for t in types}
+
+async def prepare_add_expense(api_request_func, employee_id: int, company_id: int, amount: float, reason: str, category_name: str = None, source: str = "shift", location_search: str = None) -> str:
+    """
+    Инструмент: Подготовка расхода. 
+    Умный поиск категории (нечеткое совпадение) и филиала.
+    """
+    try:
+        # 1. Получаем список категорий из БД
+        types_map = await get_expense_types_list(api_request_func, company_id, employee_id) # { "имя": id }
+        
+        if not types_map:
+             return "❌ Ошибка: В системе нет ни одной категории расходов. Создайте их в Админ-панели."
+
+        expense_type_id = None
+        expense_type_name = None
+        
+        # А. Если ИИ передал категорию (например "Хоз нужды")
+        if category_name:
+            cat_lower = category_name.lower().strip()
+            
+            # 1. Точное совпадение
+            if cat_lower in types_map:
+                expense_type_id = types_map[cat_lower]
+                expense_type_name = category_name.capitalize()
+            else:
+                # 2. Частичное совпадение (если "Хоз нужды" содержится в "хоз. нужды")
+                for db_name, db_id in types_map.items():
+                    # Очищаем от точек и пробелов для сравнения
+                    clean_db = db_name.replace('.', '').replace(' ', '')
+                    clean_cat = cat_lower.replace('.', '').replace(' ', '')
+                    
+                    if clean_cat in clean_db or clean_db in clean_cat:
+                        expense_type_id = db_id
+                        expense_type_name = db_name.capitalize() # Берем правильное имя из БД
+                        break
+
+        # Б. Если по имени не нашли, ищем ключевые слова в ПРИЧИНЕ
+        if not expense_type_id:
+            reason_lower = reason.lower()
+            for db_name, db_id in types_map.items():
+                # Убираем точки для лучшего поиска ("хоз. нужды" -> "хоз нужды")
+                clean_db_name = db_name.replace('.', ' ')
+                # Разбиваем на слова (чтобы "нужды" нашлось в "хоз. нужды")
+                db_words = clean_db_name.split()
+                
+                # Если любое значимое слово из категории есть в причине
+                for word in db_words:
+                    if len(word) > 2 and word in reason_lower:
+                        expense_type_id = db_id
+                        expense_type_name = db_name.capitalize()
+                        break
+                if expense_type_id: break
+        
+        # В. ФИНАЛЬНЫЙ ФОЛЛБЭК
+        if not expense_type_id:
+            # Ищем "Прочее" или "Хоз" как дефолт (для лампочек это логичнее чем Аванс)
+            priority_keys = ["хоз", "прочее", "разное", "расходы"]
+            for key in priority_keys:
+                for db_name, db_id in types_map.items():
+                    if key in db_name:
+                        expense_type_id = db_id
+                        expense_type_name = db_name.capitalize()
+                        break
+                if expense_type_id: break
+            
+            # Если совсем ничего не нашли, берем первую
+            if not expense_type_id and types_map:
+                first_key = list(types_map.keys())[0]
+                expense_type_id = types_map[first_key]
+                expense_type_name = first_key.capitalize()
+
+        # Логика Филиалов (без изменений)
+        target_location_id = None
+        target_location_name = "Текущий"
+        locations = await api_request_func("GET", "/api/bot/locations", params={"company_id": company_id})
+        
+        if location_search:
+            search_lower = location_search.lower()
+            found_loc = None
+            for loc in locations:
+                if search_lower in loc['name'].lower():
+                    found_loc = loc
+                    break
+            if found_loc:
+                target_location_id = found_loc['id']
+                target_location_name = found_loc['name']
+        elif len(locations) > 1 and source == 'shift':
+             return json.dumps({
+                 "status": "multiple_results",
+                 "message": f"🏢 У вас {len(locations)} филиалов. Уточните филиал?",
+                 "options": [l['name'] for l in locations]
+             }, ensure_ascii=False)
+        elif len(locations) == 1:
+            target_location_id = locations[0]['id']
+
+        source_text = f"💵 Из КАССЫ ({target_location_name})" if source == 'shift' else "💼 ЛИЧНЫЕ / Сейф"
+        
+        return json.dumps({
+            "confirm_action": "add_expense",
+            "amount": amount,
+            "reason": reason,
+            "expense_type_id": expense_type_id,
+            "expense_type_name": expense_type_name, # Важно вернуть имя из БД
+            "source": source,
+            "location_id": target_location_id,
+            "message": (
+                f"💸 **ЗАПИСЬ РАСХОДА**\n"
+                f"💰 Сумма: **{amount} сом**\n"
+                f"📂 Категория: **{expense_type_name}**\n"
+                f"📝 Причина: {reason}\n"
+                f"📍 Источник: {source_text}\n\n"
+                f"❓ Подтверждаете?"
+            )
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return f"❌ Ошибка подготовки расхода: {e}"
+
+async def get_shift_summary(api_request_func, employee_id: int, company_id: int, location_id: int = None) -> str:
+    """
+    Инструмент: Получает сводку по текущей смене (Касса, Приход, Расход).
+    """
+    try:
+        # Если Владелец не указал филиал, используем его основной или текущий контекст
+        # Но лучше пусть API само разберется. Если location_id передан — отлично.
+        
+        url = "/api/reports/shift/current"
+        # Если Владелец запрашивает конкретный филиал
+        if location_id:
+             url = f"/api/reports/shift/location/{location_id}"
+             
+        report = await api_request_func("GET", url, employee_id=employee_id, params={"company_id": company_id})
+        
+        if not report or "error" in report:
+            # Пробуем понять ошибку (часто 404 если смены нет)
+            err = report.get('error', '') if isinstance(report, dict) else ''
+            if "не найдена" in str(err) or "not found" in str(err):
+                return "📴 **Смена сейчас закрыта.**\nВ кассе 0.00 сом. Для начала работы нужно открыть смену."
+            return f"❌ Ошибка получения отчета: {err}"
+
+        # Формируем красивый текст
+        text = (
+            f"📊 **СВОДКА ПО СМЕНЕ**\n"
+            f"📍 Филиал: {report.get('location_name')}\n"
+            f"👤 Сотрудник: {report.get('employee_name')}\n"
+            f"🕐 Открыта: {report.get('shift_start_time', '')[:16].replace('T', ' ')}\n"
+            f"──────────────────\n"
+            f"💰 **В КАССЕ: {report.get('calculated_cash', 0):.2f} сом**\n"
+            f"──────────────────\n"
+            f"📥 Наличные (+): {report.get('cash_income', 0):.2f}\n"
+            f"💳 Карта (+): {report.get('card_income', 0):.2f}\n"
+            f"📤 Расходы (-): {report.get('total_expenses', 0):.2f}\n"
+            f"↩️ Возвраты (-): {report.get('total_returns', 0):.2f}\n"
+        )
+        return text
+
+    except Exception as e:
+        return f"❌ Ошибка сводки: {e}"
+    
+async def get_summary_report_by_range(api_request_func, employee_id: int, company_id: int, start_date: str, end_date: str, location_search: str = None) -> str:
+    """
+    Инструмент: Получает сводный отчет (Приход, Расход, Прибыль) за указанный период.
+    """
+    try:
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "company_id": company_id
+        }
+
+        # Логика поиска филиала (если указан)
+        if location_search:
+            locations = await api_request_func("GET", "/api/bot/locations", params={"company_id": company_id})
+            if locations:
+                search_lower = location_search.lower()
+                for loc in locations:
+                    if search_lower in loc['name'].lower():
+                        params["location_id"] = loc['id']
+                        break
+        
+        # Запрос к API
+        report = await api_request_func("GET", "/api/reports/summary", employee_id=employee_id, params=params)
+        
+        if not report or "error" in report:
+            err = report.get('error', '') if isinstance(report, dict) else ''
+            return f"❌ Не удалось получить отчет: {err}"
+        
+        s = report.get('summary', {})
+        
+        # Формирование красивого ответа
+        loc_text = f" (Филиал: {s.get('location_id_filter')})" if s.get('location_id_filter') else ""
+        
+        text = (
+            f"📊 **ОТЧЕТ ЗА ПЕРИОД**\n"
+            f"📅 {start_date} — {end_date}{loc_text}\n"
+            f"──────────────────\n"
+            f"💰 **ВЫРУЧКА: {s.get('total_income', 0):,.2f} сом**\n"
+            f"   ├ 💵 Нал: {s.get('total_cash_income', 0):,.2f}\n"
+            f"   └ 💳 Карта: {s.get('total_card_income', 0):,.2f}\n"
+            f"──────────────────\n"
+            f"📉 **РАСХОДЫ: {s.get('total_expenses', 0):,.2f} сом**\n"
+        )
+        
+        # Детализация расходов
+        if s.get('expenses_by_type'):
+            for type_name, amount in s['expenses_by_type'].items():
+                 text += f"   • {type_name}: {amount:,.2f}\n"
+        
+        text += f"──────────────────\n"
+        profit = s.get('net_profit', 0)
+        profit_icon = "📈" if profit >= 0 else "📉"
+        text += f"{profit_icon} **ЧИСТАЯ ПРИБЫЛЬ: {profit:,.2f} сом**"
+        
+        return text
+
+    except Exception as e:
+        return f"❌ Ошибка формирования отчета: {e}"
+    
+async def request_broadcast_photo(api_request_func, text: str) -> str:
+    """
+    Инструмент: Сохраняет черновик и просит фото/подтверждение.
+    """
+    return json.dumps({
+        "status": "waiting_for_broadcast_photo",
+        "draft_text": text,
+        "message": (
+            f"📝 **Черновик объявления:**\n\n"
+            f"{text}\n\n"
+            f"➖➖➖➖➖➖➖\n"
+            f"📸 **Если текст устраивает** — отправьте фото (или напишите 'без фото').\n"
+            f"✏️ **Если нужно исправить** — просто напишите, что поменять."
+        )
+    }, ensure_ascii=False)
