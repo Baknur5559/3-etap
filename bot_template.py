@@ -996,17 +996,48 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     valid_tracks = [t for t in potential_tracks if any(char.isdigit() for char in t)]
 
     # --- УМНЫЙ ФИЛЬТР (ИСПРАВЛЕНИЕ) ---
-    # Если пишет Владелец и код ВСЕГО ОДИН, мы НЕ перехватываем его.
-    # Мы отдаем его ИИ, чтобы ИИ мог поискать клиента или заказ.
+    # Если пишет Владелец и код ВСЕГО ОДИН, мы НЕ перехватываем его (чтобы ИИ мог ответить на вопрос "Чей это заказ?").
+    # Если кодов много -> это точно массовое добавление.
+    # --- УМНЫЙ ФИЛЬТР v2 (ЗАЩИТА ОТ ТУПОСТИ) ---
     should_intercept = True
+    
+    # 1. Если пишет Владелец и код ВСЕГО ОДИН -> это поиск, не перехватываем.
     if is_owner and len(valid_tracks) == 1:
          should_intercept = False
+
+    # 2. (НОВОЕ) Если в тексте есть СЛОВА-КОМАНДЫ -> это действие, не перехватываем.
+    stop_words = [
+        # --- Арифметика ---
+        "посчитать", "расчет", "вес", "кг", "сумма", "сколько", 
+        # --- Действия ---
+        "удалить", "убрать", "отмена", 
+        "статус", "перенести", "изменить", "сменить", "вернуть", "поставить", "отметить", "сделай",
+        # --- Поиск ---
+        "чей", "кто", "где", "инфо", "покажи", "список",
+        # --- Английский ---
+        "calculate", "weight", "delete", "status",
+        
+        # --- [NEW] СТАТУСЫ (Самое важное!) ---
+        "в пути", "на складе", "выдан", "готов", "обработке", "выкуп", "прибыли", "уехали", "пришли","выехали", 
+        
+        # --- [NEW] РАЗГОВОРНЫЕ МАРКЕРЫ ---
+        "эти", "вот", "оказ", "они", "их" 
+    ]
+    
+    text_lower = text.lower()
+    # Проверка: Если есть хоть одно стоп-слово -> Отключаем перехватчик добавления
+    if any(word in text_lower for word in stop_words):
+        should_intercept = False
+        logger.info(f"Intercept Cancelled: найдены командные слова или статусы. Передаю ИИ.")
+
     # ----------------------------------
 
-    if valid_tracks and len(valid_tracks) >= 1:
+    # Если фильтр пропустил (True) -> Пытаемся добавить заказы
+    if valid_tracks and len(valid_tracks) >= 1 and should_intercept:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         
         try:
+            # ... (дальше идет старый код api_request "check_only") ...
             # 1. ДЕЛАЕМ ПРОВЕРКУ (Check Only)
             api_response = await api_request("POST", "/api/bot/order_request", json={
                 "client_id": client_id, 
@@ -1245,13 +1276,17 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if command and isinstance(command, dict) and "tool" in command:
              # ... (код выполнения остается без изменений)
             try:
-                # --- (НОВОЕ) ОТПРАВКА ТЕКСТА ПЕРЕД ИНСТРУМЕНТОМ ---
-                json_start = ai_answer.find('{')
+                # --- (УЛУЧШЕНО) ОЧИСТКА ОТ MARKDOWN ---
+                # Сначала убираем маркеры кода, чтобы они не попали в text_before
+                clean_raw_answer = ai_answer.replace("```json", "").replace("```", "").strip()
+                
+                json_start = clean_raw_answer.find('{')
                 
                 # Если перед JSON есть текст (извинения, комментарии) — отправляем его
                 if json_start > 0:
-                    text_before = ai_answer[:json_start].strip()
+                    text_before = clean_raw_answer[:json_start].strip()
                     if text_before:
+                        # Отправляем текст, предварительно убедившись, что там нет мусора
                         await update.message.reply_html(text_before)
                 # --------------------------------------------------
 
@@ -1308,19 +1343,32 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                 [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
                             ]
                             context.user_data['ai_pending_action'] = confirm_data
-                            await update.message.reply_text(confirm_data['message'], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+                            # ИСПРАВЛЕНИЕ: Включаем HTML
+                            await update.message.reply_text(confirm_data['message'], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
                             return
                     except: pass
                     
                     # Обработка результата инструмента
                     final_text = str(tool_result)
                     try:
+                        # Пробуем распарсить JSON, если ответ похож на него
                         if final_text.strip().startswith(("{", "[")):
                             res_json = json.loads(final_text)
                             
-                            if isinstance(res_json, dict) and "message" in res_json:
+                            # Сценарий 0: Дубликаты (ПОКАЗЫВАЕМ СПИСОК)
+                            if isinstance(res_json, dict) and res_json.get("status") == "multiple_results":
+                                # Собираем сообщение + список вариантов
+                                msg = res_json.get("message", "")
+                                options = res_json.get("options", [])
+                                if options:
+                                    msg += "\n\n" + "\n".join(options)
+                                final_text = msg
+
+                            # Сценарий 1: Просто сообщение
+                            elif isinstance(res_json, dict) and "message" in res_json and "active_orders" not in res_json:
                                 final_text = res_json["message"]
                             
+                            # Сценарий 2: Список заказов (active_orders)
                             elif isinstance(res_json, dict) and "active_orders" in res_json:
                                 # Логика форматирования списка заказов
                                 orders = res_json.get("active_orders", [])
@@ -1332,6 +1380,8 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     grouped_orders = {}
                                     for status in active_statuses:
                                         grouped_orders[status] = []
+                                    
+                                    # Распределяем заказы по группам
                                     for order in orders:
                                         status = order.get('статус', 'В обработке')
                                         if status in grouped_orders:
@@ -1351,10 +1401,10 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                             comment = o.get('комментарий')
                                             if comment: formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
                                             
-                                            calc_weight = o.get('расчет_вес_кг')
-                                            calc_cost = o.get('расчет_сумма_сом')
-                                            if calc_weight is not None and calc_cost is not None:
-                                                formatted_text += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
+                                            # ИСПРАВЛЕНИЕ: Используем готовое поле 'расчет' из ai_tools.py
+                                            calc_string = o.get('расчет')
+                                            if calc_string:
+                                                formatted_text += f"<b>Расчет:</b> {calc_string}\n"
                                             
                                             # История
                                             history = o.get('history_entries', [])
@@ -1364,26 +1414,30 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                                     latest_status_map = {}
                                                     for entry in history:
                                                         entry_status = entry.get('status')
-                                                        entry['parsed_date'] = datetime.fromisoformat(entry.get('date').replace('Z', '+00:00'))
+                                                        # Защита от формата даты без Z
+                                                        date_str = entry.get('date', '').replace('Z', '+00:00')
+                                                        entry['parsed_date'] = datetime.fromisoformat(date_str)
                                                         latest_status_map[entry_status] = entry
                                                     
                                                     sorted_history = sorted(latest_status_map.values(), key=lambda e: e['parsed_date'])
                                                     for entry in sorted_history:
                                                         bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
                                                         formatted_text += f"  <i>- {bishkek_date.strftime('%d.%m %H:%M')}: {entry.get('status')}</i>\n"
-                                                except Exception:
-                                                    formatted_text += "  <i>- (ошибка истории)</i>\n"
+                                                except Exception as e_hist:
+                                                    # logger.warning(f"History parse error: {e_hist}")
+                                                    formatted_text += "  <i>- (история скрыта)</i>\n"
                                             formatted_text += "──────────────\n"
                                     
                                     if not has_orders_in_message: formatted_text = "У вас пока нет активных заказов. 🚚"
-                                    if len(formatted_text) > 4000: formatted_text = formatted_text[:4000] + "\n..."
+                                    
                                     # --- ДОБАВЛЕНИЕ ИТОГОВ (FOOTER) ---
                                     if "summary_footer" in res_json:
                                         formatted_text += "\n──────────────\n" + res_json["summary_footer"]
+                                        
                                     final_text = formatted_text
 
+                            # Сценарий 3: Список филиалов
                             elif isinstance(res_json, list): 
-                                # Список филиалов
                                 formatted_text = ""
                                 for l in res_json:
                                     nm = l.get("Филиал") or l.get("name") or "Филиал"
@@ -1395,6 +1449,8 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     if ph: formatted_text += f"📞 {ph}\n"
                                     formatted_text += "\n"
                                 if formatted_text: final_text = formatted_text
+                            
+                            # Fallback
                             else:
                                 final_text = str(tool_result)
 
@@ -1402,29 +1458,37 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         logger.warning(f"Tool result was not JSON, using raw text: {e_json}")
                         final_text = str(tool_result)
                     
-                    # --- [ULTRA MEMORY FIX] ЭКОНОМИЯ ПАМЯТИ ---
-                    # Если ответ длинный (список заказов), мы НЕ пишем его в память ИИ целиком.
-                    # Мы пишем только краткую суть, чтобы ИИ не зависал.
+                    # --- [ULTRA MEMORY FIX v2] ---
+                    # Мы не пишем в память технические ответы (JSON), только человеческий текст.
                     
                     history_content = final_text
                     
-                    # Если это JSON (список заказов или сводка)
-                    if final_text.strip().startswith("{") and "active_orders" in final_text:
-                         # Парсим, чтобы понять, сколько там заказов
+                    # Если ответ был JSON-командой (которую мы выполнили), не пишем её в память как текст.
+                    # Вместо этого пишем системное сообщение о том, что действие выполнено.
+                    if final_text.strip().startswith("{") and "confirm_action" in final_text:
+                         try:
+                             action_data = json.loads(final_text)
+                             action_name = action_data.get("confirm_action", "действие")
+                             history_content = f"[Системно: Я предложил пользователю выполнить '{action_name}'. Жду нажатия кнопки.]"
+                         except:
+                             history_content = "[Системно: Я предложил действие.]"
+                    
+                    elif final_text.strip().startswith("{") and "active_orders" in final_text:
+                         # Это мы уже исправляли (список заказов)
                          try:
                              data = json.loads(final_text)
                              count = len(data.get("active_orders", []))
-                             history_content = f"[Системно: Я вывел пользователю список из {count} заказов. Если он попросит что-то сделать с 'ними' или 'этим списком', используй ID клиента из контекста.]"
+                             history_content = f"[Системно: Я вывел список из {count} заказов.]"
                          except:
-                             history_content = "[Системно: Я показал пользователю список заказов.]"
+                             history_content = "[Системно: Я показал список заказов.]"
                     
-                    # Если это просто длинный текст
-                    elif len(final_text) > 200:
-                        history_content = final_text[:200] + "... [Текст сокращен для экономии памяти]"
+                    # Если это просто очень длинный текст
+                    elif len(final_text) > 400:
+                        history_content = final_text[:200] + "... [Текст сокращен]"
 
                     history.append({"role": "assistant", "content": history_content})
-                    context.user_data['dialog_history'] = history
-                    # ----------------------------------------------------------------------
+                    context.user_data['dialog_history'] = history[-15:] # Храним только последние 15 сообщений
+                    # -----------------------------
 
                     # --- SMART PAGINATION: Разбивка длинных сообщений ---
                     if len(final_text) < 4000:
@@ -1435,27 +1499,22 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             await update.message.reply_text(final_text, parse_mode=None)
                     else:
                         # Длинное сообщение - разбиваем по заказам (разделитель)
-                        # Разделитель в ai_tools/bot_template обычно такой: "──────────────\n"
-                        # Но лучше разбивать по двойному переносу, чтобы наверняка
                         parts = final_text.split('──────────────\n')
                         current_chunk = ""
                         
                         for part in parts:
-                            # Восстанавливаем разделитель (кроме, возможно, последнего, но это не страшно)
                             if not part.strip(): continue
                             part_to_add = part + '──────────────\n'
                             
-                            # Если добавление куска превысит лимит - отправляем текущий буфер
                             if len(current_chunk) + len(part_to_add) > 4000:
                                 try:
                                     await update.message.reply_text(current_chunk, parse_mode=ParseMode.HTML)
                                 except Exception:
                                     await update.message.reply_text(current_chunk, parse_mode=None)
-                                current_chunk = part_to_add # Начинаем новый буфер
+                                current_chunk = part_to_add 
                             else:
                                 current_chunk += part_to_add
                         
-                        # Отправляем остаток
                         if current_chunk:
                              try:
                                 await update.message.reply_text(current_chunk, parse_mode=ParseMode.HTML)
@@ -2051,16 +2110,25 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(f"✅ Статус изменен на '{action_data['new_status']}'.")
 
         elif data == "ai_confirm_delete_order":
-            # Для удаления может потребоваться пароль, но пока сделаем без (доверие Владельцу)
-            # Или можно взять пароль из базы, но это сложно. 
-            # Пока используем API удаления без пароля (если переделали) или заглушку
-            # В main.py delete_order требует пароль. Это проблема. 
-            # РЕШЕНИЕ: Передадим пароль 'ai_admin_override' (нужно доработать main.py) или пока просто скажем "Удалите через сайт".
-            # А, стоп. Мы можем просто в main.py разрешить удаление без пароля, если это делает Владелец.
-            # ДАВАЙ ПОПРОБУЕМ вызвать API, предполагая, что пароль Владельца мы не знаем.
-            # В main.py мы меняли логику? delete_order требует пароль.
-            # Ладно, для теста покажем ошибку, если пароль нужен.
-            await query.edit_message_text("⚠️ Для удаления заказа пока используйте сайт (требуется пароль).")
+            # Передаем пароль владельца (берем из employee_id -> API само проверит, если мы допишем логику, 
+            # но пока просто удаляем, так как Владелец уже авторизован в боте)
+            
+            # ВАЖНО: В main.py delete_order требует пароль. 
+            # Чтобы это работало из бота БЕЗ ввода пароля каждый раз, 
+            # мы должны либо передать пароль в запросе (если храним его в сессии - но мы не храним),
+            # либо сделать спец. эндпоинт для бота.
+            
+            # ВРЕМЕННОЕ РЕШЕНИЕ: Мы будем использовать bulk_action с action='delete', 
+            # так как там можно передать ID заказа. Но там тоже нужен пароль.
+            
+            # ДАВАЙТЕ СДЕЛАЕМ ТАК: Бот попросит ввести пароль текстом.
+            await query.edit_message_text("🔒 Введите ваш пароль Владельца для подтверждения удаления:")
+            # Сохраняем контекст, что мы ждем пароль для удаления заказа ID
+            context.user_data['awaiting_password_for_action'] = {
+                'action': 'delete_order',
+                'order_id': action_data['order_id']
+            }
+            return
 
         elif data == "ai_confirm_assign_client":
             payload = {"action": "assign_client", "order_ids": [action_data['order_id']], "client_id": action_data['client_id'], "new_status": "В пути"}
@@ -2104,10 +2172,20 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
         elif data == "ai_confirm_bulk_status_manual":
             ids = action_data['ids']
             if ids:
-                await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json={"action": "update_status", "order_ids": ids, "new_status": action_data['new_status']})
-                await query.edit_message_text(f"✅ Статус обновлен для {len(ids)} заказов.")
-            else:
-                await query.edit_message_text("❌ Ошибка данных.")
+                # Выполняем действие
+                resp = await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json={"action": "update_status", "order_ids": ids, "new_status": action_data['new_status']})
+                
+                msg = f"✅ Статус обновлен для {len(ids)} заказов."
+                
+                # Если API вернуло ID операции, добавляем кнопку отмены
+                op_id = resp.get("operation_id")
+                if op_id:
+                     msg += "\n\n🔄 **Ошиблись?** У вас есть 3 часа, чтобы отменить."
+                     # Создаем клавиатуру с кнопкой отмены
+                     undo_kb = [[InlineKeyboardButton("🔙 ОТМЕНИТЬ ИЗМЕНЕНИЯ", callback_data=f"ai_undo_{op_id}")]]
+                     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(undo_kb), parse_mode=ParseMode.MARKDOWN)
+                else:
+                     await query.edit_message_text(msg)
         # --- 6. РАСЧЕТ ЗАКАЗОВ (НОВОЕ) ---
         # Callback будет выглядеть как ai_confirm_confirm_calc (из-за префикса ai_confirm_)
         elif data == "ai_confirm_confirm_calc":
@@ -2153,6 +2231,26 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(f"❌ Ошибка API: {e}")
     
     context.user_data.pop('ai_pending_action', None)
+
+# --- НОВЫЙ ОБРАБОТЧИК ОТМЕНЫ (UNDO) ---
+async def handle_undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатие кнопки отмены массового действия."""
+    query = update.callback_query
+    # data выглядит как "ai_undo_123", нам нужен ID (123)
+    op_id = query.data.split("_")[2] 
+    
+    # Получаем ID сотрудника для авторизации запроса
+    employee_id = context.user_data.get('employee_id')
+
+    # Вызываем инструмент отмены через API
+    # Обратите внимание: api_request импортируется или определен в этом файле
+    resp = await api_request("POST", f"/api/orders/undo/{op_id}", employee_id=employee_id)
+    
+    if resp and "message" in resp:
+        await query.edit_message_text(f"✅ {resp['message']}")
+    else:
+        err = resp.get("error", "Ошибка") if resp else "Сбой связи"
+        await query.edit_message_text(f"❌ Не удалось отменить: {err}")
 
 # --- НОВЫЙ ОБРАБОТчик ДЛЯ ВЛАДЕЛЬЦА (КТО РЕАГИРОВАЛ) ---
 async def handle_show_reactions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3008,6 +3106,9 @@ def main() -> None:
 
     # НОВЫЙ Обработчик подтверждений ИИ (ловит 'ai_confirm_' и 'ai_cancel')
     application.add_handler(CallbackQueryHandler(handle_ai_confirmation, pattern=r'^ai_'))
+
+    # --- ВОТ ЭТУ СТРОКУ НУЖНО ДОБАВИТЬ: ---
+    application.add_handler(CallbackQueryHandler(handle_undo_callback, pattern=r'^ai_undo_'))
 
     # Команда /cancel вне диалогов
     application.add_handler(CommandHandler('cancel', cancel_dialog))
