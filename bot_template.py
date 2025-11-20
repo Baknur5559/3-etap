@@ -735,7 +735,7 @@ async def add_order_received_track_code(update: Update, context: ContextTypes.DE
                  params={"q": track_code, "company_id": COMPANY_ID_FOR_BOT, "limit": 1}
             )
 
-            if search_response and not search_response.get("error") and len(search_response) > 0:
+            if search_response and isinstance(search_response, list) and len(search_response) > 0:
                  # Найден дубликат (принадлежит кому-то или "Неизвестному", но магия не сработала)
                  order_status = search_response[0].get("status", "Неизвестен")
                  
@@ -1367,27 +1367,39 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             # Сценарий 1: Просто сообщение
                             elif isinstance(res_json, dict) and "message" in res_json and "active_orders" not in res_json:
                                 final_text = res_json["message"]
+
+                            # --- ВСТАВИТЬ ЭТОТ БЛОК ---
+                            # Ловим сигнал от инструмента, что пора ждать фото
+                            elif isinstance(res_json, dict) and res_json.get("status") == "waiting_for_broadcast_photo":
+                                # 1. Сохраняем текст в память (ЧТОБЫ БОТ ПОМНИЛ)
+                                context.user_data['ai_broadcast_text'] = res_json['draft_text']
+                                context.user_data['ai_broadcast_photo'] = None
+                                # 2. Формируем ответ пользователю
+                                final_text = res_json['message']
+                            # ---------------------------
                             
                             # Сценарий 2: Список заказов (active_orders)
                             elif isinstance(res_json, dict) and "active_orders" in res_json:
-                                # Логика форматирования списка заказов
                                 orders = res_json.get("active_orders", [])
+                                client_info = res_json.get("client_info", "Клиент") # Берем имя из ответа
+                                
                                 if not orders:
-                                    final_text = "У вас пока нет активных заказов. 🚚"
+                                    final_text = f"📭 У клиента {client_info} нет активных заказов."
                                 else:
-                                    # Группировка по статусам
+                                    # Группировка
                                     active_statuses = ["Готов к выдаче", "На складе в КР", "В пути", "На складе в Китае", "Выкуплен", "Ожидает выкупа", "В обработке"]
                                     grouped_orders = {}
                                     for status in active_statuses:
                                         grouped_orders[status] = []
                                     
-                                    # Распределяем заказы по группам
                                     for order in orders:
                                         status = order.get('статус', 'В обработке')
                                         if status in grouped_orders:
                                             grouped_orders[status].append(order)
 
-                                    formatted_text = "📦 <b>Ваши текущие заказы:</b>\n"
+                                    # ВАЖНО: Пишем имя клиента в начало сообщения!
+                                    formatted_text = f"📦 <b>Заказы клиента: {client_info}</b>\n" 
+                                    
                                     has_orders_in_message = False
                                     bishkek_tz = timezone(timedelta(hours=6)) 
 
@@ -1397,40 +1409,28 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                         formatted_text += f"\n\n═════ <b>{status.upper()}</b> ({len(status_orders)} шт) ═════\n\n"
 
                                         for o in status_orders:
-                                            formatted_text += f"<b>Трек:</b> <code>{o.get('трек', '?')}</code>\n"
+                                            formatted_text += f"Трек: <code>{o.get('трек', '?')}</code>\n"
                                             comment = o.get('комментарий')
-                                            if comment: formatted_text += f"<b>Примечание:</b> {html.escape(comment)}\n"
+                                            if comment: formatted_text += f"Примечание: {html.escape(comment)}\n"
                                             
-                                            # ИСПРАВЛЕНИЕ: Используем готовое поле 'расчет' из ai_tools.py
                                             calc_string = o.get('расчет')
                                             if calc_string:
-                                                formatted_text += f"<b>Расчет:</b> {calc_string}\n"
+                                                formatted_text += f"Расчет: {calc_string}\n"
                                             
-                                            # История
+                                            # История (последние 3 записи)
                                             history = o.get('history_entries', [])
                                             if history:
-                                                formatted_text += "<b>История:</b>\n"
+                                                formatted_text += "История:\n"
                                                 try:
-                                                    latest_status_map = {}
-                                                    for entry in history:
-                                                        entry_status = entry.get('status')
-                                                        # Защита от формата даты без Z
+                                                    for entry in history[-3:]:
                                                         date_str = entry.get('date', '').replace('Z', '+00:00')
-                                                        entry['parsed_date'] = datetime.fromisoformat(date_str)
-                                                        latest_status_map[entry_status] = entry
-                                                    
-                                                    sorted_history = sorted(latest_status_map.values(), key=lambda e: e['parsed_date'])
-                                                    for entry in sorted_history:
-                                                        bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
-                                                        formatted_text += f"  <i>- {bishkek_date.strftime('%d.%m %H:%M')}: {entry.get('status')}</i>\n"
-                                                except Exception as e_hist:
-                                                    # logger.warning(f"History parse error: {e_hist}")
-                                                    formatted_text += "  <i>- (история скрыта)</i>\n"
+                                                        dt = datetime.fromisoformat(date_str).astimezone(bishkek_tz)
+                                                        formatted_text += f"  - {dt.strftime('%d.%m %H:%M')}: {entry.get('status')}\n"
+                                                except: pass
                                             formatted_text += "──────────────\n"
                                     
-                                    if not has_orders_in_message: formatted_text = "У вас пока нет активных заказов. 🚚"
+                                    if not has_orders_in_message: formatted_text = f"У клиента {client_info} нет заказов по этому фильтру."
                                     
-                                    # --- ДОБАВЛЕНИЕ ИТОГОВ (FOOTER) ---
                                     if "summary_footer" in res_json:
                                         formatted_text += "\n──────────────\n" + res_json["summary_footer"]
                                         
@@ -1474,11 +1474,14 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                              history_content = "[Системно: Я предложил действие.]"
                     
                     elif final_text.strip().startswith("{") and "active_orders" in final_text:
-                         # Это мы уже исправляли (список заказов)
+                         # Исправление Памяти: Записываем не просто "список", а "список КЛИЕНТА"
                          try:
                              data = json.loads(final_text)
                              count = len(data.get("active_orders", []))
-                             history_content = f"[Системно: Я вывел список из {count} заказов.]"
+                             # Достаем имя клиента из JSON
+                             c_info = data.get("client_info", "клиента")
+                             # Пишем в память ИМЯ и ID
+                             history_content = f"[Системно: Я вывел список из {count} заказов для {c_info}.]"
                          except:
                              history_content = "[Системно: Я показал список заказов.]"
                     
@@ -1577,7 +1580,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Запрос ссылки ЛК для клиента {client_id}")
     
     # --- ИЗМЕНЕНИЕ: /generate_lk_link - это POST ---
-    api_response_link = await api_request("POST", f"/api/clients/{client_id}/generate_lk_link", json={'company_id': COMPANY_ID_FOR_BOT})
+    api_response_link = await api_request("POST", f"/api/clients/{client_id}/generate_lk_link", params={'company_id': COMPANY_ID_FOR_BOT})
     lk_url = None
     if api_response_link and "error" not in api_response_link:
         lk_url = api_response_link.get("link")
@@ -2145,28 +2148,72 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
              await api_request("DELETE", f"/api/clients/{action_data['client_id']}", employee_id=employee_id, params={"company_id": COMPANY_ID_FOR_BOT})
              await query.edit_message_text(f"✅ Клиент {action_data['client_name']} удален.")
 
-        # --- 3. ФИНАНСЫ ---
+        # --- 3. ФИНАНСЫ (ОБНОВЛЕНО v2 - С ФИЛИАЛАМИ) ---
         elif data == "ai_confirm_add_expense":
-            # Сначала найдем тип расхода "Прочее" или "Хоз. нужды"
-            types = await api_request("GET", "/api/expense_types", employee_id=employee_id, params={"company_id": COMPANY_ID_FOR_BOT})
-            type_id = types[0]['id'] if types else 1 # Берем первый попавшийся или 1
+            shift_id = None
+            source = action_data.get('source', 'shift')
+            location_id = action_data.get('location_id') # ID выбранного филиала
             
+            if source == 'shift':
+                # Если филиал выбран (для Владельца), ищем активную смену ИМЕННО ТАМ
+                if location_id:
+                    # Используем эндпоинт для поиска всех смен и фильтруем
+                    active_shifts = await api_request("GET", "/api/shifts/all_active", employee_id=employee_id)
+                    target_shift = next((s for s in active_shifts if s['location_id'] == location_id), None)
+                    
+                    if target_shift:
+                        shift_id = target_shift['id']
+                    else:
+                        await query.edit_message_text(f"❌ Ошибка: В выбранном филиале сейчас нет открытой смены.")
+                        return
+                else:
+                    # Стандартный поиск (для сотрудника или если филиал один)
+                    active_shift = await api_request("GET", "/api/shifts/active", employee_id=employee_id, params={"company_id": COMPANY_ID_FOR_BOT})
+                    if active_shift and active_shift.get('id'):
+                        shift_id = active_shift['id']
+                    else:
+                        await query.edit_message_text("❌ Ошибка: Активная смена не найдена.")
+                        return
+            else:
+                shift_id = None # Личные
+
             payload = {
                 "amount": action_data['amount'],
                 "notes": action_data['reason'],
-                "expense_type_id": type_id,
+                "expense_type_id": action_data['expense_type_id'],
                 "company_id": COMPANY_ID_FOR_BOT,
-                "shift_id": None # Общий расход
+                "shift_id": shift_id 
             }
-            await api_request("POST", "/api/expenses", employee_id=employee_id, json=payload)
-            await query.edit_message_text(f"✅ Расход {action_data['amount']} сом добавлен.")
+            
+            resp = await api_request("POST", "/api/expenses", employee_id=employee_id, json=payload)
+            
+            if resp and "id" in resp:
+                src_text = "из кассы" if shift_id else "из личных"
+                await query.edit_message_text(f"✅ Расход {action_data['amount']} сом ({src_text}) добавлен.")
+            else:
+                err = resp.get('detail', 'Ошибка') if resp else 'Сбой'
+                await query.edit_message_text(f"❌ Не удалось добавить расход: {err}")
 
-        # --- 4. РАССЫЛКА ---
+        # --- 4. РАССЫЛКА (ОБНОВЛЕНО С ФОТО) ---
         elif data == "ai_confirm_broadcast":
-            payload = {"text": action_data['text'], "company_id": COMPANY_ID_FOR_BOT}
+            # Достаем данные (они могут быть в action_data или в user_data['ai_pending_action'])
+            text = action_data.get('text')
+            photo = action_data.get('photo') or context.user_data.get('ai_broadcast_photo')
+            
+            payload = {
+                "text": text, 
+                "photo_file_id": photo, # Передаем ID фото
+                "company_id": COMPANY_ID_FOR_BOT
+            }
+            
             resp = await api_request("POST", "/api/bot/broadcast", employee_id=employee_id, json=payload)
             count = resp.get('sent_to_clients', 0) if resp else 0
-            await query.edit_message_text(f"✅ Рассылка отправлена {count} клиентам.")
+            
+            # Очищаем память
+            context.user_data.pop('ai_broadcast_text', None)
+            context.user_data.pop('ai_broadcast_photo', None)
+            
+            await query.edit_message_text(f"✅ Рассылка успешно отправлена {count} клиентам.")
 
         # --- 5. МАССОВОЕ (ПО ID) ---
         elif data == "ai_confirm_bulk_status_manual":
@@ -2213,16 +2260,26 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
                 parse_mode=ParseMode.HTML
             )
 
-        # --- 7. РЕДАКТИРОВАНИЕ КЛИЕНТА (НОВОЕ) ---
+        # --- 7. РЕДАКТИРОВАНИЕ КЛИЕНТА (ОБНОВЛЕНО) ---
         elif data == "ai_confirm_confirm_client_edit":
-            client_id = action_data['client_id']
-            payload = {}
-            # Добавляем только те поля, которые меняли
-            if action_data.get('new_phone'): payload['phone'] = action_data['new_phone']
-            if action_data.get('new_code'): payload['client_code_num'] = action_data['new_code']
+            # В новой версии ai_tools данные лежат внутри ключа 'payload'
+            # Но для совместимости проверяем структуру
+            payload_src = action_data.get('payload', action_data)
             
+            client_id = payload_src['client_id']
+            api_payload = {}
+            
+            # Собираем только то, что изменилось
+            if payload_src.get('new_phone'): api_payload['phone'] = payload_src['new_phone']
+            if payload_src.get('new_code'): api_payload['client_code_num'] = payload_src['new_code']
+            if payload_src.get('new_name'): api_payload['full_name'] = payload_src['new_name']       # <-- Новое
+            if payload_src.get('new_prefix'): api_payload['client_code_prefix'] = payload_src['new_prefix'] # <-- Новое
+            
+            # Добавляем company_id, так как API требует его для проверок уникальности
+            api_payload['company_id'] = COMPANY_ID_FOR_BOT
+
             # Вызываем API обновления
-            await api_request("PATCH", f"/api/clients/{client_id}", employee_id=employee_id, json=payload)
+            await api_request("PATCH", f"/api/clients/{client_id}", employee_id=employee_id, json=api_payload)
             
             await query.edit_message_text(f"✅ Данные клиента успешно обновлены!", parse_mode=ParseMode.HTML)
 
@@ -2987,6 +3044,56 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 # --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
 
+async def handle_ai_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ловит фото для рассылки.
+    """
+    draft_text = context.user_data.get('ai_broadcast_text')
+    
+    # --- ИСПРАВЛЕНИЕ: Если текст потерян (перезагрузка), говорим об этом ---
+    if not draft_text:
+        # Реагируем только если это похоже на диалог с Владельцем
+        if context.user_data.get('is_owner'):
+             await update.message.reply_text(
+                 "⚠️ **Сбой режима рассылки.**\n\n"
+                 "Бот был перезагружен и 'забыл' черновик текста.\n"
+                 "Пожалуйста, попросите ИИ создать объявление заново.",
+                 parse_mode=ParseMode.HTML
+             )
+        return 
+    # -----------------------------------------------------------------------
+
+    photo_file_id = None
+    # ... (дальше код получения фото остается как был)
+    if update.message.photo:
+        photo_file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+         # ... (код для документа)
+         doc = update.message.document
+         if doc.mime_type and doc.mime_type.startswith('image/'):
+            photo_file_id = doc.file_id
+    
+    if not photo_file_id:
+        await update.message.reply_text("⚠️ Пожалуйста, отправьте изображение.")
+        return
+
+    context.user_data['ai_broadcast_photo'] = photo_file_id
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Отправить всем", callback_data="ai_confirm_broadcast")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
+    ]
+    
+    # Сохраняем для кнопки
+    context.user_data['ai_pending_action'] = {
+        "text": draft_text,
+        "photo": photo_file_id
+    }
+    
+    await update.message.reply_text(
+        "📸 Фото добавлено!\nГотовы запускать рассылку?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # --- 12. Запуск Бота ---
 
@@ -3136,6 +3243,9 @@ def main() -> None:
 
     # Обработка Голоса (НОВОЕ)
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+
+    # Обработчик фото И документов-картинок для AI-рассылок
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_ai_photo))
 
     logger.info(f"Бот (ID: {COMPANY_ID_FOR_BOT}) запущен и готов к работе...")
     # --- Диалог Импорта Excel (Владелец) ---
