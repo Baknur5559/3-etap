@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -153,6 +153,66 @@ async def notify_buyout_request(api_request_func, client_id: int, company_id: in
         return json.dumps({"status": "success", "message": "✅ Заявка принята! Я передал информацию Владельцу, он скоро напишет вам реквизиты."}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+async def search_deletion_history(api_request_func, company_id: int, employee_id: int, query: str = None, date_from: str = None, date_to: str = None) -> str:
+    """
+    ДЕТЕКТИВ 2.0: Ищет по слову И/ИЛИ по дате.
+    """
+    try:
+        if not employee_id:
+            return "❌ Ошибка: Нет прав Владельца."
+
+        params = {"company_id": company_id}
+        if query and query.lower() not in ['сегодня', 'вчера', 'завтра']: # Игнорируем слова-паразиты в поиске
+            params["q"] = query
+        if date_from: params["start_date"] = date_from
+        if date_to: params["end_date"] = date_to
+
+        # Запрос к API
+        logs = await api_request_func(
+            "GET", 
+            "/api/audit/search", 
+            params=params,
+            employee_id=employee_id
+        )
+        
+        # Обработка ошибок и пустоты
+        if not logs or (isinstance(logs, dict) and "error" in logs):
+            if not logs: return "🕵️‍♂️ По вашему запросу записей не найдено."
+            return f"⚠️ Ошибка поиска: {logs.get('error')}"
+
+        # Формирование ответа
+        period_info = ""
+        if date_from and date_to: period_info = f" (📅 {date_from} — {date_to})"
+        elif date_from: period_info = f" (📅 c {date_from})"
+        
+        text = f"🕵️‍♂️ **ОТЧЕТ ДЕТЕКТИВА{period_info}**\nНайдено записей: {len(logs)}\n\n"
+        
+        for log in logs:
+            try:
+                # Конвертация UTC -> Бишкек (+6)
+                raw_date = log.get('created_at', '')
+                if raw_date:
+                    dt_utc = datetime.fromisoformat(str(raw_date).replace('Z', '+00:00'))
+                    bishkek_tz = timezone(timedelta(hours=6))
+                    dt_bishkek = dt_utc.astimezone(bishkek_tz)
+                    date_str = dt_bishkek.strftime('%Y-%m-%d %H:%M')
+                else:
+                    date_str = "??"
+            except:
+                date_str = "??"
+            
+            text += (
+                f"📅 <b>{date_str}</b>\n"
+                f"👤 Кто: <b>{log.get('who_did_it')}</b>\n"
+                f"📝 Что:\n{log.get('description')}\n"
+                f"----------------\n"
+            )
+            
+        return text
+
+    except Exception as e:
+        return f"❌ Ошибка расследования: {e}"
 
 async def add_client_order_request(api_request_func, client_id: int, company_id: int, request_text: str) -> str:
     """
@@ -795,6 +855,17 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
                 "confirm_action": "bulk_status", "party_date": date_str, "new_status": status, "count": count,
                 "message": f"❓ Перевести партию от **{date_str}** ({count} шт) в статус **{status}**?"
             })
+        
+        elif tool == "search_deletion_history":
+            q = tool_command.get("query")
+            d_from = tool_command.get("date_from")
+            d_to = tool_command.get("date_to")
+            
+            # Разрешаем поиск, если есть ХОТЯ БЫ ОДИН параметр
+            if not q and not d_from: 
+                 return "❌ Ошибка ИИ: Не заданы критерии поиска (ни текста, ни даты)."
+            
+            return await search_deletion_history(api_request_func, company_id, employee_id, query=q, date_from=d_from, date_to=d_to)
             
         # === БЛОК 5: КОНФИГУРАЦИЯ ===
         elif tool == "get_settings":
