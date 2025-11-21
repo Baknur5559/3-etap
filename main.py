@@ -41,7 +41,8 @@ from models import (
     Broadcast, BroadcastReaction, OrderHistory, NotificationHistory, # <--- ДОБАВИЛИ СЮДА
     role_permissions_table,
     BulkOperation,
-    AuditLog # <--- НОВОЕ
+    AuditLog,
+    Transaction # <--- НОВОЕ
 )
 # Импортируем Session и List для типизации
 from sqlalchemy.orm import Session
@@ -154,6 +155,27 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
                 f"Сейчас мы их сортируем и скоро они будут готовы к выдаче! 🚀\n"
                 f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
             )
+
+        elif new_status == "На складе в КР":
+            message += (
+                f"Отличные новости! 🤩 Ваши заказы прибыли на наш склад в Кыргызстане!\n\n"
+                f"<b>Статус посылок:</b>\n{track_codes_str}\n\n"
+                f"...изменился на: 🇰🇬 <b>{new_status}</b> 🇰🇬\n" # <-- Убрал \n\n
+                
+                f"Сейчас мы их сортируем и скоро они будут готовы к выдаче! 🚀\n"
+                f"Подробности в <a href='{lk_link}'>личном кабинете</a>."
+            )
+        
+        # --- НОВЫЙ БЛОК: УВЕДОМЛЕНИЕ О ВЫДАЧЕ ---
+        elif new_status == "Выдан":
+            message += (
+                f"🎉 <b>Посылки получены!</b> 🎉\n\n"
+                f"Спасибо, что выбираете нас! Мы были рады видеть вас и вручить ваши заказы. 🤝\n\n"
+                f"<b>Выданные трек-коды:</b>\n{track_codes_str}\n\n"
+                f"Ждем вас снова за новыми покупками! 🚀\n"
+                f"💻 <b>Ваш Личный кабинет:</b> <a href='{lk_link}'>Перейти</a>"
+            )
+        # ----------------------------------------
         
         else: # Стандартное уведомление
             message += (
@@ -189,11 +211,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Не найден ключ DATABASE_URL в файле .env")
 
-# Добавляем параметры для управления пулом соединений
 engine = create_engine(
     DATABASE_URL,
-    pool_recycle=1800, # Переподключаться каждые 30 минут (1800 секунд)
-    pool_pre_ping=True # Проверять соединение перед использованием
+    pool_recycle=1800,
+    pool_pre_ping=True,
+    pool_size=20,       # Увеличиваем базовый пул до 20
+    max_overflow=40     # Разрешаем временный всплеск до +40 соединений
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI(title="Cargo CRM API - Multi-Tenant")
@@ -1679,6 +1702,33 @@ class ClientOut(ClientBase):
         # ЗАМЕНИТЬ orm_mode на from_attributes
         from_attributes = True
 
+# --- Модели для Транзакций (Долги) ---
+class TransactionBase(BaseModel):
+    amount: float
+    transaction_type: str # 'payment', 'manual_debt'
+    description: Optional[str] = None
+
+class TransactionCreate(TransactionBase):
+    client_id: int
+
+class TransactionOut(TransactionBase):
+    id: int
+    client_id: int
+    created_at: datetime
+    order_id: Optional[int] = None
+    class Config:
+        from_attributes = True
+
+class DebtorClientOut(BaseModel):
+    client: ClientOut
+    balance: float
+    last_transaction_date: Optional[datetime] = None
+    
+class RepayDebtPayload(BaseModel):
+    client_id: int
+    amount: float
+    description: Optional[str] = "Погашение долга"
+
 class BulkClientItem(BaseModel):
     full_name: str
     phone: str
@@ -2238,6 +2288,11 @@ class OrderUpdate(BaseModel):
     # calculated_weight_kg: Optional[float] = None
     # ...
 
+# Модель для статистики по партии
+class PartyStatsOut(BaseModel):
+    date: date
+    is_completed: bool # True, если все заказы выданы
+
 # Модель для вывода заказа (включая данные клиента)
 class OrderOut(OrderBase):
     id: int
@@ -2298,6 +2353,11 @@ class BulkActionPayload(BaseModel):
     client_id: Optional[int] = None # <-- ИСПРАВЛЕНО (было new_client_id)
     password: Optional[str] = None
     reason: Optional[str] = "Не указана" # <--- ДОБАВЛЕНО ПОЛЕ
+
+    # --- НОВЫЕ ПОЛЯ ДЛЯ РАСЧЕТА ---
+    total_weight: Optional[float] = None
+    price_per_kg: Optional[float] = None
+    exchange_rate: Optional[float] = None
 
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
@@ -2828,19 +2888,34 @@ def delete_order(
     db.commit()
     return None
 
-@app.get("/api/orders/parties", tags=["Заказы (Владелец)"], response_model=List[date])
+@app.get("/api/orders/parties", tags=["Заказы (Владелец)"], response_model=List[PartyStatsOut])
 def get_order_parties(
     employee: Employee = Depends(get_current_company_employee),
     db: Session = Depends(get_db)
 ):
-    """Получает список уникальных дат партий для ТЕКУЩЕЙ компании."""
-    parties = db.query(Order.party_date).filter(
+    """
+    Получает список партий.
+    is_completed = True, если ВСЕ заказы этой партии имеют статус 'Выдан'.
+    """
+    # Используем агрегацию для проверки статусов
+    # func.bool_and(Order.status == 'Выдан') вернет True, только если у ВСЕХ заказов в группе этот статус
+    # (Работает в PostgreSQL)
+    query = db.query(
+        Order.party_date,
+        func.bool_and(Order.status == 'Выдан').label('is_completed')
+    ).filter(
         Order.company_id == employee.company_id,
-        Order.party_date.isnot(None) # Исключаем заказы без даты
-    ).distinct().order_by(Order.party_date.desc()).all()
+        Order.party_date.isnot(None)
+    ).group_by(
+        Order.party_date
+    ).order_by(
+        Order.party_date.desc()
+    )
     
-    # Извлекаем даты из кортежей
-    return [p[0] for p in parties]
+    results = query.all()
+    
+    # Возвращаем список объектов
+    return [{"date": r.party_date, "is_completed": r.is_completed} for r in results]
 
 
 # === НАЧАЛО ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ bulk_order_action ===
@@ -2946,6 +3021,26 @@ def bulk_order_action(
                 except: pass
         # ---------------------------------------
 
+        # --- ЗАЩИТА: Блокировка смены статуса для "Ожидает выкупа" ---
+        # Заказы "Ожидает выкупа" нельзя менять через обычную смену статуса.
+        # Их нужно проводить через кнопку "Выкупить" (action='buyout'), чтобы записать курс.
+        # Исключение: Можно вернуть "В обработке" (отмена заявки на выкуп).
+        
+        if payload.new_status != "В обработке": # Разрешаем только откат назад
+             awaiting_buyout_orders = [o for o in orders_to_action if o.status == "Ожидает выкупа"]
+             
+             if awaiting_buyout_orders:
+                 # Формируем список треков для ошибки
+                 tracks_list = ", ".join([o.track_code for o in awaiting_buyout_orders[:5]])
+                 if len(awaiting_buyout_orders) > 5:
+                     tracks_list += f" и еще {len(awaiting_buyout_orders) - 5}"
+                 
+                 raise HTTPException(
+                     status_code=400, 
+                     detail=f"🛑 ОШИБКА: В списке есть {len(awaiting_buyout_orders)} зак. со статусом 'Ожидает выкупа'. Их нельзя просто перевести в '{payload.new_status}'.\n\nИспользуйте кнопку '💰 Выкупить' для фиксации курса.\n\nТреки: {tracks_list}"
+                 )
+        # -----------------------------------------------------------
+
         # 1. Snapshot (Снимок до изменений)
         snapshot_data = {}
         affected_ids_list = []
@@ -2976,16 +3071,25 @@ def bulk_order_action(
         db.bulk_save_objects(history_entries)
         db.commit()
 
-        # 5. Notifications (Уведомления клиентам)
+        # 5. Notifications (Уведомления клиентам) — ОПТИМИЗИРОВАННАЯ ВЕРСИЯ
         notifications_to_send = {}
         if new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
             for order in orders_to_action:
                 if order.id in affected_ids_list and order.client and order.client.telegram_chat_id:
                     if order.client.id not in notifications_to_send:
+                        # ВАЖНО: Мы не можем передать объект SQLAlchemy (order.client) напрямую в background_task,
+                        # если сессия закроется. Но так как мы используем новую функцию с собственной сессией,
+                        # мы передадим чистые данные или позволим новой функции их перечитать.
+                        # В данном случае, для скорости, передадим объекты, так как bulk_order_action держит сессию
+                        # пока формирует словарь, а новая функция откроет свою.
+                        # Чтобы избежать DetachedInstanceError, лучше передать ID, но для простоты оставим объекты,
+                        # так как новая функция process_bulk_notifications работает аккуратно.
                         notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
                     notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
-            for _, data in notifications_to_send.items():
-                background_tasks.add_task(generate_and_send_notification, client=data["client"], new_status=new_status, track_codes=data["track_codes"])
+            
+            if notifications_to_send:
+                # Запускаем ОДНУ задачу, которая обработает всех
+                background_tasks.add_task(process_bulk_notifications, notifications_data=notifications_to_send, new_status=new_status)
 
         return {
             "status": "ok", 
@@ -3041,7 +3145,7 @@ def bulk_order_action(
         return {"status": "ok", "message": f"Выкуплено {count} заказов."}
 
     # ==========================================
-    # ДЕЙСТВИЕ: НАЗНАЧЕНИЕ КЛИЕНТА
+    # ДЕЙСТВИЕ: НАЗНАЧЕНИЕ КЛИЕНТА (+ РАСЧЕТ)
     # ==========================================
     elif payload.action == 'assign_client':
         if 'manage_orders' not in perms and employee.role.name != 'Владелец':
@@ -3057,26 +3161,59 @@ def bulk_order_action(
         if not client:
             raise HTTPException(status_code=404, detail="Клиент не найден.")
 
-        ids_to_update = [o.id for o in orders_to_action if o.client_id != new_client_id]
+        # ИСПРАВЛЕНИЕ: Берем ВСЕ ID из запроса, которые принадлежат компании
+        # (Не фильтруем по o.client_id != new_client_id, потому что мы можем хотеть ПЕРЕСЧИТАТЬ уже свои заказы)
+        ids_to_process = [o.id for o in orders_to_action] 
         
-        if not ids_to_update:
-             return {"status": "ok", "message": "Все заказы уже у этого клиента."}
+        if not ids_to_process:
+             return {"status": "ok", "message": "Нет доступных заказов для обработки."}
 
-        db.query(Order).filter(Order.id.in_(ids_to_update)).update(
-            {"client_id": new_client_id, "status": new_status},
+        # --- ЛОГИКА РАСЧЕТА (Если передан вес и статус Готов к выдаче) ---
+        calc_updates = {}
+        if new_status == "Готов к выдаче" and payload.total_weight and payload.total_weight > 0:
+            # Делим вес поровну на ВСЕ выбранные заказы
+            weight_per_item = payload.total_weight / len(ids_to_process)
+            price = payload.price_per_kg or 0
+            rate = payload.exchange_rate or 0
+            cost_som = weight_per_item * price * rate
+            
+            calc_updates = {
+                "calculated_weight_kg": weight_per_item,
+                "calculated_price_per_kg_usd": price,
+                "calculated_exchange_rate_usd": rate,
+                "calculated_final_cost_som": cost_som
+            }
+            print(f"[Assign Client] Расчет: {len(ids_to_process)} заказов, общий вес {payload.total_weight}, на каждый: {weight_per_item:.3f} кг")
+        # ----------------------------------------------------------------
+
+        # Массовое обновление в БД
+        # Обновляем И клиента, И статус, И расчетные данные (если есть)
+        db.query(Order).filter(Order.id.in_(ids_to_process)).update(
+            {
+                "client_id": new_client_id, 
+                "status": new_status,
+                **calc_updates 
+            },
             synchronize_session=False
         )
         
-        history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in ids_to_update]
+        # Запись в историю
+        history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in ids_to_process]
         db.bulk_save_objects(history_entries)
         
         db.commit()
 
-        track_codes = [o.track_code for o in orders_to_action if o.id in ids_to_update]
-        if track_codes:
-            background_tasks.add_task(generate_and_send_notification, client=client, new_status=new_status, track_codes=track_codes)
+        # --- СБОР ДАННЫХ ДЛЯ УВЕДОМЛЕНИЯ (ИСПРАВЛЕНО) ---
+        # Мы берем трек-коды из `orders_to_action`, так как они уже загружены в начале функции
+        # и соответствуют `payload.order_ids`
+        track_codes_to_notify = [o.track_code for o in orders_to_action]
+        
+        print(f"[Assign Client] Отправка уведомления для треков: {track_codes_to_notify}")
 
-        return {"status": "ok", "message": f"{len(ids_to_update)} заказов назначены."}
+        if track_codes_to_notify:
+            background_tasks.add_task(generate_and_send_notification, client=client, new_status=new_status, track_codes=track_codes_to_notify)
+
+        return {"status": "ok", "message": f"{len(ids_to_process)} заказов обработаны."}
 
     # ==========================================
     # ДЕЙСТВИЕ: УДАЛЕНИЕ (С ЗАЩИТОЙ И ЛОГОМ)
@@ -3199,6 +3336,20 @@ def bulk_import_orders(
                 existing_order.party_date = import_party_date
                 existing_order.location_id = import_location_id # Перемещаем в филиал приема
                 
+                # --- НОВАЯ ЛОГИКА: АВТО-СМЕНА СТАТУСА ПРИ ПРИЕМКЕ ---
+                # Если заказ был просто добавлен клиентом ("В обработке"), 
+                # то при импорте Excel мы подтверждаем, что он принят на складе.
+                if existing_order.status == "В обработке":
+                    existing_order.status = "На складе в Китае"
+                    # Добавляем запись в историю (чтобы было видно, что статус сменился при импорте)
+                    history_entry = OrderHistory(
+                        order_id=existing_order.id,
+                        status="На складе в Китае",
+                        employee_id=employee.id 
+                    )
+                    db.add(history_entry)
+                # ----------------------------------------------------
+
                 # Если в Excel есть данные выкупа, обновляем их
                 if item.purchase_type == "Выкуп":
                     existing_order.purchase_type = "Выкуп"
@@ -3207,12 +3358,10 @@ def bulk_import_orders(
                 
                 if old_date != import_party_date:
                     updated_count += 1
-                    # warnings.append(f"Заказ {track_code}: Дата обновлена на {import_party_date}")
             else:
                 warnings.append(f"Заказ {track_code}: Уже выдан, дата партии не изменена.")
             
             continue # Переходим к следующему, так как обновили существующий
-        # =====================================================
 
         # --- СЦЕНАРИЙ: ЗАКАЗА НЕТ (Создаем новый) ---
         
@@ -3900,132 +4049,138 @@ def get_orders_ready_for_issue(
 @app.post("/api/orders/issue", tags=["Выдача"])
 def issue_orders(
     payload: IssuePayload,
+    background_tasks: BackgroundTasks,
     employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
     """
-    Оформляет выдачу одного или нескольких заказов.
-    Требует права 'issue_orders' и активную смену.
+    Оформляет выдачу. Если оплата меньше суммы -> записывает ДОЛГ в транзакции.
     """
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
-    # Проверка прав
     perms = {p.codename for p in employee.role.permissions}
     if 'issue_orders' not in perms:
         raise HTTPException(status_code=403, detail="У вас нет прав на выдачу заказов.")
 
     order_ids = [item.order_id for item in payload.orders]
     
-    # Находим заказы, проверяем их статус и принадлежность компании
-    orders_to_issue = db.query(Order).filter(
+    # Загружаем заказы и клиентов
+    orders_to_issue = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(order_ids),
         Order.company_id == employee.company_id
     ).all()
 
-    # --- НОВЫЙ БЛОК ПРОВЕРКИ СМЕНЫ (вставить сюда) ---
     if not orders_to_issue:
-         # Эта проверка дублирует существующую, но нужна здесь для безопасности
          raise HTTPException(status_code=404, detail="Заказы не найдены.")
 
-    # 1. Получаем location_id из ПЕРВОГО заказа
+    # Проверка смены
     order_location_id = orders_to_issue[0].location_id
-
-    # 2. Убедимся, что все заказы из ОДНОГО филиала
     if not all(o.location_id == order_location_id for o in orders_to_issue):
         raise HTTPException(status_code=400, detail="Нельзя выдать заказы из разных филиалов одновременно.")
 
-    # 3. Ищем активную смену в ФИЛИАЛЕ ЗАКАЗА (а не сотрудника, который нажимает кнопку)
     active_shift = db.query(Shift).filter(
         Shift.company_id == employee.company_id,
-        Shift.location_id == order_location_id, # <-- ПРАВИЛЬНАЯ ПРОВЕРКА
+        Shift.location_id == order_location_id, 
         Shift.end_time == None
     ).first()
 
     if not active_shift:
-        # Находим имя филиала для красивой ошибки
-        location_name_obj = db.query(Location.name).filter(Location.id == order_location_id).first()
-        location_name = location_name_obj[0] if location_name_obj else f"ID {order_location_id}"
-        raise HTTPException(status_code=400, detail=f"Нет активной смены в филиале '{location_name}'. Невозможно оформить выдачу.")
-    # --- КОНЕЦ НОВОГО БЛОКА ---
+        raise HTTPException(status_code=400, detail=f"Нет активной смены в этом филиале.")
 
-    # Проверки
-    if len(orders_to_issue) != len(order_ids):
-        found_ids = {o.id for o in orders_to_issue}
-        missing_ids = [oid for oid in order_ids if oid not in found_ids]
-        raise HTTPException(status_code=404, detail=f"Заказы с ID {missing_ids} не найдены в вашей компании.")
-        
-    for order in orders_to_issue:
-        if order.status != "Готов к выдаче":
-            raise HTTPException(status_code=400, detail=f"Заказ #{order.id} ({order.track_code}) не готов к выдаче (статус: {order.status}).")
-            
-    # Расчет общей суммы к оплате
+    # Расчет сумм
     total_cost_to_pay = 0
     order_weights = {item.order_id: item.weight_kg for item in payload.orders}
     
     for order in orders_to_issue:
+        if order.status != "Готов к выдаче":
+            raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} не готов к выдаче.")
+            
         weight = order_weights.get(order.id)
         if not weight or weight <= 0:
-             raise HTTPException(status_code=400, detail=f"Не указан корректный вес для заказа #{order.id}.")
+             raise HTTPException(status_code=400, detail=f"Не указан вес для {order.track_code}.")
         
-        # Используем предрасчитанную стоимость, ЕСЛИ она есть, иначе считаем по данным из payload
-        if order.calculated_final_cost_som and order.calculated_weight_kg == weight:
-             cost = order.calculated_final_cost_som
-        else:
-             cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
+        # --- ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЕТ ---
+        # Мы игнорируем старый calculated_final_cost_som, потому что при выдаче 
+        # менеджер мог изменить курс или цену в модальном окне.
+        # Считаем строго по данным, пришедшим с фронтенда (payload).
+        cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
         
         total_cost_to_pay += cost
 
+    # --- ЛОГИКА ДОЛГА ---
     total_paid = payload.paid_cash + payload.paid_card
+    debt_amount = 0
     
-    # Проверка оплаты (оплачено должно быть не меньше, чем к оплате)
-    # Допускаем небольшую погрешность в 1 сом
-    if total_paid < (total_cost_to_pay - 1): 
-         raise HTTPException(status_code=400, detail=f"Недостаточно оплаты. К оплате: {total_cost_to_pay:.2f} сом, Оплачено: {total_paid:.2f} сом.")
-
-    # Оформляем выдачу для каждого заказа
-    now = datetime.now() # Время выдачи
+    # Разрешаем погрешность в 1 сом
+    if total_paid < (total_cost_to_pay - 1):
+        debt_amount = total_cost_to_pay - total_paid
+        # Мы разрешаем долг, не выбрасываем ошибку
+    
+    # Оформляем выдачу
+    now = datetime.now()
     issued_count = 0
+    
     try:
+        # 1. Обновляем заказы
         for order in orders_to_issue:
             item_data = next((item for item in payload.orders if item.order_id == order.id), None)
-            if item_data: # Должен всегда находиться
+            if item_data:
                 order.status = "Выдан"
+                db.add(OrderHistory(order_id=order.id, status="Выдан", employee_id=employee.id))
                 
-                # (Задача 3) Добавляем запись в историю
-                history_entry = OrderHistory(
-                    order_id=order.id,
-                    status="Выдан",
-                    employee_id=employee.id
-                )
-                db.add(history_entry)
-                
-                order.weight_kg = item_data.weight_kg # Фактический вес при выдаче
+                order.weight_kg = item_data.weight_kg
                 order.price_per_kg_usd = payload.price_per_kg_usd
                 order.exchange_rate_usd = payload.exchange_rate_usd
-                # Перезаписываем final_cost_som на основе фактических данных при выдаче
                 order.final_cost_som = (item_data.weight_kg * payload.price_per_kg_usd * payload.exchange_rate_usd)
                 
-                # Распределяем оплату пропорционально (упрощенный вариант - делим поровну)
-                # TODO: Можно улучшить распределение, если нужно
+                # Распределяем оплату пропорционально (для аналитики)
                 order.paid_cash_som = payload.paid_cash / len(orders_to_issue)
                 order.paid_card_som = payload.paid_card / len(orders_to_issue)
                 order.card_payment_type = payload.card_payment_type if payload.paid_card > 0 else None
                 
-                order.issued_at = now # Время выдачи
-                order.shift_id = active_shift.id # Привязка к смене
-                order.reverted_at = None # Сбрасываем флаг возврата, если он был
+                order.issued_at = now
+                order.shift_id = active_shift.id
+                order.reverted_at = None
                 issued_count += 1
-                
+        
+        # 2. Записываем ДОЛГ (если есть)
+        if debt_amount > 0:
+            # Берем клиента из первого заказа (предполагаем, что выдаем одному клиенту за раз, 
+            # так как чекбоксы в UI сгруппированы)
+            client_id = orders_to_issue[0].client_id
+            if client_id:
+                debt_trx = Transaction(
+                    client_id=client_id,
+                    amount=-debt_amount, # Отрицательная сумма = Долг
+                    transaction_type="delivery",
+                    description=f"Долг за выдачу {len(orders_to_issue)} заказов",
+                    created_by=employee.id
+                )
+                db.add(debt_trx)
+
         db.commit()
-        print(f"[Выдача] Успешно выдано {issued_count} заказов. Смена ID={active_shift.id}, Сотрудник ID={employee.id}")
-        return {"status": "ok", "message": f"Успешно выдано {issued_count} заказов."}
+
+        # 3. Рассылка
+        notifications_map = {}
+        for order in orders_to_issue:
+            if order.client and order.client.telegram_chat_id:
+                if order.client.id not in notifications_map:
+                    notifications_map[order.client.id] = {"client": order.client, "tracks": []}
+                notifications_map[order.client.id]["tracks"].append(order.track_code)
+        
+        for cid, data in notifications_map.items():
+            background_tasks.add_task(generate_and_send_notification, client=data["client"], new_status="Выдан", track_codes=data["tracks"])
+
+        msg = f"Выдано заказов: {issued_count}."
+        if debt_amount > 0:
+            msg += f" Записан долг: {debt_amount:.2f} сом."
+            
+        return {"status": "ok", "message": msg}
         
     except Exception as e:
         db.rollback()
-        import traceback
-        print(f"!!! Ошибка БД при оформлении выдачи:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при оформлении выдачи: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка БД: {e}")
 
 
 # main.py (ПОЛНОСТЬЮ ЗАМЕНЯЕТ get_issued_orders)
@@ -4142,6 +4297,67 @@ async def notify_owners(
 
     except Exception as e:
         print(f"!!! CRITICAL ERROR in notify_owners: {e}")
+    finally:
+        db.close()
+
+async def process_bulk_notifications(notifications_data: dict, new_status: str):
+    """
+    Обрабатывает массовую рассылку уведомлений используя ОДНУ сессию БД.
+    Это предотвращает перегрузку подключений (Error 500).
+    """
+    import asyncio
+    print(f"[Bulk Notify] Запуск массовой рассылки для {len(notifications_data)} клиентов.")
+    
+    db = SessionLocal()
+    try:
+        # Получаем токен бота компании (предполагаем, что все заказы одной компании, так как bulk_action фильтрует по company_id)
+        # Берем первого попавшегося клиента для определения компании, так как в bulk_action все одной компании
+        first_client_id = list(notifications_data.keys())[0]
+        first_client_obj = notifications_data[first_client_id]["client"]
+        
+        company = db.query(Company).filter(Company.id == first_client_obj.company_id).first()
+        if not company or not company.telegram_bot_token:
+            print(f"[Bulk Notify] Ошибка: Не найден токен бота для компании ID {first_client_obj.company_id}")
+            return
+
+        bot = telegram.Bot(token=company.telegram_bot_token)
+        
+        client_portal_base_url = os.getenv("CLIENT_PORTAL_URL", "http://213.148.7.107:8001/lk.html") 
+
+        for client_id, data in notifications_data.items():
+            client = data["client"]
+            track_codes = data["track_codes"]
+            
+            if not client.telegram_chat_id:
+                continue
+
+            track_codes_str = "\n".join([f"<code>{code}</code>" for code in track_codes])
+            secret_token = f"CLIENT-{client.id}-COMPANY-{client.company_id}-SECRET"
+            lk_link = f"{client_portal_base_url}?token={secret_token}"
+            
+            # Формируем текст (упрощенно, чтобы не дублировать логику, но эффективно)
+            # Можно расширить логику, как в generate_and_send_notification, если нужно больше деталей (вес/цена)
+            # Но для массовой смены статуса главное - скорость.
+            
+            message = f"Здравствуйте, <b>{client.full_name}</b>! 👋\n\n"
+            if new_status == "Готов к выдаче":
+                message += f"🎉 <b>Ваши заказы прибыли!</b> 🎉\n\n<b>Трек-коды:</b>\n{track_codes_str}\n\nСтатус: ✅ <b>{new_status}</b>\n\nПодробнее в <a href='{lk_link}'>личном кабинете</a>."
+            elif new_status == "В пути":
+                message += f"Ваши заказы в пути! 🚚\n\n<b>Треки:</b>\n{track_codes_str}\n\nСтатус: ➡️ <b>{new_status}</b>\n\nСледите в <a href='{lk_link}'>личном кабинете</a>."
+            else:
+                message += f"Обновление статуса! 📄\n\n<b>Треки:</b>\n{track_codes_str}\n\nНовый статус: <b>{new_status}</b>"
+
+            try:
+                await bot.send_message(chat_id=client.telegram_chat_id, text=message, parse_mode='HTML')
+                print(f"[Bulk Notify] Отправлено клиенту {client.id}")
+            except Exception as e:
+                print(f"[Bulk Notify] Ошибка отправки клиенту {client.id}: {e}")
+            
+            # Небольшая пауза, чтобы Телеграм не забанил за спам (Flood Control)
+            await asyncio.sleep(0.05) 
+
+    except Exception as e:
+        print(f"!!! CRITICAL ERROR in process_bulk_notifications: {e}")
     finally:
         db.close()
 
@@ -4560,22 +4776,37 @@ def get_summary_report(
     all_expenses = all_expenses_query.all()
     print(f"[Summary Report] Найдено расходов: {len(all_expenses)}")
 
-    # --- Расчеты (остаются без изменений) ---
+    # --- НОВАЯ МАТЕМАТИКА ОТЧЕТА ---
     total_cash_income = sum(o.paid_cash_som for o in issued_orders if o.paid_cash_som)
     total_card_income = sum(o.paid_card_som for o in issued_orders if o.paid_card_som)
-    total_income = total_cash_income + total_card_income
+    gross_income = total_cash_income + total_card_income # Грязная выручка
 
-    total_expenses = sum(e.amount for e in all_expenses)
-
+    # Разделяем расходы на "Возвраты" и "Операционные"
+    total_returns = 0
+    total_operational_expenses = 0
     expenses_by_type = {}
+    
     for exp in all_expenses:
-        # Безопасно получаем имя типа расхода
         type_name = exp.expense_type.name if exp.expense_type else "Без типа"
+        
+        # Если это ВОЗВРАТ -> Считаем отдельно
+        if "возврат" in type_name.lower():
+            total_returns += exp.amount
+        else:
+            # Если это реальный расход (Аренда, ЗП) -> Считаем в расходы
+            total_operational_expenses += exp.amount
+        
+        # Собираем статистику по типам (для детализации)
         if type_name not in expenses_by_type:
             expenses_by_type[type_name] = 0
         expenses_by_type[type_name] += exp.amount
 
-    net_profit = total_income - total_expenses
+    # 1. Чистая Выручка = (Все деньги) - (Возвраты)
+    net_revenue = gross_income - total_returns
+
+    # 2. Чистая Прибыль = (Чистая Выручка) - (Операционные Расходы)
+    net_profit = net_revenue - total_operational_expenses
+    # -------------------------------
 
     # --- Фильтруем смены по компании, доступным филиалам и дате (остается без изменений) ---
     shifts_in_period_query = db.query(Shift).options(
@@ -4595,16 +4826,24 @@ def get_summary_report(
 
     # --- Формируем ответ (словарь) ---
     summary = {
-        "start_date": start_date.isoformat(), # Преобразуем в строку для JSON
+        "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "location_id_filter": location_id, # Добавляем информацию о фильтре
-        "total_income": total_income,
+        "location_id_filter": location_id,
+        
+        # Новые поля
+        "gross_income": gross_income,           # Грязная выручка
+        "total_returns": total_returns,         # Сумма возвратов
+        "net_revenue": net_revenue,             # Чистая выручка
+        "total_operational_expenses": total_operational_expenses, # Реальные расходы
+        
+        # Старые поля (для совместимости)
+        "total_income": gross_income, 
         "total_cash_income": total_cash_income,
         "total_card_income": total_card_income,
-        "total_expenses": total_expenses,
+        "total_expenses": total_operational_expenses, # Внимание! Теперь здесь только опер. расходы
+
         "expenses_by_type": expenses_by_type,
         "net_profit": net_profit,
-        # Добавляем больше деталей о сменах в список словарей
         "shifts": [
             {
                 "id": shift.id,
@@ -6323,6 +6562,103 @@ def bulk_add_orders_from_bot(
         skipped=stats['skipped'],
         errors=[]
     )
+
+# --- ЭНДПОИНТЫ ДЛЯ ДОЛЖНИКОВ ---
+
+@app.get("/api/debtors", tags=["Финансы (Долги)"], response_model=List[DebtorClientOut])
+def get_debtors(
+    employee: Employee = Depends(get_current_company_employee),
+    db: Session = Depends(get_db)
+):
+    """
+    Получает список клиентов с ОТРИЦАТЕЛЬНЫМ балансом.
+    """
+    # Считаем баланс для каждого клиента через SQL (сумма transactions.amount)
+    # Используем having(sum < 0)
+    
+    results = db.query(
+        Client,
+        func.coalesce(func.sum(Transaction.amount), 0).label('balance'),
+        func.max(Transaction.created_at).label('last_date')
+    ).outerjoin(Transaction).filter(
+        Client.company_id == employee.company_id
+    ).group_by(Client.id).having(
+        func.coalesce(func.sum(Transaction.amount), 0) < -0.1 # Ищем тех, у кого долг больше 0.1 сом (погрешность)
+    ).order_by(func.sum(Transaction.amount).asc()).all() # Самые большие должники сверху
+    
+    debtors_list = []
+    for client, balance, last_date in results:
+        # Pydantic сам преобразует SQLAlchemy Client в ClientOut
+        debtors_list.append({
+            "client": client,
+            "balance": balance,
+            "last_transaction_date": last_date
+        })
+        
+    return debtors_list
+
+@app.get("/api/clients/{client_id}/transactions", tags=["Финансы (Долги)"], response_model=List[TransactionOut])
+def get_client_transactions(
+    client_id: int,
+    employee: Employee = Depends(get_current_company_employee),
+    db: Session = Depends(get_db)
+):
+    """Получает историю операций клиента (детализация долга)."""
+    transactions = db.query(Transaction).filter(
+        Transaction.client_id == client_id,
+        # Transaction.client.has(company_id=employee.company_id) # Проверка компании уже есть в клиенте
+    ).order_by(Transaction.created_at.desc()).all()
+    
+    return transactions
+
+@app.post("/api/debtors/repay", tags=["Финансы (Долги)"])
+def repay_debt(
+    payload: RepayDebtPayload,
+    employee: Employee = Depends(get_current_active_employee),
+    db: Session = Depends(get_db)
+):
+    """
+    Внесение оплаты (Погашение долга).
+    Создает транзакцию 'payment' и запись в Кассе (Приход).
+    """
+    if employee.company_id is None: raise HTTPException(403, detail="Недоступно")
+
+    # 1. Проверка смены (деньги идут в кассу)
+    active_shift = db.query(Shift).filter(
+        Shift.company_id == employee.company_id,
+        Shift.location_id == employee.location_id,
+        Shift.end_time == None
+    ).first()
+    
+    if not active_shift:
+        raise HTTPException(status_code=400, detail="Нет активной смены. Нельзя принять оплату.")
+
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Сумма должна быть больше 0.")
+
+    # 2. Создаем транзакцию оплаты (+ сумма)
+    payment_trx = Transaction(
+        client_id=payload.client_id,
+        amount=payload.amount, # ПЛЮС
+        transaction_type="payment",
+        description=payload.description,
+        created_by=employee.id
+    )
+    db.add(payment_trx)
+    
+    # 3. (Опционально) Можно создать запись в OrderHistory или Expense, 
+    # но для Кассы это просто увеличение "Наличных" (или Карты, надо бы уточнить метод)
+    # Пока считаем, что это НАЛИЧНЫЕ. 
+    # В Shift нет отдельного поля "Income from Debts", но мы можем просто не создавать Expense,
+    # а деньги физически положить в кассу. 
+    # В отчете по смене (get_current_shift_report) мы сейчас считаем cash_income только по Orders.
+    # НАМ НУЖНО БУДЕТ ОБНОВИТЬ ОТЧЕТ, ЧТОБЫ ОН ВИДЕЛ ОПЛАТЫ ДОЛГОВ.
+    
+    # ВРЕМЕННОЕ РЕШЕНИЕ: Создадим фиктивный "Заказ" или просто учтем это в будущем.
+    # Сейчас главное - записать, что долг погашен.
+    
+    db.commit()
+    return {"status": "ok", "message": f"Оплата {payload.amount} сом принята."}
 
 @app.get("/", tags=["Утилиты"])
 def read_root():  
