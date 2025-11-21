@@ -1355,33 +1355,28 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         if final_text.strip().startswith(("{", "[")):
                             res_json = json.loads(final_text)
                             
-                            # Сценарий 0: Дубликаты (ПОКАЗЫВАЕМ СПИСОК)
-                            if isinstance(res_json, dict) and res_json.get("status") == "multiple_results":
-                                # Собираем сообщение + список вариантов
+                            # --- (ИСПРАВЛЕНО) ПРИОРИТЕТ 1: РАССЫЛКА (Ждем фото) ---
+                            if isinstance(res_json, dict) and res_json.get("status") == "waiting_for_broadcast_photo":
+                                # 1. Сохраняем текст в память
+                                draft = res_json.get('draft_text', '')
+                                context.user_data['ai_broadcast_text'] = draft
+                                context.user_data['ai_broadcast_photo'] = None
+                                logger.info(f"[Broadcast Setup] DRAFT SAVED via Priority 1. Text len: {len(draft)}")
+                                # 2. Формируем ответ
+                                final_text = res_json.get('message', 'Пришлите фото.')
+
+                            # ПРИОРИТЕТ 2: Дубликаты (Multiple Results)
+                            elif isinstance(res_json, dict) and res_json.get("status") == "multiple_results":
                                 msg = res_json.get("message", "")
                                 options = res_json.get("options", [])
                                 if options:
                                     msg += "\n\n" + "\n".join(options)
                                 final_text = msg
 
-                            # Сценарий 1: Просто сообщение
-                            elif isinstance(res_json, dict) and "message" in res_json and "active_orders" not in res_json:
-                                final_text = res_json["message"]
-
-                            # --- ВСТАВИТЬ ЭТОТ БЛОК ---
-                            # Ловим сигнал от инструмента, что пора ждать фото
-                            elif isinstance(res_json, dict) and res_json.get("status") == "waiting_for_broadcast_photo":
-                                # 1. Сохраняем текст в память (ЧТОБЫ БОТ ПОМНИЛ)
-                                context.user_data['ai_broadcast_text'] = res_json['draft_text']
-                                context.user_data['ai_broadcast_photo'] = None
-                                # 2. Формируем ответ пользователю
-                                final_text = res_json['message']
-                            # ---------------------------
-                            
-                            # Сценарий 2: Список заказов (active_orders)
+                            # ПРИОРИТЕТ 3: Список заказов (active_orders)
                             elif isinstance(res_json, dict) and "active_orders" in res_json:
                                 orders = res_json.get("active_orders", [])
-                                client_info = res_json.get("client_info", "Клиент") # Берем имя из ответа
+                                client_info = res_json.get("client_info", "Клиент")
                                 
                                 if not orders:
                                     final_text = f"📭 У клиента {client_info} нет активных заказов."
@@ -1397,9 +1392,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                         if status in grouped_orders:
                                             grouped_orders[status].append(order)
 
-                                    # ВАЖНО: Пишем имя клиента в начало сообщения!
                                     formatted_text = f"📦 <b>Заказы клиента: {client_info}</b>\n" 
-                                    
                                     has_orders_in_message = False
                                     bishkek_tz = timezone(timedelta(hours=6)) 
 
@@ -1417,7 +1410,6 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                             if calc_string:
                                                 formatted_text += f"Расчет: {calc_string}\n"
                                             
-                                            # История (последние 3 записи)
                                             history = o.get('history_entries', [])
                                             if history:
                                                 formatted_text += "История:\n"
@@ -1436,7 +1428,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                         
                                     final_text = formatted_text
 
-                            # Сценарий 3: Список филиалов
+                            # ПРИОРИТЕТ 4: Список филиалов
                             elif isinstance(res_json, list): 
                                 formatted_text = ""
                                 for l in res_json:
@@ -1449,6 +1441,11 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     if ph: formatted_text += f"📞 {ph}\n"
                                     formatted_text += "\n"
                                 if formatted_text: final_text = formatted_text
+
+                            # ПРИОРИТЕТ 5 (САМЫЙ НИЗКИЙ): Просто сообщение
+                            # (Ставим в конец, чтобы оно не перехватывало другие JSON)
+                            elif isinstance(res_json, dict) and "message" in res_json:
+                                final_text = res_json["message"]
                             
                             # Fallback
                             else:
@@ -3048,33 +3045,42 @@ async def handle_ai_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """
     Ловит фото для рассылки.
     """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    # 1. Пытаемся получить черновик
     draft_text = context.user_data.get('ai_broadcast_text')
     
+    # Логируем состояние для отладки
+    logger.info(f"[Handle AI Photo] User: {user.id}. Draft exists: {bool(draft_text)}. Is Owner: {context.user_data.get('is_owner')}")
+
     # --- ИСПРАВЛЕНИЕ: Если текст потерян (перезагрузка), говорим об этом ---
     if not draft_text:
         # Реагируем только если это похоже на диалог с Владельцем
         if context.user_data.get('is_owner'):
              await update.message.reply_text(
                  "⚠️ **Сбой режима рассылки.**\n\n"
-                 "Бот был перезагружен и 'забыл' черновик текста.\n"
+                 "Бот не видит черновик текста (возможно, был перезапуск сервера).\n"
                  "Пожалуйста, попросите ИИ создать объявление заново.",
                  parse_mode=ParseMode.HTML
              )
+        else:
+             # Если это обычный клиент шлет фото — игнорируем или даем стандартный ответ
+             pass
         return 
     # -----------------------------------------------------------------------
 
     photo_file_id = None
-    # ... (дальше код получения фото остается как был)
+    
     if update.message.photo:
         photo_file_id = update.message.photo[-1].file_id
     elif update.message.document:
-         # ... (код для документа)
          doc = update.message.document
          if doc.mime_type and doc.mime_type.startswith('image/'):
             photo_file_id = doc.file_id
     
     if not photo_file_id:
-        await update.message.reply_text("⚠️ Пожалуйста, отправьте изображение.")
+        await update.message.reply_text("⚠️ Пожалуйста, отправьте изображение (сжатое фото).")
         return
 
     context.user_data['ai_broadcast_photo'] = photo_file_id
@@ -3084,16 +3090,28 @@ async def handle_ai_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
     ]
     
-    # Сохраняем для кнопки
+    # Сохраняем для кнопки подтверждения
     context.user_data['ai_pending_action'] = {
         "text": draft_text,
         "photo": photo_file_id
     }
     
-    await update.message.reply_text(
-        "📸 Фото добавлено!\nГотовы запускать рассылку?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # Показываем превью
+    caption = draft_text[:1000] + "..." if len(draft_text) > 1000 else draft_text
+    
+    try:
+        await update.message.reply_photo(
+            photo=photo_file_id,
+            caption=f"📸 **ФОТО ДОБАВЛЕНО!**\n\nВот как это будет выглядеть:\n\n{caption}\n\n<b>Готовы запускать рассылку?</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки превью фото: {e}")
+        await update.message.reply_text(
+            "📸 Фото принято, но я не смог показать превью.\nГотовы отправлять?", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # --- 12. Запуск Бота ---
 
