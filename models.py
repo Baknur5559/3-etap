@@ -403,3 +403,24 @@ class BulkOperation(Base):
     affected_ids = Column(JSON, nullable=False) 
 
     employee = relationship("Employee")
+
+# --- models.py ---
+
+class AuditLog(Base):
+    """
+    Журнал действий (Детектив).
+    Хранит информацию об удаленных объектах и важных изменениях.
+    """
+    __tablename__ = 'audit_logs'
+
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
+    
+    event_type = Column(String, nullable=False) # 'delete_order', 'delete_client', 'delete_expense'
+    entity_id = Column(String, nullable=True)   # ID удаленного объекта (или трек-код)
+    description = Column(String, nullable=False) # "Заказ TE-1234 удален"
+    
+    who_did_it = Column(String, nullable=False) # Имя сотрудника (строкой, т.к. сотрудника тоже могут удалить)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    company = relationship("Company")
