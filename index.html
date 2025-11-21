@@ -3356,19 +3356,47 @@ function handleClientListActions(e) {
 // --- Функция удаления клиента ---
 async function handleDeleteClient(clientId, clientName) {
     console.log(`[Delete] handleDeleteClient: Start deleting ID ${clientId} (${clientName})`);
+    
+    // 1. Первое подтверждение
+    if (!confirm(`Вы уверены, что хотите удалить клиента "${clientName}"?\n\nЭто действие необратимо!`)) {
+        return;
+    }
+
+    // 2. Запрос Пароля (Обязательно)
+    const password = prompt(`Введите ваш пароль для подтверждения удаления клиента "${clientName}":`);
+    if (password === null) return; // Нажата Отмена
+    if (!password) {
+        alert("Пароль не введен. Удаление отменено.");
+        return;
+    }
+
+    // 3. Запрос Причины (Обязательно)
+    const reason = prompt("Укажите ПРИЧИНУ удаления (обязательно):");
+    if (reason === null) return; // Нажата Отмена
+    if (!reason || reason.trim().length < 3) {
+        alert("Причина должна быть указана. Удаление отменено.");
+        return;
+    }
+
     showLoader();
     try {
-        // Отправляем DELETE запрос на бэкенд
-        await apiFetch(`/api/clients/${clientId}`, { method: 'DELETE' });
-        console.log(`[Delete] handleDeleteClient: Client ID ${clientId} deleted successfully.`);
-        alert(`Клиент "${clientName}" успешно удален.`);
-        await fetchAndRenderClients(); // Обновляем список клиентов
-    } catch (err) { // Обработка ошибок от apiFetch (включая 400, если есть активные заказы)
+        // Отправляем DELETE запрос с паролем и причиной в URL
+        const params = new URLSearchParams({
+            password: password,
+            reason: reason
+        });
+
+        await apiFetch(`/api/clients/${clientId}?${params.toString()}`, { method: 'DELETE' });
+        
+        console.log(`[Delete] handleDeleteClient: Client ID ${clientId} deleted.`);
+        alert(`Клиент "${clientName}" успешно удален.\nПричина зафиксирована.`);
+        await fetchAndRenderClients(); // Обновляем список
+
+    } catch (err) { 
         console.error("[Delete] handleDeleteClient: Error", err);
-        alert(`Ошибка удаления клиента "${clientName}": ${err.message}`);
+        alert(`Ошибка удаления клиента: ${err.message}`);
     } finally {
-        hideLoader(); // Скрываем лоадер
-        console.log("[Delete] handleDeleteClient: End");
+        hideLoader();
     }
 }
 
@@ -4842,48 +4870,62 @@ function updateBulkActionBar() {
 
 // Выполнить массовое обновление статуса
 async function handleBulkUpdateStatus() {
-    // Получаем ID всех отмеченных заказов
-    const selectedIds = Array.from(document.querySelectorAll('.order-checkbox:checked'))
-                           .map(cb => parseInt(cb.dataset.orderId));
-    // Получаем выбранный новый статус из select'а
+    const selectedCheckboxes = Array.from(document.querySelectorAll('.order-checkbox:checked'));
+    const selectedIds = selectedCheckboxes.map(cb => parseInt(cb.dataset.orderId));
     const bulkStatusSelect = document.getElementById('orders-bulk-status-select');
     const newStatus = bulkStatusSelect ? bulkStatusSelect.value : null;
 
-    // Проверки
-    if (selectedIds.length === 0) {
-        alert("Не выбраны заказы для смены статуса.");
-        return;
-    }
-    if (!newStatus) { // Проверяем, выбран ли статус (не пустая ли опция "-- Выберите статус --")
-         alert("Пожалуйста, выберите новый статус из списка.");
-         return;
-    }
+    if (selectedIds.length === 0) { alert("Не выбраны заказы."); return; }
+    if (!newStatus) { alert("Выберите статус."); return; }
 
-    console.log(`[Bulk Action] handleBulkUpdateStatus: Attempting to set status '${newStatus}' for ${selectedIds.length} orders:`, selectedIds);
-    showLoader(); // Показываем лоадер
+    let password = null;
+    let reason = null;
+
+    // --- ПРОВЕРКА НА ОТКАТ ---
+    // Проверяем, есть ли среди выбранных заказы со статусом "Готов к выдаче"
+    // Нам нужно найти эти заказы в кэше companyOrders
+    const riskyOrders = selectedIds.filter(id => {
+        const order = companyOrders.find(o => o.id === id);
+        return order && order.status === "Готов к выдаче";
+    });
+
+    // Если есть "Готовые", а мы меняем их на "В пути" (или другой откат)
+    if (riskyOrders.length > 0 && newStatus !== "Готов к выдаче" && newStatus !== "Выдан") {
+        const confirmMsg = `🛑 ВНИМАНИЕ! ОТКАТ СТАТУСА!\n\nСреди выбранных есть ${riskyOrders.length} заказ(ов), готовых к выдаче.\nВы пытаетесь вернуть их назад.\n\nВведите ПАРОЛЬ БЕЗОПАСНОСТИ:`;
+        password = prompt(confirmMsg);
+        if (password === null) return;
+
+        reason = prompt("📝 Укажите ПРИЧИНУ массового отката (Обязательно):");
+        if (reason === null) return;
+        if (!reason || reason.trim().length < 3) {
+            alert("Причина обязательна."); return;
+        }
+    }
+    // -------------------------
+
+    console.log(`[Bulk] Updating ${selectedIds.length} orders to '${newStatus}'.`);
+    showLoader();
 
     try {
-        // Отправляем запрос на бэкенд
         const response = await apiFetch('/api/orders/bulk_action', {
             method: 'POST',
             body: JSON.stringify({
-                action: 'update_status', // Указываем действие
-                order_ids: selectedIds,   // Передаем массив ID
-                new_status: newStatus     // Передаем новый статус
+                action: 'update_status',
+                order_ids: selectedIds,
+                new_status: newStatus,
+                password: password, // Отправляем, если был введен
+                reason: reason      // Отправляем, если была введена
             })
         });
-        console.log("[Bulk Action] handleBulkUpdateStatus: Server response:", response);
-        alert(response.message || `Статус успешно обновлен для ${selectedIds.length} заказов.`);
-        // Перезагружаем список заказов, чтобы увидеть изменения
-        // При перезагрузке выбор и панель автоматически сбросятся
+        
+        alert(response.message || `Статус обновлен.`);
         await fetchAndRenderOrders();
 
-    } catch (err) { // Обработка ошибок от apiFetch
-        console.error("!!! [Bulk Action] handleBulkUpdateStatus: Error", err);
-        alert(`Ошибка массового обновления статуса: ${err.message}`);
+    } catch (err) {
+        console.error("Error:", err);
+        alert(`Ошибка: ${err.message}`);
     } finally {
-        hideLoader(); // Скрываем лоадер
-        console.log("[Bulk Action] handleBulkUpdateStatus: End");
+        hideLoader();
     }
 }
 
@@ -4955,51 +4997,53 @@ async function handleBulkDeleteOrders() {
     const selectedIds = Array.from(document.querySelectorAll('.order-checkbox:checked'))
                            .map(cb => parseInt(cb.dataset.orderId));
 
-    // Проверка
     if (selectedIds.length === 0) {
         alert("Не выбраны заказы для удаления."); return;
     }
 
-    // Запрашиваем пароль Владельца для подтверждения (опасная операция)
+    // 1. Запрос Пароля
     const ownerPassword = prompt(`ВНИМАНИЕ! Вы собираетесь удалить ${selectedIds.length} заказ(ов). Это действие НЕОБРАТИМО.\n\nВведите ваш пароль для подтверждения:`);
-    if (ownerPassword === null) {
-         console.log("[Bulk Action] Массовое удаление отменено пользователем.");
-         return;
-    }
-     if (ownerPassword === "") {
+    if (ownerPassword === null) return;
+    if (ownerPassword === "") {
          alert("Пароль не введен. Удаление отменено.");
          return;
     }
 
-    console.log(`[Bulk Action] handleBulkDeleteOrders: Attempting to delete ${selectedIds.length} orders.`);
-    showLoader(); // Показываем лоадер
+    // 2. Запрос Причины (НОВОЕ)
+    const reason = prompt("Укажите ПРИЧИНУ удаления этих заказов (для отчета):");
+    if (reason === null) return;
+    if (!reason || reason.trim().length < 3) {
+        alert("Причина не указана. Удаление отменено.");
+        return;
+    }
+
+    console.log(`[Bulk Action] Deleting ${selectedIds.length} orders. Reason: ${reason}`);
+    showLoader();
 
     try {
         // Отправляем запрос на бэкенд
         const response = await apiFetch('/api/orders/bulk_action', {
             method: 'POST',
             body: JSON.stringify({
-                action: 'delete',        // Указываем действие
-                order_ids: selectedIds,  // Передаем массив ID
-                password: ownerPassword  // Передаем введенный пароль
+                action: 'delete',
+                order_ids: selectedIds,
+                password: ownerPassword,
+                reason: reason // <--- Передаем причину
             })
         });
-        console.log("[Bulk Action] handleBulkDeleteOrders: Server response:", response);
+        
         alert(response.message || `Успешно удалено ${selectedIds.length} заказов.`);
 
-        // Обновляем список заказов
         await fetchAndRenderOrders();
-        // Обновляем кэш и фильтр дат партий (могли удалиться все заказы с какой-то датой)
-        console.log("[Bulk Action] Refreshing party dates after delete...");
+        // Обновляем кэш и фильтр дат партий
         availablePartyDates = await apiFetch('/api/orders/parties');
         populatePartyFilter();
 
-    } catch (err) { // Обработка ошибок (включая неверный пароль - 403)
-        console.error("!!! [Bulk Action] handleBulkDeleteOrders: Error", err);
-        alert(`Ошибка массового удаления заказов: ${err.message}`);
+    } catch (err) {
+        console.error("!!! [Bulk Action] Error", err);
+        alert(`Ошибка массового удаления: ${err.message}`);
     } finally {
-        hideLoader(); // Скрываем лоадер
-        console.log("[Bulk Action] handleBulkDeleteOrders: End");
+        hideLoader();
     }
 }
 
@@ -5278,97 +5322,113 @@ function openEditOrderModal(orderId) {
 
 async function handleSaveOrderChanges(e) {
     e.preventDefault(); 
-    console.log("[Save Order Changes] handleSaveOrderChanges: Start");
+    console.log("[Save Order Changes] Start");
     showLoader(); 
+    
     const form = e.target;
     const orderId = form.dataset.orderId; 
-    const orderIdInt = parseInt(orderId); // Нам понадобится число
+    const orderIdInt = parseInt(orderId);
 
-    if (!orderIdInt) { 
-        hideLoader(); 
-        alert("Критическая ошибка: Не удалось определить ID редактируемого заказа."); 
-        console.error("!!! handleSaveOrderChanges: Order ID not found in form data-attribute.");
-        return; 
+    // 1. Находим ИСХОДНЫЙ заказ в кэше, чтобы сравнить статусы
+    const originalOrder = companyOrders.find(o => o.id === orderIdInt);
+    if (!originalOrder) {
+        hideLoader();
+        alert("Ошибка: Исходный заказ не найден в кэше (попробуйте обновить страницу).");
+        return;
     }
-    
+
     const newClientId = document.getElementById('modal-order-new-client-id')?.value;
-    if (!newClientId || isNaN(parseInt(newClientId))) { 
-        hideLoader(); 
-        alert("Ошибка: Не удалось определить ID клиента. Пожалуйста, выберите клиента из поиска."); 
-        console.error("!!! handleSaveOrderChanges: New Client ID is invalid or missing.");
-        return; 
+    if (!newClientId) { 
+        hideLoader(); alert("Ошибка: Клиент не выбран."); return; 
     }
 
-    // Собираем данные ИЗ ПОЛЕЙ МОДАЛЬНОГО ОКНА
+    // Собираем данные
     const payload = {
         track_code: document.getElementById('modal-order-track-code')?.value.trim(),
         status: document.getElementById('modal-order-status')?.value,
         party_date: document.getElementById('modal-order-party-date')?.value || null, 
         client_id: parseInt(newClientId), 
         comment: document.getElementById('modal-order-comment')?.value.trim() || null, 
-        // Поля выкупа
         buyout_item_cost_cny: parseFloat(document.getElementById('modal-order-buyout-cost')?.value) || null,
         buyout_commission_percent: parseFloat(document.getElementById('modal-order-buyout-commission')?.value) || 10.0, 
         buyout_rate_for_client: parseFloat(document.getElementById('modal-order-buyout-rate')?.value) || null,
         buyout_actual_rate: parseFloat(document.getElementById('modal-order-buyout-actual-rate')?.value) || null,
-        // location_id будет добавлен ниже
     };
 
-    // --- ДОБАВЛЕНИЕ ЛОГИКИ LOCATION_ID (только если Владелец может редактировать) ---
     if (currentUser.role === 'Владелец') {
         const locationSelect = document.getElementById('modal-order-location');
-        if (locationSelect && locationSelect.value) {
-            payload.location_id = parseInt(locationSelect.value); 
-            console.log("[Save Order Changes] Sending location_id:", payload.location_id);
+        if (locationSelect && locationSelect.value) payload.location_id = parseInt(locationSelect.value); 
+    }
+
+    if (!payload.track_code) { hideLoader(); alert("Трек-код не может быть пустым."); return; }
+
+    // --- ПРОВЕРКА НА ОТКАТ СТАТУСА (ИСПРАВЛЕНО) ---
+    let password = null;
+    let reason = null;
+    
+    // Очищаем строки от пробелов для точного сравнения
+    const currentStatus = originalOrder.status.trim();
+    const newStatusRaw = payload.status.trim();
+
+    console.log(`[Security Check] Old: '${currentStatus}', New: '${newStatusRaw}'`);
+
+    // Условие срабатывания защиты:
+    // 1. Старый статус БЫЛ "Готов к выдаче"
+    // 2. Новый статус НЕ "Готов к выдаче" И НЕ "Выдан"
+    if (currentStatus === "Готов к выдаче" && newStatusRaw !== "Готов к выдаче" && newStatusRaw !== "Выдан") {
+        
+        console.warn("🚨 DETECTED STATUS ROLLBACK!");
+        
+        // Принудительный запрос
+        const confirmMsg = "🛑 ВНИМАНИЕ! ОТКАТ СТАТУСА!\n\nВы пытаетесь убрать статус 'Готов к выдаче'.\nЭто действие требует объяснения и пароля.\n\nВведите ПАРОЛЬ БЕЗОПАСНОСТИ:";
+        password = prompt(confirmMsg);
+        
+        if (password === null) { 
+            hideLoader(); return; // Нажата отмена
+        }
+
+        reason = prompt("📝 Укажите ПРИЧИНУ изменения (Обязательно):");
+        if (reason === null) { 
+            hideLoader(); return; 
+        }
+        
+        if (!reason || reason.trim().length < 3) {
+            hideLoader();
+            alert("❌ Ошибка: Причина не указана. Изменение отменено.");
+            return;
         }
     }
-    // --- КОНЕЦ ЛОГИКИ LOCATION_ID ---
 
-    // Валидация
-    if (!payload.track_code) { 
-        hideLoader(); 
-        alert("Трек-код не может быть пустым."); 
-        console.warn("[Save Order Changes] Validation failed: track_code missing.");
-        return; 
+    // Формируем URL с параметрами безопасности (если они есть)
+    let url = `/api/orders/${orderId}`;
+    const params = new URLSearchParams();
+    if (password) params.append('password', password);
+    if (reason) params.append('reason', reason);
+    
+    if (password || reason) {
+        url += `?${params.toString()}`;
     }
 
-    console.log(`[Save Order Changes] Sending PATCH to /api/orders/${orderId}. Payload:`, payload);
     try {
-        // 1. Отправляем запрос. Бэкенд (с нашим фиксом в get_orders) вернет
-        //    объект updatedOrder С ПОЛНЫМИ ДАННЫМИ КЛИЕНТА.
-        const updatedOrder = await apiFetch(`/api/orders/${orderId}`, {
+        const updatedOrder = await apiFetch(url, {
             method: 'PATCH',
             body: JSON.stringify(payload)
         });
-        console.log("[Save Order Changes] Server response (updated order):", updatedOrder);
+        
         alert(`Заказ #${orderId} успешно обновлен!`);
         closeModal('edit-order-modal'); 
 
-        // 2. ИСПРАВЛЕНИЕ: Ручное обновление кэша (вместо fetchAndRenderOrders)
-        // Находим индекс старого заказа в кэше
+        // Обновляем кэш
         const indexToUpdate = companyOrders.findIndex(o => o.id === orderIdInt);
+        if (indexToUpdate !== -1) companyOrders[indexToUpdate] = updatedOrder;
         
-        if (indexToUpdate !== -1) {
-            // Если нашли, заменяем старый объект новым
-            companyOrders[indexToUpdate] = updatedOrder;
-            console.log(`[Save Order Changes] Кэш companyOrders обновлен для заказа ID: ${orderIdInt}`);
-        } else {
-            // Если не нашли (маловероятно), просто добавляем в начало
-            companyOrders.unshift(updatedOrder);
-            console.warn(`[Save Order Changes] Заказ ID: ${orderIdInt} не найден в кэше, добавлен в начало.`);
-        }
-        
-        // 3. Перерисовываем список из ОБНОВЛЕННОГО кэша
         renderOrderListFromCache();
-        console.log("[Save Order Changes] Список перерисован из кэша.");
-        // (renderOrderListFromCache уже вызывает handleOrdersSearch, так что поиск применится)
 
     } catch (err) { 
-        console.error("!!! [Save Order Changes] Error:", err);
-        alert(`Ошибка обновления заказа #${orderId}: ${err.message}`);
+        console.error("!!! Error:", err);
+        alert(`Ошибка обновления: ${err.message}`);
     } finally {
         hideLoader(); 
-        console.log("[Save Order Changes] handleSaveOrderChanges: End");
     }
 }
 
@@ -6193,24 +6253,24 @@ async function fetchAndRenderHistory() {
             const revertBtn = e.target.closest('.revert-status-btn');
             if (revertBtn) {
                 const orderId = revertBtn.dataset.orderId;
-if (confirm('Вы уверены, что хотите вернуть этот заказ? Оплата будет отменена.')) {
-    // Проверяем, установлен ли пароль в настройках
-    const requiredPassword = companySettings['password_revert_order'];
-    let password = null;
+                
+                if (!confirm('Вы уверены, что хотите вернуть этот заказ?')) return;
 
-    if (requiredPassword) {
-        password = prompt("Для возврата заказа введите пароль:");
-        if (password === null) return; // Нажата "Отмена"
-    }
+                // 1. Запрос Пароля
+                const password = prompt("🔒 Введите ваш пароль для подтверждения возврата:");
+                if (password === null) return;
+                if (!password) { alert("Пароль обязателен."); return; }
 
-    const reason = prompt("Укажите ПРИЧИНУ возврата (обязательно):");
-    if (!reason || reason.trim().length < 5) {
-        alert("Причина не указана или слишком короткая. Возврат отменен.");
-        return;
-    }
+                // 2. Запрос Причины
+                const reason = prompt("📝 Укажите ПРИЧИНУ возврата (обязательно):");
+                if (reason === null) return;
+                if (!reason || reason.trim().length < 3) {
+                    alert("Причина должна быть указана. Возврат отменен.");
+                    return;
+                }
 
-    handleRevertStatus(orderId, password, reason); // <-- ПЕРЕДАЕМ ДАННЫЕ
-}
+                // Вызываем функцию отправки
+                handleRevertStatus(orderId, password, reason);
             }
         });
 
@@ -6231,28 +6291,27 @@ function handleHistorySearch(e) {
 }
 
 // Обработка возврата статуса
-async function handleRevertStatus(orderId, password, reason) { // <-- ПРИНИМАЕМ ДАННЫЕ
+async function handleRevertStatus(orderId, password, reason) {
     console.log(`[Revert] Reverting order ID: ${orderId}`);
     showLoader(); 
     try {
-        // Формируем payload
         const payload = {
             password: password,
             revert_reason: reason
         };
 
-        // Вызываем PATCH /api/orders/{id}/revert_status
+        // Используем JSON body, а не query params для безопасности
         await apiFetch(`/api/orders/${orderId}/revert_status`, { 
             method: 'PATCH',
-            body: JSON.stringify(payload) // <-- ОТПРАВЛЯЕМ PAYLOAD
+            body: JSON.stringify(payload) 
         });
 
         alert('Статус заказа успешно возвращен на "Готов к выдаче"!');
-        await fetchAndRenderHistory(); // Обновляем историю в модальном окне
-        await fetchAndRenderIssueList(); // Обновляем список готовых к выдаче на основной вкладке
+        await fetchAndRenderHistory(); // Обновляем таблицу истории
 
     } catch (error) {
-        alert(`Ошибка возврата статуса: ${error.message}`);
+        console.error("Revert Error:", error);
+        alert(`Ошибка возврата статуса: ${error.message}`); // Теперь покажет реальную ошибку (напр. "Неверный пароль")
     } finally {
         hideLoader(); 
     }
@@ -8065,6 +8124,11 @@ async function renderSettingsTab() {
                     <div>
                         <label class="block text-sm font-medium text-gray-700">Пароль на Удаление клиента</label>
                         <input type="text" data-key="password_delete_client" class="setting-input w-full p-2 border rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-red-700">🔑 Пароль на ОТКАТ СТАТУСА (Готов -> В пути)</label>
+                        <p class="text-xs text-gray-500 mb-1">Защищает от кражи "готовых" заказов сотрудниками.</p>
+                        <input type="text" data-key="password_status_rollback" class="setting-input w-full p-2 border rounded-md border-red-200 bg-red-50" placeholder="Придумайте сложный пароль">
                     </div>
                 </div>
 
