@@ -40,7 +40,8 @@ from models import (
     ExpenseType, Shift, Expense, Setting,
     Broadcast, BroadcastReaction, OrderHistory, NotificationHistory, # <--- ДОБАВИЛИ СЮДА
     role_permissions_table,
-    BulkOperation
+    BulkOperation,
+    AuditLog # <--- НОВОЕ
 )
 # Импортируем Session и List для типизации
 from sqlalchemy.orm import Session
@@ -739,19 +740,33 @@ def setup_initial_data(db: Session = Depends(get_db)):
     return {"status": "ok", "message": "Первоначальная настройка системы завершена."}
 
 ALL_PERMISSIONS = {
-    'manage_companies': 'Управлять Компаниями (создавать, блокировать, продлевать)',
-    'impersonate_company': 'Входить "от имени" компании (для техподдержки)',
+    # --- Глобальные ---
+    'manage_companies': 'Управлять Компаниями (Super-Admin)',
+    'impersonate_company': 'Входить от имени компании',
+    
+    # --- Персонал и Точки ---
     'manage_employees': 'Управлять сотрудниками (добавлять, увольнять)',  
     'manage_roles': 'Управлять должностями и доступами',
     'manage_locations': 'Управлять филиалами (точками)',
-    'manage_expense_types': 'Управлять типами расходов',  
-    'view_full_reports': 'Видеть полные финансовые отчеты',
+    
+    # --- Клиенты ---
+    'manage_clients': 'Управлять клиентами (добавлять, ред., удалять)',
+    
+    # --- Заказы (Детализация) ---
+    'manage_orders': 'Просматривать и создавать заказы',
+    'change_order_status': 'Менять статус заказов (Массово и одиночно)', # <-- НОВОЕ
+    'revert_orders': 'Делать возврат статуса (из "Выдан" в "Готов")',    # <-- НОВОЕ
+    'issue_orders': 'Выдавать заказы (Прием оплаты)',
+    'delete_orders': 'Удалять заказы (Опасно!)',                         # <-- НОВОЕ
+    
+    # --- Финансы ---
+    'manage_expense_types': 'Управлять типами расходов',
+    'add_expense': 'Добавлять расходы',
+    'open_close_shift': 'Открывать и закрывать смены',
     'view_shift_report': 'Видеть отчет по текущей смене',
-    'add_expense': 'Добавлять расходы',  
-    'open_close_shift': 'Открывать и закрывать смены',  
-    'issue_orders': 'Выдавать заказы',
-    'manage_clients': 'Управлять клиентами',  
-    'manage_orders': 'Управлять заказами',
+    'view_full_reports': 'Видеть полные финансовые отчеты (Сводка, Выкуп)',
+    
+    # --- Прочее ---
     'wipe_database': 'Полностью очищать базу данных (опасная зона)'
 }
 
@@ -1873,29 +1888,64 @@ async def update_client(
 @app.delete("/api/clients/{client_id}", tags=["Клиенты (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
 def delete_client(
     client_id: int,
-    employee: Employee = Depends(get_client_manager), # <-- ИСПРАВЛЕНО
-    db: Session = Depends(get_db)
+    background_tasks: BackgroundTasks,
+    employee: Employee = Depends(get_client_manager),
+    db: Session = Depends(get_db),
+    password: str = Query(...), # <--- ТЕПЕРЬ ТРЕБУЕМ ПАРОЛЬ
+    reason: Optional[str] = Query("Не указана") # И причину
 ):
-    """Удаляет клиента ТЕКУЩЕЙ компании."""
+    """Удаляет клиента (С ПАРОЛЕМ, ПРИЧИНОЙ И ЛОГОМ)."""
+    
+    # 1. Проверка пароля (Закрываем дыру)
+    if employee.password != password:
+         raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения удаления.")
+
     client = db.query(Client).filter(
         Client.id == client_id,
         Client.company_id == employee.company_id
     ).first()
     if not client:
-        raise HTTPException(status_code=404, detail="Клиент не найден в вашей компании.")
+        raise HTTPException(status_code=404, detail="Клиент не найден.")
 
-    # ПРОВЕРКА: Есть ли у клиента активные (не выданные) заказы?
+    # 2. Проверка на активные заказы
     active_orders_count = db.query(Order).filter(
-        Order.client_id == client_id,
-        Order.status != "Выдан" # Используем статус "Выдан" как признак завершенного
+        Order.client_id == client_id, 
+        Order.status != "Выдан"
     ).count()
 
     if active_orders_count > 0:
-        raise HTTPException(status_code=400, detail=f"Невозможно удалить клиента, так как у него есть {active_orders_count} незавершенных заказов.")
+        raise HTTPException(status_code=400, detail=f"Нельзя удалить: у клиента {active_orders_count} активных заказов.")
 
-    # TODO: Подумать, нужно ли удалять ИСТОРИЮ заказов клиента или только самого клиента.
-    # Пока удаляем только клиента, заказы останутся без привязки (или можно настроить каскадное удаление).
-    # Рекомендуется НЕ удалять заказы, чтобы сохранялась история.
+    # --- ДЕТЕКТИВ ---
+    log_desc = (
+        f"Причина: {reason}\n"
+        f"--------------------------\n"
+        f"Клиент: {client.full_name}\n"
+        f"Телефон: {client.phone}\n"
+        f"Код: {client.client_code_prefix}{client.client_code_num}"
+    )
+
+    log_entry = AuditLog(
+        company_id=employee.company_id,
+        event_type="delete_client",
+        entity_id=str(client.id),
+        description=log_desc,
+        who_did_it=f"{employee.full_name} ({employee.role.name})"
+    )
+    db.add(log_entry)
+    
+    # --- УВЕДОМЛЕНИЕ 🚨 ---
+    notify_msg = (
+        f"🚨 <b>УДАЛЕН КЛИЕНТ</b> 🚨\n\n"
+        f"👤 <b>Кто удалил:</b> {employee.full_name}\n"
+        f"❓ <b>Причина:</b> {reason}\n"
+        f"--------------------------\n"
+        f"💀 <b>Клиент:</b> {client.full_name}\n"
+        f"📞 <b>Телефон:</b> {client.phone}\n"
+        f"🔢 <b>Код:</b> {client.client_code_prefix}{client.client_code_num}"
+    )
+    background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+    # ---------------------
 
     db.delete(client)
     db.commit()
@@ -2247,6 +2297,7 @@ class BulkActionPayload(BaseModel):
     buyout_actual_rate: Optional[float] = None
     client_id: Optional[int] = None # <-- ИСПРАВЛЕНО (было new_client_id)
     password: Optional[str] = None
+    reason: Optional[str] = "Не указана" # <--- ДОБАВЛЕНО ПОЛЕ
 
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
@@ -2557,28 +2608,97 @@ def create_order(
 # main.py (Полностью заменяет функцию update_order)
 
 @app.patch("/api/orders/{order_id}", tags=["Заказы (Владелец)"], response_model=OrderOut)
-async def update_order( # Убедись, что 'async' здесь есть
+async def update_order(
     order_id: int,
     payload: OrderUpdate,
+    background_tasks: BackgroundTasks,
     employee: Employee = Depends(get_current_active_employee),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    password: Optional[str] = Query(None),
+    reason: Optional[str] = Query("Не указана")
 ):
-    """(С ИСПРАВЛЕНИЯМИ) Обновляет данные заказа и отправляет уведомление."""
+    """
+    Обновляет заказ.
+    ВКЛЮЧАЕТ ЗАЩИТУ ОТ ОТКАТА СТАТУСА "Готов к выдаче".
+    """
     
     # 1. Находим заказ
-    # НЕ ИСПОЛЬЗУЕМ joinedload(Order.client) здесь, т.к. он может загрузить СТАРОГО клиента
-    order = db.query(Order).filter( 
+    order = db.query(Order).options(joinedload(Order.client)).filter( 
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
+    
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден в вашей компании.")
 
     update_data = payload.dict(exclude_unset=True) 
     original_status = order.status 
-    original_client_id = order.client_id # Запоминаем ID старого клиента
+    original_client_id = order.client_id
 
-    # 2. Обработка изменения location_id (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА)
+    # --- ЛОГИКА БЕЗОПАСНОСТИ: ПРОВЕРКА ОТКАТА ---
+    # Если текущий статус "Готов к выдаче", А новый статус НЕ "Готов к выдаче" И НЕ "Выдан"
+    if original_status == "Готов к выдаче" and 'status' in update_data:
+        new_status = update_data['status']
+        
+        if new_status != "Готов к выдаче" and new_status != "Выдан":
+            print(f"[Security] 🚨 DETECTED ROLLBACK! Order: {order.track_code}. Reason: {reason}")
+
+            # 1. Проверяем настройку пароля
+            security_setting = db.query(Setting).filter(
+                Setting.company_id == employee.company_id,
+                Setting.key == "password_status_rollback"
+            ).first()
+            
+            required_pass = security_setting.value if security_setting else None
+            
+            # Если пароль установлен в настройках, сверяем его
+            if required_pass and required_pass.strip():
+                if password != required_pass:
+                     print(f"[Security] Password mismatch! Got: '{password}'")
+                     raise HTTPException(status_code=403, detail="Неверный пароль безопасности для отката статуса.")
+            
+            # 2. Пишем в Детектив (AuditLog)
+            client_name = order.client.full_name if order.client else "Неизвестный"
+            log_desc = (
+                f"🚨 ПОДОЗРИТЕЛЬНЫЙ ОТКАТ СТАТУСА!\n"
+                f"Было: {original_status} -> Стало: {new_status}\n"
+                f"Причина: {reason}\n"
+                f"Заказ: {order.track_code} ({client_name})"
+            )
+            try:
+                log_entry = AuditLog(
+                    company_id=employee.company_id,
+                    event_type="suspicious_rollback",
+                    entity_id=order.track_code,
+                    description=log_desc,
+                    who_did_it=f"{employee.full_name} ({employee.role.name})"
+                )
+                db.add(log_entry)
+            except Exception as e:
+                print(f"[Security] Log Error: {e}")
+
+            # 3. Уведомление Владельцу 🚨 (КРАСИВЫЙ СПИСОК)
+                formatted_tracks = ""
+                # Берем первые 20 заказов для списка (чтобы не спамить слишком длинно)
+                for o in risky_orders[:20]:
+                    formatted_tracks += f"{o.track_code}\n"
+                
+                if len(risky_orders) > 20:
+                    formatted_tracks += f"... и еще {len(risky_orders) - 20} шт."
+
+                notify_msg = (
+                    f"🚨 <b>МАССОВЫЙ ОТКАТ СТАТУСА!</b> 🚨\n\n"
+                    f"👤 <b>Кто:</b> {employee.full_name}\n"
+                    f"🔢 <b>Количество:</b> {len(risky_orders)} шт.\n"
+                    f"🔄 <b>Изменение:</b> 'Готов к выдаче' ➡️ '{new_status}'\n"
+                    f"❓ <b>Причина:</b> {reason_text}\n\n"
+                    f"📝 <b>Заказы:</b>\n"
+                    f"{formatted_tracks}"
+                )
+                background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+    # --------------------------------------------
+
+    # 2. Обработка изменения location_id (Только Владелец)
     if 'location_id' in update_data:
         if employee.role.name != 'Владелец':
             del update_data['location_id']  
@@ -2590,20 +2710,18 @@ async def update_order( # Убедись, что 'async' здесь есть
             if not new_location:
                 raise HTTPException(status_code=404, detail="Новый филиал не найден в вашей компании.")
 
-    # 3. Обработка смены клиента (если client_id передан)
-    new_client_id = None
+    # 3. Обработка смены клиента
     if 'client_id' in update_data:
-        new_client_id = update_data['client_id'] # Запоминаем ID нового клиента
+        new_client_id = update_data['client_id']
         if new_client_id != original_client_id:
-            new_client_check = db.query(Client.id).filter( # Проверяем только ID
+            new_client_check = db.query(Client.id).filter(
                 Client.id == new_client_id,
                 Client.company_id == employee.company_id
             ).first()
             if not new_client_check:
                  raise HTTPException(status_code=404, detail="Новый клиент не найден в вашей компании.")
-            print(f"[Update Order] Заказ ID={order_id} переносится на клиента ID={new_client_id}")
 
-    # 4. Проверка дубликата трек-кода при изменении
+    # 4. Проверка дубликата трек-кода
     if 'track_code' in update_data and update_data['track_code'] != order.track_code:
         if not update_data['track_code'].startswith("PENDING-"):
              existing_order = db.query(Order).filter(
@@ -2612,19 +2730,14 @@ async def update_order( # Убедись, что 'async' здесь есть
                  Order.id != order_id 
              ).first()
              if existing_order:
-                  raise HTTPException(status_code=400, detail=f"Другой заказ с трек-кодом '{update_data['track_code']}' уже существует.")
+                  raise HTTPException(status_code=400, detail="Такой трек-код уже существует.")
 
-    # 5. Проверка корректности статуса
-    if 'status' in update_data and update_data['status'] not in ORDER_STATUSES:
-         raise HTTPException(status_code=400, detail=f"Недопустимый статус заказа: {update_data['status']}")
-         
-    # 6. Применяем все собранные обновления к объекту заказа
-    # 6. Применяем все собранные обновления к объекту заказа
+    # 5. Применяем обновления
     try:
         for key, value in update_data.items():
             setattr(order, key, value)
         
-        # (Задача 3) Добавляем запись в историю, ЕСЛИ СТАТУС ИЗМЕНИЛСЯ
+        # История изменений статуса
         if 'status' in update_data and update_data['status'] != original_status:
             history_entry = OrderHistory(
                 order_id=order.id,
@@ -2633,76 +2746,81 @@ async def update_order( # Убедись, что 'async' здесь есть
             )
             db.add(history_entry)
             
-        db.commit() # Коммитим и заказ, и историю
-        # db.refresh(order)
+        db.commit()
         
-        # --- ИСПРАВЛЕНИЕ: ПЕРЕЗАГРУЖАЕМ ОБЪЕКТ ПОЛНОСТЬЮ ---
-        # После commit(), делаем НОВЫЙ запрос, чтобы получить
-        # обновленный заказ С ГАРАНТИРОВАННО ПОДГРУЖЕННЫМ НОВЫМ КЛИЕНТОМ
-        updated_order_with_client = db.query(Order).options(
-            joinedload(Order.client) # <-- Принудительно грузим КЛИЕНТА
-        ).filter(
-            Order.id == order_id
-        ).first()
+        # Перезагружаем объект с клиентом для ответа
+        # Используем новый запрос, чтобы гарантированно подтянуть обновленного клиента (если он менялся)
+        updated_order_with_client = db.query(Order).options(joinedload(Order.client)).filter(Order.id == order_id).first()
         
-        if not updated_order_with_client:
-             # Этого не должно случиться, но на всякий случай
-             raise HTTPException(status_code=500, detail="Ошибка: Обновленный заказ не найден после сохранения.")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-
-        # --- Логика уведомлений (ИСПОЛЬЗУЕМ НОВЫЙ ОБЪЕКТ) ---
+        # Уведомления клиенту о "хороших" статусах
         if 'status' in update_data and update_data['status'] != original_status:
             new_status = update_data['status']
-            
-            # ВАЖНО: Уведомление должно уйти НОВОМУ клиенту, если он сменился
             client_to_notify = updated_order_with_client.client 
             
+            # Отправляем, если статус поменялся на один из "клиентских"
             if client_to_notify and client_to_notify.telegram_chat_id and new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
-                print(f"[Notification] Статус заказа {updated_order_with_client.id} изменился на '{new_status}'. Вызов await generate_and_send_notification...")
                 await generate_and_send_notification(
                         client=client_to_notify, 
                         new_status=new_status, 
                         track_codes=[updated_order_with_client.track_code]
                 )
-            else:
-                chat_id_debug = client_to_notify.telegram_chat_id if client_to_notify else "Нет клиента"
-                print(f"[Notification] Уведомление для заказа {updated_order_with_client.id} не отправлено (статус: '{new_status}', chat_id: {chat_id_debug})")
-        # --- КОНЕЦ Логики уведомлений ---
 
-        print(f"[Update Order] Заказ ID={order_id} успешно обновлен.")
-        # Возвращаем объект, который мы принудительно перезагрузили
         return updated_order_with_client 
         
     except Exception as e:
         db.rollback() 
         import traceback
-        print(f"!!! Ошибка БД при обновлении заказа ID={order_id}:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при обновлении заказа: {e}")
+        print(f"Update Error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка БД: {e}")
 
 @app.delete("/api/orders/{order_id}", tags=["Заказы (Владелец)"], status_code=status.HTTP_204_NO_CONTENT)
 def delete_order(
     order_id: int,
+    background_tasks: BackgroundTasks,
     employee: Employee = Depends(get_company_owner),
     db: Session = Depends(get_db),
-    # Добавляем требование пароля через Query параметр или Header
-    password: str = Query(...) # Требуем пароль как параметр запроса
+    password: str = Query(...),
+    reason: Optional[str] = Query("Не указана") # <--- ДОБАВИЛИ ПАРАМЕТР
 ):
-    """Удаляет заказ ТЕКУЩЕЙ компании (ТРЕБУЕТ ПАРОЛЬ ВЛАДЕЛЬЦА)."""
-    # Проверяем пароль текущего сотрудника (Владельца)
+    """Удаляет заказ (С ПРИЧИНОЙ И КРАСИВЫМ ЛОГОМ)."""
     if employee.password != password:
-         raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения удаления.")
+         raise HTTPException(status_code=403, detail="Неверный пароль.")
 
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.company_id == employee.company_id
-    ).first()
+    order = db.query(Order).filter(Order.id == order_id, Order.company_id == employee.company_id).first()
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден в вашей компании.")
+        raise HTTPException(status_code=404, detail="Заказ не найден.")
 
-    # Доп. проверка: Нельзя удалить ВЫДАННЫЙ заказ? (По желанию)
-    # if order.status == "Выдан":
-    #     raise HTTPException(status_code=400, detail="Нельзя удалить уже выданный заказ.")
+    # --- ДЕТЕКТИВ ---
+    client_name = order.client.full_name if order.client else 'Нет клиента'
+    comment_info = f" ({order.comment})" if order.comment else ""
+    
+    log_desc = (
+        f"Причина: {reason}\n"
+        f"--------------------------\n"
+        f"👤 Клиент: {client_name}\n"
+        f"📦 Заказ: {order.track_code}{comment_info}"
+    )
+
+    log_entry = AuditLog(
+        company_id=employee.company_id,
+        event_type="delete_order",
+        entity_id=order.track_code,
+        description=log_desc,
+        who_did_it=f"{employee.full_name} ({employee.role.name})"
+    )
+    db.add(log_entry)
+    
+    # --- УВЕДОМЛЕНИЕ 🚨 ---
+    notify_msg = (
+        f"🚨 <b>УДАЛЕН ЗАКАЗ</b> 🚨\n\n"
+        f"👤 <b>Кто удалил:</b> {employee.full_name}\n"
+        f"❓ <b>Причина:</b> {reason}\n"
+        f"--------------------------\n"
+        f"👤 <b>Клиент:</b> {client_name}\n"
+        f"📦 <b>Трек:</b> <code>{order.track_code}</code>{comment_info}"
+    )
+    background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+    # ---------------------
 
     db.delete(order)
     db.commit()
@@ -2726,53 +2844,113 @@ def get_order_parties(
 # === НАЧАЛО ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ bulk_order_action ===
 
 # Эндпоинт для массовых действий (смена статуса, даты, удаление)
-
 @app.post("/api/orders/bulk_action", tags=["Заказы (Владелец)"])
 def bulk_order_action(
     payload: BulkActionPayload,
-    background_tasks: BackgroundTasks, # <-- Используем BackgroundTasks
-    employee: Employee = Depends(get_company_owner),
+    background_tasks: BackgroundTasks,
+    employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
-    """(Версия 3.0) Выполняет массовые действия (синхронно) и запускает уведомления в фоне."""
+    """
+    Выполняет массовые действия (Статус, Дата, Клиент, Удаление).
+    (ИСПРАВЛЕНА ОШИБКА ПЕРЕМЕННЫХ)
+    """
+    if employee.company_id is None:
+         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
+
+    perms = {p.codename for p in employee.role.permissions} if employee.role and employee.role.permissions else set()
 
     if not payload.order_ids:
-        raise HTTPException(status_code=400, detail="Не выбраны заказы для действия.")
+        raise HTTPException(status_code=400, detail="Не выбраны заказы.")
 
-    # 1. Загружаем заказы СРАЗУ с клиентами
     query = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(payload.order_ids),
-        Order.company_id == employee.company_id 
+        Order.company_id == employee.company_id
     )
     orders_to_action = query.all()
 
-    requested_ids_set = set(payload.order_ids)
-    found_ids_set = {o.id for o in orders_to_action}
+    if employee.role.name != 'Владелец':
+        for o in orders_to_action:
+            if o.location_id != employee.location_id:
+                raise HTTPException(status_code=403, detail="Вы не можете менять заказы другого филиала.")
 
-    if len(found_ids_set) != len(requested_ids_set):
-        missing_ids = list(requested_ids_set - found_ids_set)
-        raise HTTPException(status_code=404, detail=f"Некоторые заказы не найдены в вашей компании: {missing_ids}")
-
-    # --- Блок IF для 'update_status' ---
+    # ==========================================
+    # ДЕЙСТВИЕ: СМЕНА СТАТУСА
+    # ==========================================
     if payload.action == 'update_status':
+        if 'change_order_status' not in perms and employee.role.name != 'Владелец':
+             raise HTTPException(status_code=403, detail="У вас нет права менять статусы заказов.")
+
         new_status = payload.new_status
         if not new_status or new_status not in ORDER_STATUSES:
             raise HTTPException(status_code=400, detail="Недопустимый статус.")
 
-        # 1. Запоминаем СТАРЫЕ статусы (Snapshot) и собираем ID
+        # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ (FIX Pylance Error) ---
+        risky_orders = []
+        reason_text = payload.reason if payload.reason and len(payload.reason) > 2 else "Не указана"
+        # ----------------------------------------------------
+
+        # --- ЛОГИКА ЗАЩИТЫ ОТ ОТКАТА ---
+        if new_status != "Готов к выдаче" and new_status != "Выдан":
+            # Находим рискованные заказы
+            risky_orders = [o for o in orders_to_action if o.status == "Готов к выдаче"]
+            
+            if risky_orders:
+                print(f"[Bulk Security] Обнаружен откат {len(risky_orders)} заказов!")
+                
+                # 1. Проверка пароля
+                security_setting = db.query(Setting).filter(
+                    Setting.company_id == employee.company_id, 
+                    Setting.key == "password_status_rollback"
+                ).first()
+                required_pass = security_setting.value if security_setting else None
+                
+                if required_pass and required_pass.strip():
+                    if payload.password != required_pass:
+                         raise HTTPException(status_code=403, detail="МАССОВЫЙ ОТКАТ: Требуется пароль безопасности.")
+                
+                # 2. Уведомление Владельцу 🚨 (КРАСИВОЕ)
+                formatted_tracks = ""
+                for o in risky_orders[:20]:
+                    formatted_tracks += f"{o.track_code}\n"
+                if len(risky_orders) > 20:
+                    formatted_tracks += f"... и еще {len(risky_orders) - 20} шт."
+
+                notify_msg = (
+                    f"🚨 <b>МАССОВЫЙ ОТКАТ СТАТУСА!</b> 🚨\n\n"
+                    f"👤 <b>Кто:</b> {employee.full_name}\n"
+                    f"🔢 <b>Количество:</b> {len(risky_orders)} шт.\n"
+                    f"🔄 <b>Изменение:</b> 'Готов к выдаче' ➡️ '{new_status}'\n"
+                    f"❓ <b>Причина:</b> {reason_text}\n\n"
+                    f"📝 <b>Заказы:</b>\n"
+                    f"{formatted_tracks}"
+                )
+                background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+                
+                # 3. Запись в Детектив
+                try:
+                    db.add(AuditLog(
+                        company_id=employee.company_id,
+                        event_type="bulk_suspicious_rollback",
+                        entity_id=f"Count: {len(risky_orders)}",
+                        description=f"Массовый откат {len(risky_orders)} заказов на '{new_status}'. Причина: {reason_text}",
+                        who_did_it=f"{employee.full_name}"
+                    ))
+                except: pass
+        # ---------------------------------------
+
+        # 1. Snapshot
         snapshot_data = {}
         affected_ids_list = []
-        
         for order in orders_to_action:
-            # Записываем только если статус реально меняется
             if order.status != new_status:
                 snapshot_data[str(order.id)] = order.status 
                 affected_ids_list.append(order.id)
 
         if not affected_ids_list:
-             return {"status": "ok", "message": "Нет заказов для обновления (статусы уже совпадают)."}
+             return {"status": "ok", "message": "Нет заказов для обновления."}
 
-        # 2. Создаем запись об операции (Undo Log)
+        # 2. Undo Log
         undo_log = BulkOperation(
             employee_id=employee.id,
             company_id=employee.company_id,
@@ -2783,33 +2961,15 @@ def bulk_order_action(
         )
         db.add(undo_log)
         
-        # 3. Выполняем обновление (ИСПРАВЛЕНИЕ: ИСПОЛЬЗУЕМ ЧИСТЫЙ ЗАПРОС)
-        # Мы используем db.query(Order) заново, без joinedload, чтобы update сработал корректно
-        count = db.query(Order).filter(
-            Order.id.in_(affected_ids_list)
-        ).update(
-            {"status": new_status}, 
-            synchronize_session=False
-        )
+        # 3. Update
+        db.query(Order).filter(Order.id.in_(affected_ids_list)).update({"status": new_status}, synchronize_session=False)
         
-        # (Задача 3) Добавляем записи в историю
-        if count > 0:
-            history_entries = []
-            for order_id in affected_ids_list: 
-                history_entries.append(
-                    OrderHistory(
-                        order_id=order_id,
-                        status=new_status,
-                        employee_id=employee.id
-                    )
-                )
-            if history_entries:
-                db.bulk_save_objects(history_entries)
-                
+        # 4. History
+        history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in affected_ids_list]
+        db.bulk_save_objects(history_entries)
         db.commit()
 
-        # --- Логика уведомлений (Группировка) ---
-        # (Используем orders_to_action, так как в них есть данные клиента)
+        # 5. Notifications (Client)
         notifications_to_send = {}
         if new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
             for order in orders_to_action:
@@ -2817,146 +2977,151 @@ def bulk_order_action(
                     if order.client.id not in notifications_to_send:
                         notifications_to_send[order.client.id] = {"client": order.client, "track_codes": []}
                     notifications_to_send[order.client.id]["track_codes"].append(order.track_code)
-            
-            # Отправка
-            for client_id, data in notifications_to_send.items():
-                background_tasks.add_task(
-                    generate_and_send_notification,
-                    client=data["client"], 
-                    new_status=new_status, 
-                    track_codes=data["track_codes"]
-                )
+            for _, data in notifications_to_send.items():
+                background_tasks.add_task(generate_and_send_notification, client=data["client"], new_status=new_status, track_codes=data["track_codes"])
 
-        # Возвращаем ID операции
         return {
             "status": "ok", 
-            "message": f"Статус '{new_status}' установлен для {count} заказов.",
+            "message": f"Статус '{new_status}' установлен для {len(affected_ids_list)} заказов.",
             "operation_id": undo_log.id 
         }
 
-    # --- Остальные 'elif' ---
+    # ==========================================
+    # ДЕЙСТВИЕ: СМЕНА ДАТЫ ПАРТИИ
+    # ==========================================
     elif payload.action == 'update_party_date':
+        if employee.role.name != 'Владелец':
+            raise HTTPException(status_code=403, detail="Только Владелец может менять дату партии.")
+            
         if not payload.password or employee.password != payload.password:
-            raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения смены даты партии.")
+            raise HTTPException(status_code=403, detail="Неверный пароль.")
         if not payload.new_party_date:
-            raise HTTPException(status_code=400, detail="Не указана новая дата партии.")
-        count = query.update({"party_date": payload.new_party_date}, synchronize_session='fetch') 
-        db.commit()
-        return {"status": "ok", "message": f"Дата партии обновлена для {count} заказов."}
+            raise HTTPException(status_code=400, detail="Не указана новая дата.")
 
+        db.query(Order).filter(Order.id.in_(payload.order_ids)).update(
+            {"party_date": payload.new_party_date}, 
+            synchronize_session=False
+        )
+        db.commit()
+        return {"status": "ok", "message": "Дата партии обновлена."}
+
+    # ==========================================
+    # ДЕЙСТВИЕ: МАССОВЫЙ ВЫКУП
+    # ==========================================
     elif payload.action == 'buyout':
+        if 'manage_orders' not in perms and employee.role.name != 'Владелец':
+             raise HTTPException(status_code=403, detail="Нет прав на оформление выкупа.")
+
         if not payload.buyout_actual_rate or payload.buyout_actual_rate <= 0:
-            raise HTTPException(status_code=400, detail="Не указан корректный реальный курс выкупа.")
-        if not all(o.status == "Ожидает выкупа" for o in orders_to_action):
-            raise HTTPException(status_code=400, detail="Массовый выкуп возможен только для заказов со статусом 'Ожидает выкупа'.")
-        try:
-            count = query.update({
-                "status": "Выкуплен", 
-                "buyout_actual_rate": payload.buyout_actual_rate
-            }, synchronize_session=False) # Используем False
+            raise HTTPException(status_code=400, detail="Неверный курс выкупа.")
+        
+        count = db.query(Order).filter(
+            Order.id.in_(payload.order_ids),
+            Order.status == "Ожидает выкупа"
+        ).update({
+            "status": "Выкуплен", 
+            "buyout_actual_rate": payload.buyout_actual_rate
+        }, synchronize_session=False)
 
-            # (Задача 3) Добавляем записи в историю
-            if count > 0:
-                history_entries = [
-                    OrderHistory(
-                        order_id=order.id,
-                        status="Выкуплен",
-                        employee_id=employee.id
-                    )
-                    for order in orders_to_action # 'orders_to_action' все еще содержат старые данные
-                ]
-                db.bulk_save_objects(history_entries)
-
-            db.commit() # Коммитим и update, и историю
-            return {"status": "ok", "message": f"Выкуп и статус 'Выкуплен' успешно применены к {count} заказам."}
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=f"Ошибка базы данных при массовом выкупе: {e}")
-
-    # (Задача 3) Добавляем записи в историю для обновленных заказов
         if count > 0:
-            history_entries = [
-                OrderHistory(
-                    order_id=order_id,
-                    status=new_status, # Статус (например, "В пути")
-                    employee_id=employee.id
-                )
-                for order_id in ids_to_update # ids_to_update содержит ID тех, кому МЕНЯЕМ клиента
-            ]
-            db.bulk_save_objects(history_entries)
-        
-        db.commit()
-    
-    # --- ИСПРАВЛЕННЫЙ БЛОК 'assign_client' (v3.2) ---
-    elif payload.action == 'assign_client':
-        
-        # ИСПРАВЛЕНИЕ: Используем 'client_id', как ожидает твой JS
-        new_client_id = payload.client_id 
+             history_entries = [
+                 OrderHistory(order_id=oid, status="Выкуплен", employee_id=employee.id) 
+                 for oid in payload.order_ids
+             ]
+             db.bulk_save_objects(history_entries)
 
-        new_status = payload.new_status
-        if not new_status or new_status not in ORDER_STATUSES or new_status == "Выдан":
-            new_status = "В пути" # Статус по умолчанию при назначении
+        db.commit()
+        return {"status": "ok", "message": f"Выкуплено {count} заказов."}
+
+    # ==========================================
+    # ДЕЙСТВИЕ: НАЗНАЧЕНИЕ КЛИЕНТА
+    # ==========================================
+    elif payload.action == 'assign_client':
+        if 'manage_orders' not in perms and employee.role.name != 'Владелец':
+             raise HTTPException(status_code=403, detail="Нет прав на назначение клиента.")
+
+        new_client_id = payload.client_id
+        new_status = payload.new_status or "В пути"
 
         if not new_client_id:
-            # Ошибка теперь соответствует полю Pydantic
-            raise HTTPException(status_code=400, detail="Не указан ID клиента для назначения (client_id).")
+            raise HTTPException(status_code=400, detail="Не указан клиент.")
 
         client = db.query(Client).filter(Client.id == new_client_id, Client.company_id == employee.company_id).first()
         if not client:
-            raise HTTPException(status_code=404, detail="Клиент, которому вы пытаетесь назначить заказ, не найден.")
+            raise HTTPException(status_code=404, detail="Клиент не найден.")
 
-        # Проверяем, не назначен ли заказ УЖЕ этому клиенту
-        already_assigned_tracks = []
-        ids_to_update = []
-        for order in orders_to_action:
-            if order.client_id == new_client_id:
-                already_assigned_tracks.append(order.track_code)
-            else:
-                # Добавляем в список на обновление, ТОЛЬКО если он не назначен
-                ids_to_update.append(order.id)
-
+        ids_to_update = [o.id for o in orders_to_action if o.client_id != new_client_id]
+        
         if not ids_to_update:
-             # Если все заказы УЖЕ принадлежат этому клиенту
-             raise HTTPException(status_code=400, detail=f"Все выбранные заказы ({already_assigned_tracks}) уже назначены этому клиенту.")
+             return {"status": "ok", "message": "Все заказы уже у этого клиента."}
 
-        # Обновляем только те, которые еще не назначены
-        count = db.query(Order).filter(
-            Order.id.in_(ids_to_update),
-            Order.company_id == employee.company_id
-        ).update(
-            {"client_id": new_client_id, "status": new_status}, 
-            synchronize_session=False # 'fetch' не нужен, т.к. мы знаем ID
+        db.query(Order).filter(Order.id.in_(ids_to_update)).update(
+            {"client_id": new_client_id, "status": new_status},
+            synchronize_session=False
         )
+        
+        history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in ids_to_update]
+        db.bulk_save_objects(history_entries)
+        
         db.commit()
 
-        # Отправляем уведомление новому клиенту в фоне
         track_codes = [o.track_code for o in orders_to_action if o.id in ids_to_update]
-        if track_codes: # Отправляем, только если что-то реально назначили
-            background_tasks.add_task(
-                generate_and_send_notification,
-                client=client,
-                new_status=new_status, 
-                track_codes=track_codes
-            )
+        if track_codes:
+            background_tasks.add_task(generate_and_send_notification, client=client, new_status=new_status, track_codes=track_codes)
 
-        message = f"{count} заказов успешно назначены клиенту {client.full_name} (статус '{new_status}')."
-        if already_assigned_tracks:
-            message += f" {len(already_assigned_tracks)} заказов были пропущены, т.к. уже принадлежали ему."
+        return {"status": "ok", "message": f"{len(ids_to_update)} заказов назначены."}
 
-        return {"status": "ok", "message": message}
-    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
-
+    # ==========================================
+    # ДЕЙСТВИЕ: УДАЛЕНИЕ (С ЗАЩИТОЙ И ЛОГОМ)
+    # ==========================================
     elif payload.action == 'delete':
+        if employee.role.name != 'Владелец' and 'delete_orders' not in perms:
+             raise HTTPException(status_code=403, detail="Нет прав на удаление.")
+        
         if not payload.password or employee.password != payload.password:
-            raise HTTPException(status_code=403, detail="Неверный пароль для подтверждения удаления.")
+            raise HTTPException(status_code=403, detail="Неверный пароль.")
+
+        if orders_to_action:
+            grouped_orders = {} 
+            for o in orders_to_action:
+                c_name = f"{o.client.full_name} ({o.client.phone})" if o.client else "Неизвестный"
+                track_info = o.track_code + (f" - ({o.comment})" if o.comment else "")
+                if c_name not in grouped_orders: grouped_orders[c_name] = []
+                grouped_orders[c_name].append(track_info)
+
+            formatted_list_text = ""
+            for client_name, tracks in grouped_orders.items():
+                formatted_list_text += f"--------------------------\n👤 Клиент: <b>{client_name}</b>\n📦 Заказы:\n" + "\n".join(tracks) + "\n"
+
+            reason_text = payload.reason if payload.reason else "Не указана"
+            
+            log_entry = AuditLog(
+                company_id=employee.company_id,
+                event_type="bulk_delete_orders",
+                entity_id=f"Count: {len(orders_to_action)}",
+                description=f"Причина: {reason_text}\n{formatted_list_text}".replace("<b>", "").replace("</b>", ""),
+                who_did_it=f"{employee.full_name} ({employee.role.name})"
+            )
+            db.add(log_entry)
+
+            notify_msg = (
+                f"🚨 <b>ВНИМАНИЕ! УДАЛЕНИЕ ЗАКАЗОВ!</b> 🚨\n\n"
+                f"👤 <b>Кто удалил:</b> {employee.full_name}\n"
+                f"❓ <b>Причина:</b> {reason_text}\n"
+                f"📦 <b>Количество:</b> {len(orders_to_action)}\n"
+                f"📝 <b>Список:</b>\n{formatted_list_text}"
+            )
+            if len(notify_msg) > 3500: notify_msg = notify_msg[:3500] + "\n...(обрезано)..."
+            background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+
         ids_to_delete = [o.id for o in orders_to_action] 
-        query_to_delete = db.query(Order).filter(Order.id.in_(ids_to_delete))
-        count = query_to_delete.delete(synchronize_session=False) 
+        db.query(Order).filter(Order.id.in_(ids_to_delete)).delete(synchronize_session=False) 
         db.commit()
-        return {"status": "ok", "message": f"Удалено {count} заказов."}
+        
+        return {"status": "ok", "message": f"Удалено {len(ids_to_delete)} заказов."}
 
     else:
-        raise HTTPException(status_code=400, detail="Неизвестное массовое действие.")
+        raise HTTPException(status_code=400, detail="Неизвестное действие.")
 
 
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
@@ -3922,86 +4087,181 @@ class RevertOrderPayload(BaseModel):
     password: Optional[str] = None
     revert_reason: str = Field(..., min_length=5) # Причина обязательна
 
+async def notify_owners(
+    company_id: int, 
+    message_text: str, 
+    client_id: Optional[int] = None, 
+    notification_type: Optional[str] = None
+):
+    """
+    Отправляет уведомления владельцам (Надежная версия).
+    """
+    print(f"[Notify] Попытка отправки уведомления в компанию {company_id}")
+    db = SessionLocal()
+    try:
+        company = db.query(Company).filter(Company.id == company_id).first()
+        if not company or not company.telegram_bot_token:
+            print(f"[Notify] Ошибка: Нет токена бота для компании {company_id}")
+            return
+
+        bot = telegram.Bot(token=company.telegram_bot_token)
+        
+        # Ищем сотрудников-владельцев
+        owner_employees = db.query(Employee).join(Role).filter(
+            Employee.company_id == company_id,
+            Role.name == "Владелец",
+            Employee.is_active == True
+        ).all()
+        
+        owner_names = [e.full_name for e in owner_employees]
+
+        # Ищем клиентов, привязанных к этим именам (у кого есть Telegram ID)
+        owners_clients = db.query(Client).filter(
+            Client.company_id == company_id,
+            Client.full_name.in_(owner_names),
+            Client.telegram_chat_id.isnot(None)
+        ).all()
+
+        if not owners_clients:
+            print(f"[Notify] Не найдено Владельцев с привязанным Telegram (Имена: {owner_names})")
+            return
+
+        for client in owners_clients:
+            try:
+                await bot.send_message(chat_id=client.telegram_chat_id, text=message_text, parse_mode='HTML')
+                print(f"[Notify] Успешно отправлено владельцу: {client.full_name}")
+            except Exception as e:
+                print(f"[Notify] Ошибка отправки конкретному владельцу ({client.full_name}): {e}")
+
+    except Exception as e:
+        print(f"!!! CRITICAL ERROR in notify_owners: {e}")
+    finally:
+        db.close()
+
 @app.patch("/api/orders/{order_id}/revert_status", tags=["Выдача"], response_model=OrderOut)
 def revert_order_status(
     order_id: int,
+    payload: RevertOrderPayload, 
+    background_tasks: BackgroundTasks,
     employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
     """
-    Возвращает статус выданного заказа обратно на 'Готов к выдаче'.
-    Требует права 'issue_orders'. Доступно Владельцу или сотруднику в активной смене.
+    Возврат статуса 'Выдан' -> 'Готов к выдаче'.
+    (АВТОМАТИЧЕСКИ СОЗДАЕТ РАСХОД "ВОЗВРАТ" В КАССЕ)
     """
+    # Проверка прав
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
     perms = {p.codename for p in employee.role.permissions}
-    if 'issue_orders' not in perms: # Требуем те же права, что и на выдачу
-        raise HTTPException(status_code=403, detail="У вас нет прав на отмену выдачи.")
+    if 'revert_orders' not in perms and employee.role.name != 'Владелец':
+        raise HTTPException(status_code=403, detail="У вас нет прав на возврат.")
 
-    order = db.query(Order).options(joinedload(Order.shift)).filter( # Загружаем смену для проверки
+    order = db.query(Order).options(joinedload(Order.shift), joinedload(Order.client)).filter(
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
 
     if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден в вашей компании.")
+        raise HTTPException(status_code=404, detail="Заказ не найден.")
     if order.status != "Выдан":
-        raise HTTPException(status_code=400, detail="Можно вернуть только заказ со статусом 'Выдан'.")
+        raise HTTPException(status_code=400, detail="Заказ не в статусе 'Выдан'.")
 
-    # --- ПРОВЕРКА ВОЗМОЖНОСТИ ВОЗВРАТА ---
-    can_revert = False
-    if employee.role.name == 'Владелец':
-        can_revert = True # Владелец может всегда
-    else:
-        # Сотрудник может вернуть, только если СМЕНА, в которую была выдача, ЕЩЕ АКТИВНА
-        if order.shift and order.shift.end_time is None:
-            # И если это смена ТЕКУЩЕГО СОТРУДНИКА (доп. безопасность)
-            if order.shift.employee_id == employee.id:
-                 can_revert = True
-    
-    if not can_revert:
-         raise HTTPException(status_code=403, detail="Отмена выдачи невозможна (смена закрыта или у вас нет прав).")
-    # --- КОНЕЦ ПРОВЕРКИ ---
+    if payload.password and employee.password != payload.password:
+         raise HTTPException(status_code=403, detail="Неверный пароль.")
 
     try:
-        order.status = "Готов к выдаче"
+        # 1. Сбор данных для логов
+        client_name = order.client.full_name if order.client else "Неизвестный"
+        cost_info = f"{order.final_cost_som:.2f}" if order.final_cost_som else "0"
         
-        # (Задача 3) Добавляем запись в историю
-        history_entry = OrderHistory(
-            order_id=order.id,
-            status="Готов к выдаче",
-            employee_id=employee.id
+        # === НОВОЕ: ФИНАНСОВЫЙ ВОЗВРАТ ===
+        # Если заказ был оплачен НАЛИЧНЫМИ, возвращаем их из кассы (создаем расход)
+        cash_to_refund = order.paid_cash_som or 0
+        
+        if cash_to_refund > 0:
+            # Ищем или создаем тип расхода "Возврат"
+            return_type = db.query(ExpenseType).filter(
+                ExpenseType.name == "Возврат",
+                ExpenseType.company_id == employee.company_id
+            ).first()
+            
+            if not return_type:
+                return_type = ExpenseType(name="Возврат", company_id=employee.company_id)
+                db.add(return_type)
+                db.flush()
+            
+            # Ищем ТЕКУЩУЮ активную смену сотрудника
+            current_shift = db.query(Shift).filter(
+                Shift.company_id == employee.company_id,
+                Shift.location_id == employee.location_id,
+                Shift.end_time == None
+            ).first()
+            
+            # Создаем расход
+            if current_shift:
+                refund_expense = Expense(
+                    amount=cash_to_refund,
+                    notes=f"Авто-возврат по заказу {order.track_code} ({payload.revert_reason})",
+                    expense_type_id=return_type.id,
+                    shift_id=current_shift.id,
+                    company_id=employee.company_id
+                )
+                db.add(refund_expense)
+                print(f"[Revert] Создан расход 'Возврат' на {cash_to_refund} сом")
+        # =================================
+
+        # 2. Детектив
+        log_desc = f"ВОЗВРАТ: {order.track_code}. Клиент: {client_name}. Сумма: {cost_info}. Причина: {payload.revert_reason}"
+        try:
+            db.add(AuditLog(
+                company_id=employee.company_id,
+                event_type="revert_order",
+                entity_id=order.track_code,
+                description=log_desc,
+                who_did_it=f"{employee.full_name} ({employee.role.name})"
+            ))
+        except: pass
+
+        # 3. Уведомление
+        notify_msg = (
+            f"🚨 <b>ВОЗВРАТ ЗАКАЗА!</b> 🚨\n\n"
+            f"👤 <b>Кто вернул:</b> {employee.full_name}\n"
+            f"📦 <b>Заказ:</b> <code>{order.track_code}</code>\n"
+            f"📉 <b>Сумма возврата:</b> {cost_info} сом\n"
+            f"❓ <b>Причина:</b> {payload.revert_reason}"
         )
-        db.add(history_entry)
-        
-        order.reverted_at = datetime.now() # Фиксируем время возврата
-        # Обнуляем данные о выдаче
+        background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
+
+        # 4. Очистка заказа
+        order.status = "Готов к выдаче"
+        order.reverted_at = datetime.now()
         order.issued_at = None
         order.shift_id = None
-        order.weight_kg = None # Сбрасываем фактический вес
-        order.final_cost_som = None # Сбрасываем фактическую стоимость
-        order.paid_cash_som = None
-        order.paid_card_som = None
-        order.card_payment_type = None
+        order.paid_cash_som = 0
+        order.paid_card_som = 0
+        
+        db.add(OrderHistory(order_id=order.id, status="Готов к выдаче (Возврат)", employee_id=employee.id))
         
         db.commit()
         db.refresh(order)
-        db.refresh(order, attribute_names=['client']) # Обновляем клиента для ответа
-        print(f"[Выдача] Статус заказа ID={order_id} возвращен на 'Готов к выдаче'. Сотрудник ID={employee.id}")
         return order
         
     except Exception as e:
         db.rollback()
         import traceback
-        print(f"!!! Ошибка БД при возврате статуса заказа ID={order_id}:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Ошибка базы данных при возврате статуса: {e}")
+        print(f"!!! Revert Error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Ошибка сервера: {e}")
 # main.py (Добавьте этот блок)
 
 # --- Эндпоинты для Отчетов (Multi-Tenant) ---
 
 def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
-    """Вспомогательная функция для расчета данных по одной смене."""
+    """
+    Вспомогательная функция для расчета данных по одной смене.
+    (ТЕПЕРЬ СЧИТАЕТ ВОЗВРАТЫ)
+    """
     
     # 1. Доходы (только заказы, выданные в ЭТУ смену)
     issued_orders_in_shift = db.query(Order).filter(
@@ -4011,25 +4271,31 @@ def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
     total_cash_income = sum(o.paid_cash_som for o in issued_orders_in_shift if o.paid_cash_som)
     total_card_income = sum(o.paid_card_som for o in issued_orders_in_shift if o.paid_card_som)
 
-    # 2. Расходы (только расходы, привязанные к ЭТОЙ смене)
-    # Исключаем ЗП и Аванс из операционных расходов смены
-    expenses_in_shift = db.query(Expense).join(ExpenseType).filter(
-        Expense.shift_id == shift.id,
-        ExpenseType.name.notin_(['Зарплата', 'Аванс']) 
+    # 2. Получаем ВСЕ расходы смены
+    all_shift_expenses = db.query(Expense).join(ExpenseType).filter(
+        Expense.shift_id == shift.id
     ).all()
-    total_expenses = sum(exp.amount for exp in expenses_in_shift)
 
-    # 3. Возвраты (Заказы, возвращенные В ТЕЧЕНИЕ этой смены)
-    # (Эта логика может быть сложной, если возврат происходит в другую смену, пока упрощаем)
-    total_returns = 0 # TODO: Реализовать логику возвратов, если потребуется
+    # 3. Разделяем расходы на "Возвраты" и "Операционные"
+    # Возвраты - это расходы, где тип называется "Возврат"
+    returns_expenses = [e for e in all_shift_expenses if e.expense_type.name == "Возврат"]
+    total_returns = sum(e.amount for e in returns_expenses)
 
-    # 4. Расчет
+    # Операционные - все остальные (кроме ЗП, Аванс и Возврат)
+    operational_expenses = [
+        e for e in all_shift_expenses 
+        if e.expense_type.name not in ['Зарплата', 'Аванс', 'Возврат']
+    ]
+    total_expenses = sum(e.amount for e in operational_expenses)
+
+    # 4. Расчет (Касса = Начало + ПриходНал - Расходы - Возвраты)
     calculated_cash = shift.starting_cash + total_cash_income - total_expenses - total_returns
+    
     discrepancy = None
     if shift.end_time and shift.closing_cash is not None:
         discrepancy = shift.closing_cash - calculated_cash
 
-    # Загружаем связанные данные (если они еще не загружены)
+    # Загружаем связанные данные
     location_name = db.query(Location.name).filter(Location.id == shift.location_id).scalar() or "Неизвестный филиал"
     employee_name = db.query(Employee.full_name).filter(Employee.id == shift.employee_id).scalar() or "Неизвестный сотрудник"
 
@@ -4043,7 +4309,7 @@ def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
         cash_income=total_cash_income,
         card_income=total_card_income,
         total_expenses=total_expenses,
-        total_returns=total_returns,
+        total_returns=total_returns, # <--- ТЕПЕРЬ ТУТ РЕАЛЬНАЯ ЦИФРА
         calculated_cash=calculated_cash,
         actual_closing_cash=shift.closing_cash,
         discrepancy=discrepancy
@@ -5810,6 +6076,48 @@ def claim_order_from_bot(
         raise HTTPException(status_code=500, detail="Ошибка базы данных при назначении заказа.")
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА "МАГИИ" ---
 
+# --- Эндпоинт для Детектива ---
+@app.get("/api/audit/search", tags=["Отчеты"])
+def search_audit_logs(
+    q: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """
+    Ищет записи в журнале удалений.
+    Учитывает часовой пояс Бишкека (UTC+6) при поиске по датам.
+    """
+    query = db.query(AuditLog).filter(AuditLog.company_id == employee.company_id)
+
+    # 1. Фильтр по тексту
+    if q:
+        search = f"%{q.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(AuditLog.description).like(search),
+                func.lower(AuditLog.entity_id).like(search),
+                func.lower(AuditLog.who_did_it).like(search)
+            )
+        )
+    
+    # 2. Фильтр по Дате (с поправкой на Бишкек)
+    # Если мы ищем "21-е число", для сервера это (21-е 00:00 минус 6 часов)
+    if start_date:
+        # Начало дня в Бишкеке = 18:00 ПРЕДЫДУЩЕГО дня по UTC
+        start_dt = datetime.combine(start_date, time.min) - timedelta(hours=6)
+        query = query.filter(AuditLog.created_at >= start_dt)
+    
+    if end_date:
+        # Конец дня в Бишкеке = 17:59:59 ТЕКУЩЕГО дня по UTC
+        end_dt = datetime.combine(end_date, time.max) - timedelta(hours=6)
+        query = query.filter(AuditLog.created_at <= end_dt)
+
+    # Сортируем: новые сверху. Лимит 50.
+    logs = query.order_by(AuditLog.created_at.desc()).limit(50).all()
+    return logs
+
 # --- 7. УТИЛИТЫ ---
 
 # Этот эндпоинт больше не нужен, т.к. таблицы создаются при запуске
@@ -5826,107 +6134,6 @@ def claim_order_from_bot(
 # def get_order_statuses():  
 #     return {"status": "ok", "statuses": ORDER_STATUSES}
 
-# === УМНАЯ ФУНКЦИЯ УВЕДОМЛЕНИЯ ВЛАДЕЛЬЦЕВ (С УДАЛЕНИЕМ СТАРЫХ) ===
-async def notify_owners(
-    company_id: int, 
-    message_text: str, 
-    client_id: Optional[int] = None, 
-    notification_type: Optional[str] = None # 'buyout_request' или 'delivery_request'
-):
-    """
-    (ФОНОВАЯ ЗАДАЧA) Отправляет сообщение владельцам.
-    Если передан notification_type и client_id:
-    1. Ищет старое сообщение этого типа для этого клиента.
-    2. Удаляет его.
-    3. Отправляет новое (с пометкой "Обновлено").
-    4. Сохраняет ID нового сообщения.
-    """
-    db = SessionLocal()
-    try:
-        logger.info(f"[Notify Owner] Запуск для компании {company_id}. Тип: {notification_type}")
-
-        company = db.query(Company).filter(Company.id == company_id).first()
-        if not company or not company.telegram_bot_token:
-            return
-
-        owner_employees = db.query(Employee).join(Role).filter(
-            Employee.company_id == company_id,
-            Role.name == "Владелец",
-            Employee.is_active == True
-        ).all()
-
-        owner_names = [emp.full_name for emp in owner_employees]
-        owner_clients = db.query(Client).filter(
-            Client.company_id == company_id,
-            Client.full_name.in_(owner_names),
-            Client.telegram_chat_id != None
-        ).all()
-
-        if not owner_clients:
-            return
-
-        bot = telegram.Bot(token=company.telegram_bot_token)
-        
-        # Время для пометки об изменении
-        bishkek_now = datetime.now(timezone(timedelta(hours=6))).strftime("%H:%M")
-
-        for owner in owner_clients:
-            chat_id = owner.telegram_chat_id
-            final_text = message_text
-            
-            # --- ЛОГИКА УДАЛЕНИЯ СТАРОГО СООБЩЕНИЯ ---
-            if client_id and notification_type:
-                # 1. Ищем запись о старом сообщении
-                history_record = db.query(NotificationHistory).filter(
-                    NotificationHistory.company_id == company_id,
-                    NotificationHistory.client_id == client_id,
-                    NotificationHistory.recipient_chat_id == chat_id,
-                    NotificationHistory.notification_type == notification_type
-                ).first()
-                
-                if history_record:
-                    # 2. Пробуем удалить старое сообщение в Telegram
-                    try:
-                        await bot.delete_message(chat_id=chat_id, message_id=history_record.message_id)
-                        print(f"[Notify Owner] Старое сообщение {history_record.message_id} удалено для {chat_id}")
-                        
-                        # Добавляем пометку в НОВОЕ сообщение
-                        final_text = f"🔄 <b>ОБНОВЛЕНО в {bishkek_now}</b> (Клиент изменил данные)\n\n" + message_text
-                        
-                    except Exception as e:
-                        print(f"[Notify Owner] Не удалось удалить старое сообщение (возможно, слишком старое): {e}")
-                    
-                    # 3. Удаляем запись из БД
-                    db.delete(history_record)
-                    db.commit() # Фиксируем удаление
-
-            # --- ОТПРАВКА НОВОГО ---
-            try:
-                sent_message = await bot.send_message(
-                    chat_id=chat_id,
-                    text=final_text,
-                    parse_mode='HTML'
-                )
-                
-                # --- СОХРАНЕНИЕ ID НОВОГО СООБЩЕНИЯ ---
-                if client_id and notification_type:
-                    new_history = NotificationHistory(
-                        company_id=company_id,
-                        client_id=client_id,
-                        recipient_chat_id=chat_id,
-                        message_id=sent_message.message_id,
-                        notification_type=notification_type
-                    )
-                    db.add(new_history)
-                    db.commit()
-                    
-            except Exception as e:
-                print(f"[Notify Owner] Ошибка отправки владельцу {chat_id}: {e}")
-
-    except Exception as e:
-        logger.error(f"!!! [Notify Owner] Ошибка в фоновой задаче: {e}", exc_info=True)
-    finally:
-        db.close()
 # === КОНЕЦ УНИВЕРСАЛЬНОЙ ФУНКЦИИ ===
 
 async def notify_owner_of_complaint(company_id: int, client_id: int, message_text: str):
