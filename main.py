@@ -2635,54 +2635,45 @@ async def update_order(
     original_status = order.status 
     original_client_id = order.client_id
 
-    # --- ЛОГИКА БЕЗОПАСНОСТИ: ПРОВЕРКА ОТКАТА ---
-    # Если текущий статус "Готов к выдаче", А новый статус НЕ "Готов к выдаче" И НЕ "Выдан"
-    if original_status == "Готов к выдаче" and 'status' in update_data:
-        new_status = update_data['status']
-        
+    # ==========================================
+    # ДЕЙСТВИЕ: СМЕНА СТАТУСА
+    # ==========================================
+    if payload.action == 'update_status':
+        if 'change_order_status' not in perms and employee.role.name != 'Владелец':
+             raise HTTPException(status_code=403, detail="У вас нет права менять статусы заказов.")
+
+        new_status = payload.new_status
+        if not new_status or new_status not in ORDER_STATUSES:
+            raise HTTPException(status_code=400, detail="Недопустимый статус.")
+
+        # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ (FIX Pylance Error) ---
+        risky_orders = []
+        reason_text = payload.reason if payload.reason and len(payload.reason) > 2 else "Не указана"
+        # ----------------------------------------------------
+
+        # --- ЛОГИКА ЗАЩИТЫ ОТ ОТКАТА ---
         if new_status != "Готов к выдаче" and new_status != "Выдан":
-            print(f"[Security] 🚨 DETECTED ROLLBACK! Order: {order.track_code}. Reason: {reason}")
-
-            # 1. Проверяем настройку пароля
-            security_setting = db.query(Setting).filter(
-                Setting.company_id == employee.company_id,
-                Setting.key == "password_status_rollback"
-            ).first()
+            # Находим рискованные заказы
+            risky_orders = [o for o in orders_to_action if o.status == "Готов к выдаче"]
             
-            required_pass = security_setting.value if security_setting else None
-            
-            # Если пароль установлен в настройках, сверяем его
-            if required_pass and required_pass.strip():
-                if password != required_pass:
-                     print(f"[Security] Password mismatch! Got: '{password}'")
-                     raise HTTPException(status_code=403, detail="Неверный пароль безопасности для отката статуса.")
-            
-            # 2. Пишем в Детектив (AuditLog)
-            client_name = order.client.full_name if order.client else "Неизвестный"
-            log_desc = (
-                f"🚨 ПОДОЗРИТЕЛЬНЫЙ ОТКАТ СТАТУСА!\n"
-                f"Было: {original_status} -> Стало: {new_status}\n"
-                f"Причина: {reason}\n"
-                f"Заказ: {order.track_code} ({client_name})"
-            )
-            try:
-                log_entry = AuditLog(
-                    company_id=employee.company_id,
-                    event_type="suspicious_rollback",
-                    entity_id=order.track_code,
-                    description=log_desc,
-                    who_did_it=f"{employee.full_name} ({employee.role.name})"
-                )
-                db.add(log_entry)
-            except Exception as e:
-                print(f"[Security] Log Error: {e}")
-
-            # 3. Уведомление Владельцу 🚨 (КРАСИВЫЙ СПИСОК)
+            if risky_orders:
+                print(f"[Bulk Security] Обнаружен откат {len(risky_orders)} заказов!")
+                
+                # 1. Проверка пароля
+                security_setting = db.query(Setting).filter(
+                    Setting.company_id == employee.company_id, 
+                    Setting.key == "password_status_rollback"
+                ).first()
+                required_pass = security_setting.value if security_setting else None
+                
+                if required_pass and required_pass.strip():
+                    if payload.password != required_pass:
+                         raise HTTPException(status_code=403, detail="МАССОВЫЙ ОТКАТ: Требуется пароль безопасности.")
+                
+                # 2. Уведомление Владельцу 🚨 (КРАСИВОЕ)
                 formatted_tracks = ""
-                # Берем первые 20 заказов для списка (чтобы не спамить слишком длинно)
                 for o in risky_orders[:20]:
                     formatted_tracks += f"{o.track_code}\n"
-                
                 if len(risky_orders) > 20:
                     formatted_tracks += f"... и еще {len(risky_orders) - 20} шт."
 
@@ -2696,7 +2687,18 @@ async def update_order(
                     f"{formatted_tracks}"
                 )
                 background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
-    # --------------------------------------------
+                
+                # 3. Запись в Детектив
+                try:
+                    db.add(AuditLog(
+                        company_id=employee.company_id,
+                        event_type="bulk_suspicious_rollback",
+                        entity_id=f"Count: {len(risky_orders)}",
+                        description=f"Массовый откат {len(risky_orders)} заказов на '{new_status}'. Причина: {reason_text}",
+                        who_did_it=f"{employee.full_name}"
+                    ))
+                except: pass
+        # ---------------------------------------
 
     # 2. Обработка изменения location_id (Только Владелец)
     if 'location_id' in update_data:
@@ -2853,26 +2855,31 @@ def bulk_order_action(
 ):
     """
     Выполняет массовые действия (Статус, Дата, Клиент, Удаление).
-    (ИСПРАВЛЕНА ОШИБКА ПЕРЕМЕННЫХ)
+    (ПОЛНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ)
     """
+    # --- 1. ПРОВЕРКИ И ИНИЦИАЛИЗАЦИЯ (ЭТО ТО, ЧЕГО НЕ ХВАТАЛО) ---
     if employee.company_id is None:
          raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
+    # Определяем права
     perms = {p.codename for p in employee.role.permissions} if employee.role and employee.role.permissions else set()
 
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы.")
 
+    # Загружаем заказы (orders_to_action)
     query = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(payload.order_ids),
         Order.company_id == employee.company_id
     )
     orders_to_action = query.all()
 
+    # Проверка прав на филиал (если не Владелец)
     if employee.role.name != 'Владелец':
         for o in orders_to_action:
             if o.location_id != employee.location_id:
                 raise HTTPException(status_code=403, detail="Вы не можете менять заказы другого филиала.")
+    # ------------------------------------------------------------
 
     # ==========================================
     # ДЕЙСТВИЕ: СМЕНА СТАТУСА
@@ -2885,10 +2892,10 @@ def bulk_order_action(
         if not new_status or new_status not in ORDER_STATUSES:
             raise HTTPException(status_code=400, detail="Недопустимый статус.")
 
-        # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ (FIX Pylance Error) ---
+        # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ БЕЗОПАСНОСТИ ---
         risky_orders = []
         reason_text = payload.reason if payload.reason and len(payload.reason) > 2 else "Не указана"
-        # ----------------------------------------------------
+        # ---------------------------------------------
 
         # --- ЛОГИКА ЗАЩИТЫ ОТ ОТКАТА ---
         if new_status != "Готов к выдаче" and new_status != "Выдан":
@@ -2909,7 +2916,7 @@ def bulk_order_action(
                     if payload.password != required_pass:
                          raise HTTPException(status_code=403, detail="МАССОВЫЙ ОТКАТ: Требуется пароль безопасности.")
                 
-                # 2. Уведомление Владельцу 🚨 (КРАСИВОЕ)
+                # 2. Уведомление Владельцу 🚨
                 formatted_tracks = ""
                 for o in risky_orders[:20]:
                     formatted_tracks += f"{o.track_code}\n"
@@ -2939,7 +2946,7 @@ def bulk_order_action(
                 except: pass
         # ---------------------------------------
 
-        # 1. Snapshot
+        # 1. Snapshot (Снимок до изменений)
         snapshot_data = {}
         affected_ids_list = []
         for order in orders_to_action:
@@ -2950,7 +2957,7 @@ def bulk_order_action(
         if not affected_ids_list:
              return {"status": "ok", "message": "Нет заказов для обновления."}
 
-        # 2. Undo Log
+        # 2. Undo Log (Запись для отмены)
         undo_log = BulkOperation(
             employee_id=employee.id,
             company_id=employee.company_id,
@@ -2961,15 +2968,15 @@ def bulk_order_action(
         )
         db.add(undo_log)
         
-        # 3. Update
+        # 3. Update (Обновление)
         db.query(Order).filter(Order.id.in_(affected_ids_list)).update({"status": new_status}, synchronize_session=False)
         
-        # 4. History
+        # 4. History (История)
         history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in affected_ids_list]
         db.bulk_save_objects(history_entries)
         db.commit()
 
-        # 5. Notifications (Client)
+        # 5. Notifications (Уведомления клиентам)
         notifications_to_send = {}
         if new_status in ["Готов к выдаче", "В пути", "На складе в КР"]:
             for order in orders_to_action:
@@ -4148,9 +4155,9 @@ def revert_order_status(
 ):
     """
     Возврат статуса 'Выдан' -> 'Готов к выдаче'.
-    (АВТОМАТИЧЕСКИ СОЗДАЕТ РАСХОД "ВОЗВРАТ" В КАССЕ)
+    (ИСПРАВЛЕНО: Убран joinedload(Order.shift), который вызывал ошибку)
     """
-    # Проверка прав
+    # 1. Проверка прав
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
 
@@ -4158,7 +4165,9 @@ def revert_order_status(
     if 'revert_orders' not in perms and employee.role.name != 'Владелец':
         raise HTTPException(status_code=403, detail="У вас нет прав на возврат.")
 
-    order = db.query(Order).options(joinedload(Order.shift), joinedload(Order.client)).filter(
+    # 2. Поиск заказа
+    # !!! ИСПРАВЛЕНИЕ: Убрали joinedload(Order.shift), так как relationships нет в модели !!!
+    order = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id == order_id,
         Order.company_id == employee.company_id
     ).first()
@@ -4168,20 +4177,36 @@ def revert_order_status(
     if order.status != "Выдан":
         raise HTTPException(status_code=400, detail="Заказ не в статусе 'Выдан'.")
 
+    # 3. Проверка пароля
     if payload.password and employee.password != payload.password:
          raise HTTPException(status_code=403, detail="Неверный пароль.")
 
     try:
-        # 1. Сбор данных для логов
+        # 4. Сбор данных
         client_name = order.client.full_name if order.client else "Неизвестный"
         cost_info = f"{order.final_cost_som:.2f}" if order.final_cost_som else "0"
         
-        # === НОВОЕ: ФИНАНСОВЫЙ ВОЗВРАТ ===
-        # Если заказ был оплачен НАЛИЧНЫМИ, возвращаем их из кассы (создаем расход)
+        # === ЛОГИКА ВОЗВРАТА ДЕНЕГ ===
         cash_to_refund = order.paid_cash_som or 0
         
         if cash_to_refund > 0:
-            # Ищем или создаем тип расхода "Возврат"
+            # Ищем смену в ТОМ ЖЕ филиале, где сотрудник (или владелец)
+            target_loc = employee.location_id or order.location_id
+            
+            current_shift = db.query(Shift).filter(
+                Shift.company_id == employee.company_id,
+                Shift.location_id == target_loc,
+                Shift.end_time == None
+            ).first()
+            
+            # !!! ВАЖНО: Если смены нет - останавливаемся с ошибкой !!!
+            if not current_shift:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"ОШИБКА: Не могу вернуть {cash_to_refund} сом в кассу, так как СМЕНА ЗАКРЫТА. Откройте смену в этом филиале!"
+                )
+
+            # Тип расхода "Возврат"
             return_type = db.query(ExpenseType).filter(
                 ExpenseType.name == "Возврат",
                 ExpenseType.company_id == employee.company_id
@@ -4192,39 +4217,32 @@ def revert_order_status(
                 db.add(return_type)
                 db.flush()
             
-            # Ищем ТЕКУЩУЮ активную смену сотрудника
-            current_shift = db.query(Shift).filter(
-                Shift.company_id == employee.company_id,
-                Shift.location_id == employee.location_id,
-                Shift.end_time == None
-            ).first()
-            
             # Создаем расход
-            if current_shift:
-                refund_expense = Expense(
-                    amount=cash_to_refund,
-                    notes=f"Авто-возврат по заказу {order.track_code} ({payload.revert_reason})",
-                    expense_type_id=return_type.id,
-                    shift_id=current_shift.id,
-                    company_id=employee.company_id
-                )
-                db.add(refund_expense)
-                print(f"[Revert] Создан расход 'Возврат' на {cash_to_refund} сом")
-        # =================================
+            refund_expense = Expense(
+                amount=cash_to_refund,
+                notes=f"Авто-возврат по заказу {order.track_code} ({payload.revert_reason})",
+                expense_type_id=return_type.id,
+                shift_id=current_shift.id,
+                company_id=employee.company_id
+            )
+            db.add(refund_expense)
+            print(f"[Revert] Добавлен расход 'Возврат': {cash_to_refund} сом")
+        # ===============================
 
-        # 2. Детектив
+        # 5. Логгирование (Детектив)
         log_desc = f"ВОЗВРАТ: {order.track_code}. Клиент: {client_name}. Сумма: {cost_info}. Причина: {payload.revert_reason}"
         try:
+            role_name = employee.role.name if employee.role else "Сотрудник"
             db.add(AuditLog(
                 company_id=employee.company_id,
                 event_type="revert_order",
                 entity_id=order.track_code,
                 description=log_desc,
-                who_did_it=f"{employee.full_name} ({employee.role.name})"
+                who_did_it=f"{employee.full_name} ({role_name})"
             ))
         except: pass
 
-        # 3. Уведомление
+        # 6. Уведомление Владельцу
         notify_msg = (
             f"🚨 <b>ВОЗВРАТ ЗАКАЗА!</b> 🚨\n\n"
             f"👤 <b>Кто вернул:</b> {employee.full_name}\n"
@@ -4234,7 +4252,7 @@ def revert_order_status(
         )
         background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=notify_msg)
 
-        # 4. Очистка заказа
+        # 7. Сброс статуса заказа
         order.status = "Готов к выдаче"
         order.reverted_at = datetime.now()
         order.issued_at = None
@@ -4248,11 +4266,17 @@ def revert_order_status(
         db.refresh(order)
         return order
         
+    except HTTPException as he:
+        db.rollback()
+        raise he # Пробрасываем понятную ошибку (например, про смену)
     except Exception as e:
         db.rollback()
+        # Печатаем ПОЛНУЮ ошибку в консоль сервера
         import traceback
-        print(f"!!! Revert Error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Ошибка сервера: {e}")
+        print(f"!!! CRITICAL ERROR IN REVERT !!!")
+        print(traceback.format_exc())
+        # Отправляем ошибку в браузер
+        raise HTTPException(status_code=500, detail=f"Критическая ошибка сервера: {str(e)}")
 # main.py (Добавьте этот блок)
 
 # --- Эндпоинты для Отчетов (Multi-Tenant) ---
@@ -4260,7 +4284,7 @@ def revert_order_status(
 def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
     """
     Вспомогательная функция для расчета данных по одной смене.
-    (ТЕПЕРЬ СЧИТАЕТ ВОЗВРАТЫ)
+    (ИСПРАВЛЕНО: Более мягкий поиск возвратов - 'in' вместо '==')
     """
     
     # 1. Доходы (только заказы, выданные в ЭТУ смену)
@@ -4271,21 +4295,26 @@ def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
     total_cash_income = sum(o.paid_cash_som for o in issued_orders_in_shift if o.paid_cash_som)
     total_card_income = sum(o.paid_card_som for o in issued_orders_in_shift if o.paid_card_som)
 
-    # 2. Получаем ВСЕ расходы смены
-    all_shift_expenses = db.query(Expense).join(ExpenseType).filter(
+    # 2. Получаем ВСЕ расходы смены с подгрузкой типа
+    all_shift_expenses = db.query(Expense).options(joinedload(Expense.expense_type)).filter(
         Expense.shift_id == shift.id
     ).all()
 
     # 3. Разделяем расходы на "Возвраты" и "Операционные"
-    # Возвраты - это расходы, где тип называется "Возврат"
-    returns_expenses = [e for e in all_shift_expenses if e.expense_type.name == "Возврат"]
-    total_returns = sum(e.amount for e in returns_expenses)
+    returns_expenses = []
+    operational_expenses = []
+    
+    for e in all_shift_expenses:
+        type_name = e.expense_type.name.strip().lower() if e.expense_type else ""
+        
+        # ИСПРАВЛЕНИЕ ЗДЕСЬ: Ищем вхождение слова "возврат", а не точное совпадение
+        if "возврат" in type_name:
+            returns_expenses.append(e)
+        # Исключаем из операционных: зарплата, аванс и то, что мы уже определили как возврат
+        elif type_name not in ['зарплата', 'аванс']: 
+            operational_expenses.append(e)
 
-    # Операционные - все остальные (кроме ЗП, Аванс и Возврат)
-    operational_expenses = [
-        e for e in all_shift_expenses 
-        if e.expense_type.name not in ['Зарплата', 'Аванс', 'Возврат']
-    ]
+    total_returns = sum(e.amount for e in returns_expenses)
     total_expenses = sum(e.amount for e in operational_expenses)
 
     # 4. Расчет (Касса = Начало + ПриходНал - Расходы - Возвраты)
@@ -4309,7 +4338,7 @@ def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
         cash_income=total_cash_income,
         card_income=total_card_income,
         total_expenses=total_expenses,
-        total_returns=total_returns, # <--- ТЕПЕРЬ ТУТ РЕАЛЬНАЯ ЦИФРА
+        total_returns=total_returns, 
         calculated_cash=calculated_cash,
         actual_closing_cash=shift.closing_cash,
         discrepancy=discrepancy
