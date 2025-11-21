@@ -87,6 +87,7 @@ class Client(Base):
     # НОВАЯ СВЯЗЬ: К какой компании принадлежит этот клиент
     company_id = Column(Integer, ForeignKey('companies.id'), nullable=False, index=True)
     company = relationship("Company", back_populates="clients")
+    transactions = relationship("Transaction", back_populates="client", cascade="all, delete-orphan")
 
 # НОВОЕ ПРАВИЛО: Код клиента и телефон должны быть уникальны ВНУТРИ ОДНОЙ КОМПАНИИ
     __table_args__ = (
@@ -424,3 +425,30 @@ class AuditLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     company = relationship("Company")
+
+class Transaction(Base):
+    """
+    История финансовых операций клиента (Долги и Оплаты).
+    """
+    __tablename__ = 'transactions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=False, index=True)
+    
+    # Сумма операции:
+    # Отрицательная (-1000) = Долг (Мы отдали товар/услугу, а денег не получили)
+    # Положительная (+1000) = Оплата (Клиент внес деньги)
+    amount = Column(Float, nullable=False) 
+    
+    # Тип операции: 'buyout' (выкуп), 'delivery' (доставка), 'payment' (оплата долга), 'manual' (корректировка)
+    transaction_type = Column(String, nullable=False) 
+    
+    description = Column(String, nullable=True) # Например: "Трек TE-1234"
+    
+    # Ссылка на конкретный заказ (если долг связан с заказом)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_by = Column(Integer, ForeignKey('employees.id'), nullable=True) # Кто оформил
+
+    client = relationship("Client", back_populates="transactions")
