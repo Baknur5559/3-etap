@@ -24,6 +24,24 @@
         width: 42rem; /* Задаем ширину (max-w-2xl) */
         min-height: 550px; /* Задаем минимальную высоту, чтобы список помещался */
     }
+    /* Стиль для вложенной таблицы заказов */
+   .order-details-row { background-color: #f8fafc; }
+   .order-sub-list { padding: 10px 20px; }
+   .order-sub-item { display: flex; align-items: center; padding: 4px 0; border-bottom: 1px dashed #e2e8f0; font-size: 0.85rem; color: #475569; }
+   .order-sub-item:last-child { border-bottom: none; }
+
+   /* Стили для детализации транзакций (Аккордеон в долгах) */
+.transaction-details-row {
+    background-color: #f9fafb; /* Светло-серый фон */
+    transition: all 0.3s ease;
+}
+.cursor-pointer {
+    cursor: pointer;
+}
+/* Анимация стрелки при открытии */
+.details-open .arrow-icon {
+    transform: rotate(180deg);
+}
 </style>
 </head>
 <body class="bg-gray-100">
@@ -364,6 +382,112 @@
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+</div>
+
+<div id="buyout-cart-modal" class="modal">
+    <div class="modal-content w-full max-w-6xl h-[90vh] flex flex-col">
+        <div class="flex justify-between items-start mb-4 border-b pb-2">
+            <div>
+                <h3 class="text-2xl font-bold text-gray-800">🛒 Корзина Выкупа</h3>
+                <p class="text-sm text-gray-500">Добавляйте клиентов и фиксируйте оплаты одним списком.</p>
+            </div>
+            <div class="flex items-center gap-4">
+                <div>
+                    <label class="text-xs font-bold text-gray-600 block">Курс сегодня (сом/юань):</label>
+                    <input type="number" id="buyout-cart-rate" class="border border-purple-300 rounded p-1 w-24 font-bold text-purple-700 text-center" step="0.01" placeholder="0.00">
+                </div>
+                <button onclick="closeModal('buyout-cart-modal')" class="text-4xl font-bold text-gray-400 hover:text-gray-600">&times;</button>
+            </div>
+        </div>
+
+        <div class="mb-4 relative z-20">
+            <input type="text" id="buyout-cart-search" placeholder="➕ Найти и добавить клиента (Имя, Телефон, Код)..." class="w-full p-3 border rounded-lg shadow-sm focus:ring-2 focus:ring-purple-500 text-lg">
+            <div id="buyout-cart-search-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-xl max-h-60 overflow-y-auto"></div>
+        </div>
+
+        <div class="flex-grow overflow-y-auto border rounded-lg bg-white shadow-inner relative">
+            <table class="w-full text-left border-collapse">
+                <thead class="bg-gray-100 sticky top-0 z-10 text-xs uppercase text-gray-600">
+                    <tr>
+                        <th class="p-3 border-b">Клиент</th>
+                        <th class="p-3 border-b text-center">Заказов</th>
+                        <th class="p-3 border-b text-right">Сумма (¥)</th>
+                        <th class="p-3 border-b text-right">Итог (сом)</th>
+                        <th class="p-3 border-b text-center w-48">Оплачено (сом)</th>
+                        <th class="p-3 border-b text-right">Долг</th>
+                        <th class="p-3 border-b text-center">Убрать</th>
+                    </tr>
+                </thead>
+                <tbody id="buyout-cart-table-body" class="text-sm">
+                    </tbody>
+            </table>
+            <div id="buyout-cart-empty-msg" class="flex flex-col items-center justify-center h-full text-gray-400">
+                <span class="text-5xl mb-2">🛒</span>
+                <p>Корзина пуста. Найдите клиента сверху.</p>
+            </div>
+        </div>
+
+        <div class="mt-auto border-t bg-gray-50 p-4 rounded-b-lg flex justify-between items-center">
+            <div class="text-sm text-gray-600">
+                Клиентов: <span id="buyout-cart-client-count" class="font-bold">0</span> | 
+                Заказов: <span id="buyout-cart-order-count" class="font-bold">0</span>
+            </div>
+            <div class="text-right flex gap-4 items-center">
+                <div>
+                    <div class="text-xs text-gray-500">Общая сумма выкупа:</div>
+                    <div id="buyout-cart-total-sum" class="text-xl font-bold text-gray-800">0 с.</div>
+                </div>
+                <button id="buyout-cart-submit-btn" class="bg-purple-600 text-white font-bold py-3 px-8 rounded-xl hover:bg-purple-700 shadow-lg transform active:scale-95 transition-all disabled:opacity-50" disabled>
+                    ✅ ВЫКУПИТЬ ВСЕХ
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="mass-track-update-modal" class="modal">
+    <div class="modal-content w-full max-w-4xl h-[85vh] flex flex-col">
+        <div class="flex justify-between items-center mb-4 border-b pb-2">
+            <h3 class="text-2xl font-bold text-gray-800">📝 Массовое обновление треков</h3>
+            <button onclick="closeModal('mass-track-update-modal')" class="text-2xl font-bold">&times;</button>
+        </div>
+        
+        <div class="mb-4 relative z-30">
+            <label class="block text-xs font-bold text-gray-500 mb-1">Сначала выберите клиента:</label>
+            <input type="text" id="mass-track-client-search" placeholder="🔍 Поиск клиента (Имя, Код)..." class="w-full p-3 border rounded-lg shadow-sm focus:ring-2 focus:ring-blue-500">
+            <div id="mass-track-client-results" class="absolute hidden top-full left-0 right-0 bg-white border mt-1 rounded-md shadow-xl max-h-60 overflow-y-auto"></div>
+            <input type="hidden" id="mass-track-selected-client-id">
+        </div>
+
+        <div class="bg-blue-50 p-3 rounded mb-4 text-sm text-blue-800 flex justify-between items-center">
+            <span id="mass-track-info-text">Выберите клиента, чтобы увидеть его заказы <b>PENDING...</b></span>
+        </div>
+
+        <div class="flex-grow overflow-y-auto border rounded-lg bg-white relative shadow-inner">
+            <table class="w-full text-left">
+                <thead class="bg-gray-100 sticky top-0 z-10 text-xs uppercase text-gray-600">
+                    <tr>
+                        <th class="p-3 border-b">Клиент</th>
+                        <th class="p-3 border-b">Товар / Коммент</th>
+                        <th class="p-3 border-b">Текущий PENDING</th>
+                        <th class="p-3 border-b w-1/3">⬇️ НОВЫЙ ТРЕК (Ввод)</th>
+                    </tr>
+                </thead>
+                <tbody id="mass-track-table-body" class="text-sm">
+                    </tbody>
+            </table>
+            <div id="mass-track-empty-msg" class="p-10 text-center text-gray-400 flex flex-col items-center">
+                <span class="text-4xl mb-2">👈</span>
+                <span>Воспользуйтесь поиском сверху</span>
+            </div>
+        </div>
+
+        <div class="mt-4 pt-4 border-t flex justify-end">
+            <button id="mass-track-save-btn" class="bg-blue-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-blue-700 shadow-md disabled:opacity-50" disabled>
+                💾 Сохранить и Уведомить
+            </button>
         </div>
     </div>
 </div>
@@ -3768,6 +3892,8 @@ async function renderOrdersTab() {
                     <div class="relative"> <button id="orders-toggle-party-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors">🗳️ Партии</button> <div id="orders-party-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-xl p-3 w-72 z-30 flex flex-col gap-2"> <div class="bg-gray-50 p-2 rounded border"> <p class="text-xs text-gray-500 font-bold mb-1">Фильтр списка:</p> <div class="flex items-center gap-1 mb-1"> <span class="text-xs text-gray-400">С:</span> <input type="date" id="party-filter-date-from" class="w-full p-1 border rounded text-xs"> </div> <div class="flex items-center gap-1"> <span class="text-xs text-gray-400">По:</span> <input type="date" id="party-filter-date-to" class="w-full p-1 border rounded text-xs"> </div> </div> <p class="font-semibold text-sm text-gray-700">Выберите партии:</p> <div id="orders-party-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm border-t border-b py-2"> Загрузка... </div> <div class="flex gap-2"> <button id="orders-apply-party-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Ок</button> <button id="orders-reset-party-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
                     <div class="relative"> <button id="orders-toggle-status-filter-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-indigo-600 hover:bg-indigo-100 text-sm transition-colors">🟢 Статусы</button> <div id="orders-status-filter-container" class="hidden absolute top-full mt-2 bg-white border rounded-lg shadow-lg p-3 w-60 z-30"> <div id="orders-status-list" class="space-y-1 max-h-60 overflow-y-auto mb-2 text-sm">Загрузка...</div> <div class="flex gap-2"> <button id="orders-apply-status-filter" class="flex-1 bg-indigo-600 text-white text-xs py-1.5 rounded hover:bg-indigo-700">Ок</button> <button id="orders-reset-status-filter" class="flex-1 bg-gray-300 text-black text-xs py-1.5 rounded hover:bg-gray-400">Сброс</button> </div> </div> </div>
                     <button id="open-manual-claim-btn" class="px-3 py-2 bg-yellow-100 border border-yellow-300 text-yellow-800 rounded-md shadow-sm font-bold hover:bg-yellow-200 text-sm transition-colors flex items-center gap-2">🙋‍♂️ Ручное</button>
+                    <button id="open-buyout-cart-btn" class="px-3 py-2 bg-purple-100 border border-purple-300 text-purple-800 rounded-md shadow-sm font-bold hover:bg-purple-200 text-sm transition-colors flex items-center gap-2">💰 Выкуп</button>
+                    <button id="open-mass-track-btn" class="px-3 py-2 bg-blue-100 border border-blue-300 text-blue-800 rounded-md shadow-sm font-bold hover:bg-blue-200 text-sm transition-colors flex items-center gap-2">📝 Треки</button>
                     ${locationFilterHtml} 
                     <div class="ml-auto flex gap-2">
                         <button id="orders-export-btn" class="px-3 py-2 bg-gray-100 rounded-md shadow-sm font-bold text-green-600 hover:bg-green-100 text-sm" title="Экспорт">📥</button>
@@ -3847,6 +3973,8 @@ async function renderOrdersTab() {
     replaceAndListen('orders-bulk-update-date-btn', 'click', handleBulkUpdatePartyDate);
     replaceAndListen('orders-bulk-delete-btn', 'click', handleBulkDeleteOrders);
     replaceAndListen('orders-bulk-buyout-btn', 'click', openBuyoutModal);
+    replaceAndListen('open-buyout-cart-btn', 'click', handleOpenBuyoutCart);
+    replaceAndListen('open-mass-track-btn', 'click', handleOpenMassTracks);
 
     // Список (Делегирование)
     const listContainer = document.getElementById('orders-list-container');
@@ -4925,6 +5053,7 @@ function handleOrdersSelectAll(e) {
 
 // index.html (Внутри МОДУЛЬ: ЗАКАЗЫ)
 
+// --- ПОЛНОСТЬЮ ОБНОВЛЕННАЯ ФУНКЦИЯ (v2.0 Debug) ---
 function handleOrderCheckboxChange(e) {
     // Проверяем, что клик был именно по чекбоксу заказа
     if (e.target.classList.contains('order-checkbox')) {
@@ -4945,42 +5074,47 @@ function handleOrderCheckboxChange(e) {
             // 1. Ищем заказы в кэше
             const selectedOrders = Array.from(selected).map(cb => {
                 // Пытаемся найти заказ по ID (превращаем всё в строки для надежности)
-                // Ищем и по value, и по dataset.orderId
                 const searchId = String(cb.value || cb.dataset.orderId);
                 return companyOrders.find(o => String(o.id) === searchId);
             }).filter(item => item !== undefined);
 
-            // 2. ЛОГИРОВАНИЕ (Смотри в F12 -> Console)
-            console.log("--- ПРОВЕРКА СТАТУСОВ ---");
+            // --- ЛОГИКА ДИАГНОСТИКИ (Смотреть F12 Console) ---
+            console.log(`[Debug] Выбрано заказов: ${selectedOrders.length}`);
             selectedOrders.forEach(o => {
-                console.log(`ID: ${o.id}, Трек: ${o.track_code}, Статус в базе: '${o.status}'`);
+                console.log(` -> ID: ${o.id}, Трек: ${o.track_code}, Статус (raw): '${o.status}'`);
             });
+            // --------------------------------------------------
 
-            // 3. Проверка статуса (Мягкое сравнение)
-            // Приводим к нижнему регистру и убираем пробелы: " Ожидает выкупа " -> "ожидает выкупа"
-            const allAwaitingBuyout = selectedOrders.length > 0 && selectedOrders.every(o => {
+            // 2. Проверка статуса (Мягкое сравнение: some = хотя бы один)
+            // Ищем, есть ли в списке хоть один заказ, который ждет выкупа
+            const hasAwaitingBuyout = selectedOrders.some(o => {
                 const s = String(o.status || '').trim().toLowerCase();
+                // Сравниваем с 'ожидает выкупа'
                 return s === 'ожидает выкупа';
             });
 
-            console.log("Результат проверки (нужен 'ожидает выкупа'):", allAwaitingBuyout);
+            console.log("[Debug] Есть ли 'Ожидает выкупа'?:", hasAwaitingBuyout);
 
-            if (allAwaitingBuyout) {
-                // --- РЕЖИМ ВЫКУПА (Показываем кнопку) ---
-                if (buyoutBtn) buyoutBtn.classList.remove('hidden');
-                if (assignBtn) assignBtn.classList.remove('hidden');
-                
-                // Скрываем ненужное
-                if (statusGroup) statusGroup.classList.add('hidden');
-                if (dateGroup) dateGroup.classList.add('hidden');
-            } else {
-                // --- ОБЫЧНЫЙ РЕЖИМ ---
-                if (buyoutBtn) buyoutBtn.classList.add('hidden');
-                
-                if (statusGroup) statusGroup.classList.remove('hidden');
-                if (dateGroup) dateGroup.classList.remove('hidden');
-                if (assignBtn) assignBtn.classList.remove('hidden');
+            // 3. Управление видимостью кнопок
+            
+            // Кнопка ВЫКУПИТЬ (Показываем, если есть подходящие заказы)
+            if (buyoutBtn) {
+                if (hasAwaitingBuyout) {
+                    buyoutBtn.classList.remove('hidden');
+                    // Можно добавить визуальный акцент
+                    buyoutBtn.classList.add('ring-2', 'ring-purple-300'); 
+                } else {
+                    buyoutBtn.classList.add('hidden');
+                    buyoutBtn.classList.remove('ring-2', 'ring-purple-300');
+                }
             }
+
+            // Остальные кнопки показываем ВСЕГДА, чтобы интерфейс не прыгал
+            // (Бэкенд сам запретит некорректные действия)
+            if (assignBtn) assignBtn.classList.remove('hidden');
+            if (statusGroup) statusGroup.classList.remove('hidden');
+            if (dateGroup) dateGroup.classList.remove('hidden');
+
         } else {
             // Ничего не выбрано
             bar.classList.add('hidden');
@@ -7259,25 +7393,106 @@ async function fetchAndRenderCurrentShiftReport() {
         const report = await apiFetch(url); 
 
         contentDiv.innerHTML = `
-            <div class="text-sm text-gray-500">
-                <p><strong>Сотрудник:</strong> ${report.employee_name || '?'}</p>
-                <p><strong>Филиал:</strong> ${report.location_name || '?'}</p>
-                <p><strong>Смена открыта:</strong> ${new Date(report.shift_start_time).toLocaleString()}</p>
-            </div>
-            <div class="border-t pt-4 mt-4 space-y-2 text-lg">
-                <div class="flex justify-between"><span>Наличные на начало:</span> <span class="font-semibold">${report.starting_cash.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-green-600"><span>Приход наличными (+):</span> <span class="font-semibold">${report.cash_income.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-blue-600"><span>Приход по карте (+):</span> <span class="font-semibold">${report.card_income.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-red-600"><span>Расходы (операционные) (-):</span> <span class="font-semibold">${report.total_expenses.toFixed(2)} сом</span></div>
-                <div class="flex justify-between text-yellow-600"><span>Возвраты (-):</span> <span class="font-semibold">${report.total_returns.toFixed(2)} сом</span></div>
-            </div>
-            <div class="border-t pt-4 mt-4">
-                <div class="flex justify-between text-xl font-bold">
-                    <span>Итого в кассе (расчет):</span>
-                    <span>${report.calculated_cash.toFixed(2)} сом</span>
+        <div class="bg-gray-50 p-4 rounded-xl border border-gray-100 mb-6">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                <div class="flex items-center space-x-3">
+                    <div class="p-2 bg-white rounded-full shadow-sm text-gray-500">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                    </div>
+                    <div>
+                        <p class="text-xs text-gray-400 uppercase font-bold tracking-wide">Сотрудник</p>
+                        <p class="font-semibold text-gray-800">${report.employee_name || 'Не указан'}</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-3">
+                    <div class="p-2 bg-white rounded-full shadow-sm text-gray-500">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    </div>
+                    <div>
+                        <p class="text-xs text-gray-400 uppercase font-bold tracking-wide">Филиал</p>
+                        <p class="font-semibold text-gray-800">${report.location_name || 'Не указан'}</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-3 sm:col-span-2 border-t border-gray-200 pt-3 mt-1">
+                    <div class="p-2 bg-white rounded-full shadow-sm text-gray-500">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    </div>
+                    <div>
+                        <p class="text-xs text-gray-400 uppercase font-bold tracking-wide">Время открытия</p>
+                        <p class="font-medium text-gray-700">${new Date(report.shift_start_time).toLocaleString('ru-RU')}</p>
+                    </div>
                 </div>
             </div>
-        `;
+        </div>
+
+        <div class="space-y-4">
+            
+            <div class="flex justify-between items-center p-3 rounded-lg hover:bg-gray-50 transition">
+                <span class="text-gray-600 font-medium">🏁 Наличные на начало</span>
+                <span class="text-lg font-bold text-gray-800">${report.starting_cash.toFixed(2)} <span class="text-xs font-normal text-gray-400">сом</span></span>
+            </div>
+
+            <div class="pl-4 border-l-4 border-green-400 space-y-4">
+                
+                <div>
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="block text-gray-700 font-bold">📥 Приход Наличными</span>
+                        <span class="text-lg font-bold text-green-600">+${report.cash_income.toFixed(2)} с.</span>
+                    </div>
+                    <div class="bg-green-50 p-2 rounded text-xs text-gray-600 space-y-1">
+                        <div class="flex justify-between">
+                            <span>📦 Выдача товаров:</span>
+                            <span class="font-medium">+${(report.cash_from_orders || 0).toFixed(2)} с.</span>
+                        </div>
+                        <div class="flex justify-between border-t border-green-100 pt-1">
+                            <span>💸 Оплата долгов:</span>
+                            <span class="font-medium">+${(report.cash_from_debts || 0).toFixed(2)} с.</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="block text-gray-700 font-bold">💳 Приход Картой</span>
+                        <span class="text-lg font-bold text-blue-600">+${report.card_income.toFixed(2)} с.</span>
+                    </div>
+                    <div class="bg-blue-50 p-2 rounded text-xs text-gray-600 space-y-1">
+                        <div class="flex justify-between">
+                            <span>📦 Выдача товаров:</span>
+                            <span class="font-medium">+${(report.card_from_orders || 0).toFixed(2)} с.</span>
+                        </div>
+                        <div class="flex justify-between border-t border-blue-100 pt-1">
+                            <span>💸 Оплата долгов:</span>
+                            <span class="font-medium">+${(report.card_from_debts || 0).toFixed(2)} с.</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pl-4 border-l-4 border-red-400 space-y-3">
+                <div class="flex justify-between items-center">
+                    <span class="text-gray-700 font-medium">📤 Расходы (операционные)</span>
+                    <span class="text-lg font-bold text-red-600">-${report.total_expenses.toFixed(2)} с.</span>
+                </div>
+                <div class="flex justify-between items-center">
+                    <span class="text-gray-700 font-medium">↩️ Возвраты</span>
+                    <span class="text-lg font-bold text-yellow-600">-${report.total_returns.toFixed(2)} с.</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="mt-8 p-5 bg-indigo-50 rounded-xl border border-indigo-100">
+            <div class="flex justify-between items-end">
+                <div class="text-indigo-900">
+                    <p class="text-xs font-bold uppercase tracking-widest opacity-60">Расчетный итог</p>
+                    <p class="text-xl font-bold">В КАССЕ (Нал):</p>
+                </div>
+                <div class="text-3xl font-extrabold text-indigo-700">
+                    ${report.calculated_cash.toFixed(2)} <span class="text-lg font-medium text-indigo-400">сом</span>
+                </div>
+            </div>
+        </div>
+    `;
     } catch (e) {
         // Если 404 - смены нет, если 403 - нет прав
         contentDiv.innerHTML = `<p class="text-red-500 font-semibold">Ошибка загрузки отчета: ${e.message}</p>`;
@@ -9147,16 +9362,40 @@ async function toggleDebtorDetails(clientId) {
              `;
         }
 
-        // КНОПКА ПОГАШЕНИЯ (Общая)
+        // Проверка: есть ли активная смена? (Используем глобальную переменную activeShift)
+        const hasShift = (typeof activeShift !== 'undefined' && activeShift !== null);
+        const shiftCheckboxState = hasShift ? 'checked' : 'disabled';
+        const shiftLabelClass = hasShift ? 'text-gray-700' : 'text-gray-400 line-through';
+        const shiftTitle = hasShift ? 'Деньги попадут в отчет текущей смены' : 'Смена закрыта. Деньги пойдут на общий баланс.';
+
         html += `
-            <div class="mt-4 pt-3 border-t flex justify-end items-center gap-3">
-                <span class="text-sm text-gray-600">Внести оплату:</span>
-                <div class="flex gap-2">
-                    <input type="number" id="repay-amount-${clientId}" placeholder="Сумма" class="border rounded p-2 w-32 text-sm">
-                    <button class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 font-bold text-sm repay-btn" 
+            <div class="mt-4 pt-3 border-t bg-gray-100 p-3 rounded-b-lg">
+                <div class="flex flex-wrap items-end gap-3 justify-end">
+                    
+                    <div class="flex flex-col">
+                        <label class="text-xs text-gray-500 mb-1">Метод:</label>
+                        <select id="repay-method-${clientId}" class="border rounded p-2 text-sm bg-white w-32">
+                            <option value="cash">💵 Наличные</option>
+                            <option value="card">💳 Карта/MBank</option>
+                        </select>
+                    </div>
+
+                    <div class="flex flex-col">
+                        <label class="text-xs text-gray-500 mb-1">Сумма:</label>
+                        <input type="number" id="repay-amount-${clientId}" placeholder="0" class="border rounded p-2 w-32 text-sm font-bold">
+                    </div>
+
+                    <button class="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 font-bold text-sm repay-btn h-[38px]" 
                             data-client-id="${clientId}">
-                        Оплатить
+                        Внести
                     </button>
+                </div>
+                
+                <div class="mt-2 flex justify-end">
+                    <label class="flex items-center cursor-pointer" title="${shiftTitle}">
+                        <input type="checkbox" id="repay-shift-link-${clientId}" class="h-4 w-4 text-green-600 rounded border-gray-300 focus:ring-green-500" ${shiftCheckboxState}>
+                        <span class="ml-2 text-xs ${shiftLabelClass}">В кассу смены? ${!hasShift ? '(Смена закрыта)' : ''}</span>
+                    </label>
                 </div>
             </div>
         `;
@@ -9168,17 +9407,67 @@ async function toggleDebtorDetails(clientId) {
     }
 }
 
-// Вспомогательная: Рендер блока (таблицы)
+// Вспомогательная: Рендер блока (таблицы) с АККОРДЕОНОМ
 function renderDebtBlock(title, items, color) {
     const colorClass = color === 'red' ? 'text-red-700 bg-red-50 border-red-100' : 'text-blue-700 bg-blue-50 border-blue-100';
     
-    const rows = items.map(t => `
-        <tr class="border-b last:border-0 text-sm">
-            <td class="p-2 text-gray-500">${new Date(t.created_at).toLocaleDateString()}</td>
-            <td class="p-2 font-medium text-gray-800">${t.description || '—'}</td>
-            <td class="p-2 text-right font-bold ${color === 'red' ? 'text-red-600' : 'text-blue-600'}">${t.amount.toFixed(0)} с.</td>
-        </tr>
-    `).join('');
+    const rows = items.map(t => {
+        const dateStr = new Date(t.created_at).toLocaleDateString();
+        const amountStr = t.amount.toFixed(0);
+        const hasDetails = t.details && t.details.length > 0;
+        const cursorClass = hasDetails ? 'cursor-pointer hover:bg-gray-50' : '';
+        const detailsId = `trx-details-${t.id}`;
+        
+        // Генерируем HTML деталей (если есть)
+        let detailsHtml = '';
+        if (hasDetails) {
+            const listItems = t.details.map(d => {
+                // Разный вид для Выкупа и Доставки
+                if (t.transaction_type === 'buyout') {
+                    return `
+                        <div class="flex justify-between text-xs py-1 border-b border-gray-100 last:border-0">
+                            <span>📦 <b>${d.track}</b> <span class="text-gray-500 italic">(${d.comm})</span></span>
+                            <span>${d.cny || '?'} ¥</span>
+                        </div>`;
+                } else { // delivery
+                    const cost = d.cost ? parseFloat(d.cost).toFixed(0) : '?';
+                    const weight = d.weight ? parseFloat(d.weight).toFixed(2) : '?';
+                    return `
+                        <div class="flex justify-between text-xs py-1 border-b border-gray-100 last:border-0">
+                            <span>🚚 <b>${d.track}</b> <span class="text-gray-500 italic">(${d.comm})</span></span>
+                            <span>${weight} кг / ${cost} с.</span>
+                        </div>`;
+                }
+            }).join('');
+            
+            detailsHtml = `
+                <tr id="${detailsId}" class="hidden bg-gray-50">
+                    <td colspan="3" class="p-2">
+                        <div class="pl-4 border-l-2 border-${color}-300 text-gray-600">
+                            ${listItems}
+                        </div>
+                    </td>
+                </tr>
+            `;
+        }
+
+        // Строка таблицы
+        return `
+            <tr class="border-b last:border-0 text-sm transition-colors ${cursorClass}" 
+                ${hasDetails ? `onclick="document.getElementById('${detailsId}').classList.toggle('hidden')"` : ''}>
+                
+                <td class="p-2 text-gray-500 whitespace-nowrap align-top">
+                    ${hasDetails ? '<span class="mr-1 text-xs">▼</span>' : ''}
+                    ${dateStr}
+                </td>
+                <td class="p-2 font-medium text-gray-800 align-top">${t.description || '—'}</td>
+                <td class="p-2 text-right font-bold ${color === 'red' ? 'text-red-600' : 'text-blue-600'} align-top">
+                    ${amountStr} с.
+                </td>
+            </tr>
+            ${detailsHtml}
+        `;
+    }).join('');
 
     return `
         <div class="mb-3 border rounded-lg overflow-hidden ${colorClass}">
@@ -9194,14 +9483,22 @@ async function handleDebtorActions(e) {
     if (e.target.classList.contains('repay-btn')) {
         const clientId = e.target.dataset.clientId;
         const input = document.getElementById(`repay-amount-${clientId}`);
+        const methodSelect = document.getElementById(`repay-method-${clientId}`);
+        const shiftCheckbox = document.getElementById(`repay-shift-link-${clientId}`);
+        
         const amount = parseFloat(input.value);
+        const method = methodSelect.value;
+        const linkToShift = shiftCheckbox.checked;
 
         if (!amount || amount <= 0) {
             alert("Введите сумму больше 0.");
             return;
         }
 
-        if (!confirm(`Принять оплату ${amount} сом от клиента?`)) return;
+        const methodText = method === 'cash' ? 'Наличными' : 'Картой';
+        const shiftText = linkToShift ? 'В КАССУ смены' : 'МИМО кассы (на баланс)';
+
+        if (!confirm(`Принять оплату ${amount} сом (${methodText})?\n\nКуда: ${shiftText}`)) return;
 
         showLoader();
         try {
@@ -9210,12 +9507,14 @@ async function handleDebtorActions(e) {
                 body: JSON.stringify({
                     client_id: parseInt(clientId),
                     amount: amount,
-                    description: "Погашение через Админку"
+                    description: "Погашение долга через Админку",
+                    payment_method: method,      // <-- Новое
+                    link_to_shift: linkToShift   // <-- Новое
                 })
             });
             alert("Оплата принята!");
             
-            // Перезагружаем список, чтобы обновить баланс
+            // Перезагружаем список
             fetchAndRenderDebtors();
             
         } catch (e) {
@@ -9238,6 +9537,522 @@ function handleDebtorsSearch(e) {
         }
     });
 }
+
+// ==========================================
+// МОДУЛЬ: КОРЗИНА ВЫКУПА (JS)
+// ==========================================
+
+let buyoutCartData = []; // [{client, orders: [], paid: 0}, ...]
+
+// 2. Поиск и добавление клиента
+document.getElementById('buyout-cart-search')?.addEventListener('input', (e) => {
+    handleGenericClientSearch(e.target, document.getElementById('buyout-cart-search-results'), async (client) => {
+        // При выборе клиента
+        document.getElementById('buyout-cart-search').value = '';
+        document.getElementById('buyout-cart-search-results').classList.add('hidden');
+        await addClientToBuyoutCart(client);
+    });
+});
+
+// 3. Логика добавления
+async function addClientToBuyoutCart(client) {
+    // Проверка на дубликат в корзине
+    if (buyoutCartData.find(item => item.client.id === client.id)) {
+        alert("Этот клиент уже в корзине!");
+        return;
+    }
+
+    // Загружаем заказы "Ожидает выкупа"
+    try {
+        const params = new URLSearchParams({
+            client_id: client.id,
+            statuses: "Ожидает выкупа",
+            company_id: currentCompany.id, // Владелец только своей компании
+            limit: 100
+        });
+        const orders = await apiFetch(`/api/orders?${params.toString()}`);
+        
+        if (!orders || orders.length === 0) {
+            alert(`У клиента ${client.full_name} нет заказов со статусом 'Ожидает выкупа'.`);
+            return;
+        }
+
+        // Добавляем в массив
+        buyoutCartData.push({
+            client: client,
+            orders: orders,
+            paid: 0 // По умолчанию 0
+        });
+        
+        renderBuyoutCartTable();
+
+    } catch (e) {
+        console.error(e);
+        alert("Ошибка загрузки заказов клиента.");
+    }
+}
+
+function renderBuyoutCartTable() {
+    const tbody = document.getElementById('buyout-cart-table-body');
+    const emptyMsg = document.getElementById('buyout-cart-empty-msg');
+    const rate = parseFloat(document.getElementById('buyout-cart-rate').value) || 0;
+    
+    tbody.innerHTML = '';
+    
+    if (buyoutCartData.length === 0) {
+        emptyMsg.classList.remove('hidden');
+        updateBuyoutTotals(0, 0);
+        return;
+    }
+    emptyMsg.classList.add('hidden');
+
+    buyoutCartData.forEach((item, index) => {
+        // Инициализируем флаг included (если его нет), по умолчанию true
+        item.orders.forEach(o => { if(typeof o.is_included === 'undefined') o.is_included = true; });
+
+        // 1. Считаем (только включенные!)
+        let totalCny = 0;
+        let activeOrdersCount = 0;
+        
+        item.orders.forEach(o => {
+            if (o.is_included) {
+                const cost = o.buyout_item_cost_cny || 0;
+                const comm = o.buyout_commission_percent || 0;
+                totalCny += cost * (1 + comm / 100);
+                activeOrdersCount++;
+            }
+        });
+        
+        const totalSom = Math.ceil(totalCny * rate);
+        const debt = totalSom - item.paid;
+        const debtColor = debt > 0 ? 'text-red-600' : 'text-green-600';
+
+        // 2. Генерируем HTML (Главная строка + Строка деталей)
+        // Главная строка
+        const trMain = document.createElement('tr');
+        trMain.className = "border-b hover:bg-gray-50 main-row";
+        trMain.innerHTML = `
+            <td class="p-3">
+                <button class="mr-2 text-gray-500 hover:text-purple-600 transition-transform transform duration-200 toggle-details-btn" data-index="${index}">
+                    ▼
+                </button>
+                <span class="font-bold">${item.client.full_name}</span>
+            </td>
+            <td class="p-3 text-center font-bold text-blue-600" id="cart-row-count-${index}">${activeOrdersCount}</td>
+            <td class="p-3 text-right font-mono" id="cart-row-cny-${index}">${totalCny.toFixed(2)} ¥</td>
+            <td class="p-3 text-right font-bold" id="cart-row-som-${index}">${totalSom} с.</td>
+            <td class="p-3 text-center">
+                <div class="flex items-center justify-center gap-1">
+                    <input type="number" class="border rounded p-1 w-24 text-center paid-input" data-index="${index}" value="${item.paid > 0 ? item.paid : ''}" placeholder="0">
+                    <button class="text-xs bg-gray-200 px-2 py-1 rounded hover:bg-gray-300 set-full-btn" data-index="${index}">Все</button>
+                </div>
+            </td>
+            <td id="cart-row-debt-${index}" class="p-3 text-right font-bold ${debtColor}">${debt > 0 ? '-' + debt : '0'} с.</td>
+            <td class="p-3 text-center">
+                <button class="text-red-500 hover:text-red-700 remove-row-btn" data-index="${index}">&times;</button>
+            </td>
+        `;
+        tbody.appendChild(trMain);
+
+        // Строка деталей (Аккордеон) - Скрыта по умолчанию
+        const trDetails = document.createElement('tr');
+        trDetails.id = `details-row-${index}`;
+        trDetails.className = "order-details-row hidden";
+        
+        let ordersListHtml = item.orders.map((o, orderIdx) => `
+            <div class="order-sub-item">
+                <input type="checkbox" class="sub-item-checkbox mr-3 h-4 w-4 text-purple-600 rounded border-gray-300 focus:ring-purple-500" 
+                       data-client-index="${index}" 
+                       data-order-idx="${orderIdx}"
+                       ${o.is_included ? 'checked' : ''}>
+                
+                <div class="flex-grow grid grid-cols-12 gap-2">
+                    <div class="col-span-4 font-mono text-xs text-gray-600 break-all">${o.track_code}</div>
+                    <div class="col-span-4 text-xs italic text-gray-500 truncate">${o.comment || '-'}</div>
+                    <div class="col-span-2 text-xs text-right">${o.buyout_item_cost_cny || 0} ¥</div>
+                    <div class="col-span-2 text-xs text-right text-gray-400">${o.buyout_commission_percent}%</div>
+                </div>
+            </div>
+        `).join('');
+
+        trDetails.innerHTML = `
+            <td colspan="7" class="p-0">
+                <div class="order-sub-list border-l-4 border-purple-200 ml-4">
+                    ${ordersListHtml}
+                </div>
+            </td>
+        `;
+        tbody.appendChild(trDetails);
+    });
+
+    recalculateFooter();
+    setupBuyoutTableListeners(); // Переподключаем все слушатели
+}
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПЕРЕСЧЕТА ---
+
+function recalculateSingleRow(index) {
+    const item = buyoutCartData[index];
+    const rate = parseFloat(document.getElementById('buyout-cart-rate').value) || 0;
+    
+    // Считаем ТОЛЬКО включенные (is_included = true)
+    let totalCny = 0;
+    let activeCount = 0;
+
+    item.orders.forEach(o => {
+        if (o.is_included) { // <--- ВАЖНОЕ ИЗМЕНЕНИЕ
+            const cost = o.buyout_item_cost_cny || 0;
+            const comm = o.buyout_commission_percent || 0;
+            totalCny += cost * (1 + comm / 100);
+            activeCount++;
+        }
+    });
+
+    const totalSom = Math.ceil(totalCny * rate);
+    const debt = totalSom - item.paid;
+    
+    // Обновляем ячейки в DOM
+    const countCell = document.getElementById(`cart-row-count-${index}`);
+    const cnyCell = document.getElementById(`cart-row-cny-${index}`);
+    const somCell = document.getElementById(`cart-row-som-${index}`);
+    const debtCell = document.getElementById(`cart-row-debt-${index}`);
+
+    if(countCell) countCell.textContent = activeCount;
+    if(cnyCell) cnyCell.textContent = `${totalCny.toFixed(2)} ¥`;
+    if(somCell) somCell.textContent = `${totalSom} с.`;
+
+    if (debtCell) {
+        debtCell.textContent = debt > 0 ? `-${debt} с.` : '0 с.';
+        if (debt > 0) {
+            debtCell.classList.remove('text-green-600');
+            debtCell.classList.add('text-red-600');
+        } else {
+            debtCell.classList.remove('text-red-600');
+            debtCell.classList.add('text-green-600');
+        }
+    }
+}
+
+function recalculateFooter() {
+    const rate = parseFloat(document.getElementById('buyout-cart-rate').value) || 0;
+    let grandTotalSom = 0;
+    let totalOrders = 0;
+
+    buyoutCartData.forEach(item => {
+        let totalCny = 0;
+        item.orders.forEach(o => {
+            const cost = o.buyout_item_cost_cny || 0;
+            const comm = o.buyout_commission_percent || 0;
+            totalCny += cost * (1 + comm / 100);
+        });
+        grandTotalSom += Math.ceil(totalCny * rate);
+        totalOrders += item.orders.length;
+    });
+
+    // Обновляем подвал (используем существующую функцию updateBuyoutTotals)
+    updateBuyoutTotals(buyoutCartData.length, totalOrders, grandTotalSom);
+}
+
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ СЛУШАТЕЛЕЙ (Без перерисовки) ---
+function setupBuyoutTableListeners() {
+    // 1. Изменение оплаты (Живой пересчет)
+    document.querySelectorAll('.paid-input').forEach(input => {
+        // Удаляем старые слушатели через клонирование, чтобы не двоились
+        const newInput = input.cloneNode(true);
+        input.parentNode.replaceChild(newInput, input);
+
+        newInput.addEventListener('input', (e) => {
+            const idx = parseInt(e.target.dataset.index);
+            const val = parseFloat(e.target.value); // Может быть NaN, если пусто
+            
+            // Обновляем данные в памяти
+            buyoutCartData[idx].paid = isNaN(val) ? 0 : val;
+
+            // --- ТОЧЕЧНОЕ ОБНОВЛЕНИЕ (БЕЗ ПЕРЕРИСОВКИ) ---
+            recalculateSingleRow(idx);
+            recalculateFooter();
+        });
+    });
+
+    // 2. Кнопка "Все"
+    document.querySelectorAll('.set-full-btn').forEach(btn => {
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+
+        newBtn.addEventListener('click', (e) => {
+            const idx = parseInt(e.target.dataset.index);
+            const amount = parseFloat(e.target.dataset.amount);
+            
+            // Обновляем данные
+            buyoutCartData[idx].paid = amount;
+            
+            // Обновляем инпут визуально
+            const inputField = document.querySelector(`.paid-input[data-index="${idx}"]`);
+            if (inputField) inputField.value = amount;
+
+            // Пересчитываем
+            recalculateSingleRow(idx);
+            recalculateFooter();
+        });
+    });
+
+    // 3. Удаление (Тут нужна перерисовка, так как строка исчезает)
+    document.querySelectorAll('.remove-row-btn').forEach(btn => {
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+
+        newBtn.addEventListener('click', (e) => {
+            const idx = parseInt(e.target.dataset.index);
+            buyoutCartData.splice(idx, 1);
+            renderBuyoutCartTable(); // Тут полная перерисовка нужна
+        });
+    });
+
+    // 4. Аккордеон (Стрелка)
+    document.querySelectorAll('.toggle-details-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const idx = e.target.dataset.index;
+            const detailsRow = document.getElementById(`details-row-${idx}`);
+            const arrow = e.target;
+            
+            if (detailsRow.classList.contains('hidden')) {
+                detailsRow.classList.remove('hidden');
+                arrow.style.transform = "rotate(180deg)";
+            } else {
+                detailsRow.classList.add('hidden');
+                arrow.style.transform = "rotate(0deg)";
+            }
+        });
+    });
+
+    // 5. Галочки товаров (Вкл/Выкл)
+    document.querySelectorAll('.sub-item-checkbox').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            const clientIdx = parseInt(e.target.dataset.clientIndex);
+            const orderIdx = parseInt(e.target.dataset.orderIdx);
+            const isChecked = e.target.checked;
+
+            // Обновляем данные в памяти
+            buyoutCartData[clientIdx].orders[orderIdx].is_included = isChecked;
+
+            // Пересчитываем строку и подвал
+            recalculateSingleRow(clientIdx);
+            recalculateFooter();
+        });
+    });
+}
+
+
+// Пересчет при смене курса
+document.getElementById('buyout-cart-rate')?.addEventListener('input', renderBuyoutCartTable);
+
+function updateBuyoutTotals(clients, orders, sum = 0) {
+    document.getElementById('buyout-cart-client-count').textContent = clients;
+    document.getElementById('buyout-cart-order-count').textContent = orders;
+    document.getElementById('buyout-cart-total-sum').textContent = sum.toLocaleString() + ' с.';
+    document.getElementById('buyout-cart-submit-btn').disabled = clients === 0;
+}
+
+// 5. Отправка (ВЫКУПИТЬ ВСЕХ)
+document.getElementById('buyout-cart-submit-btn')?.addEventListener('click', async () => {
+    const rate = parseFloat(document.getElementById('buyout-cart-rate').value);
+    if (!rate || rate <= 0) { alert("Введите корректный курс!"); return; }
+
+    if (!confirm(`Выкупить заказы для ${buyoutCartData.length} клиентов по курсу ${rate}?`)) return;
+
+    const payload = {
+        exchange_rate: rate,
+        items: buyoutCartData.map(d => ({
+            client_id: d.client.id,
+            paid_amount: d.paid,
+            order_ids: d.orders.map(o => o.id),
+            order_ids: d.orders.filter(o => o.is_included).map(o => o.id)
+        })).filter(item => item.order_ids.length > 0) // Убираем клиентов без заказов
+    };
+
+    showLoader();
+    try {
+        const res = await apiFetch('/api/orders/buyout_cart', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        });
+        alert(res.message);
+        closeModal('buyout-cart-modal');
+        if (typeof fetchAndRenderOrders === 'function') fetchAndRenderOrders();
+    } catch (e) {
+        alert("Ошибка: " + e.message);
+    } finally {
+        hideLoader();
+    }
+});
+
+// --- НОВЫЕ ФУНКЦИИ ОТКРЫТИЯ МОДАЛОК ---
+
+function handleOpenBuyoutCart() {
+    console.log("Открываем корзину выкупа...");
+    buyoutCartData = []; // Очищаем данные
+    renderBuyoutCartTable();
+    
+    // Ставим курс из активной смены или дефолт
+    const rateInput = document.getElementById('buyout-cart-rate');
+    if (rateInput) {
+        if (activeShift && activeShift.exchange_rate_usd) {
+            rateInput.value = activeShift.exchange_rate_usd;
+        } else {
+            rateInput.value = 12.8; // Дефолт
+        }
+    }
+    
+    openModal('buyout-cart-modal');
+    // Фокус на поиске с небольшой задержкой
+    setTimeout(() => document.getElementById('buyout-cart-search')?.focus(), 100);
+}
+
+function handleOpenMassTracks() {
+    console.log("Открываем массовые треки...");
+    openModal('mass-track-update-modal');
+    if (typeof loadPendingTracks === 'function') {
+        loadPendingTracks();
+    } else {
+        console.error("Функция loadPendingTracks не найдена!");
+    }
+}
+
+// ==========================================
+// МОДУЛЬ: МАССОВОЕ ОБНОВЛЕНИЕ ТРЕКОВ (V2.0 - С Фильтром)
+// ==========================================
+
+// Открытие окна
+function handleOpenMassTracks() {
+    console.log("Открываем массовые треки...");
+    
+    // Сброс интерфейса
+    document.getElementById('mass-track-client-search').value = '';
+    document.getElementById('mass-track-selected-client-id').value = '';
+    document.getElementById('mass-track-client-results').classList.add('hidden');
+    document.getElementById('mass-track-table-body').innerHTML = '';
+    document.getElementById('mass-track-empty-msg').classList.remove('hidden');
+    document.getElementById('mass-track-info-text').innerHTML = 'Выберите клиента, чтобы увидеть его заказы <b>PENDING...</b>';
+    document.getElementById('mass-track-save-btn').disabled = true;
+
+    openModal('mass-track-update-modal');
+    setTimeout(() => document.getElementById('mass-track-client-search').focus(), 100);
+}
+
+// Поиск клиента в модалке
+document.getElementById('mass-track-client-search')?.addEventListener('input', (e) => {
+    handleGenericClientSearch(e.target, document.getElementById('mass-track-client-results'), (client) => {
+        // При выборе клиента
+        document.getElementById('mass-track-client-search').value = `${client.full_name} (${client.client_code_prefix}${client.client_code_num})`;
+        document.getElementById('mass-track-selected-client-id').value = client.id;
+        document.getElementById('mass-track-client-results').classList.add('hidden');
+        
+        // Загружаем его заказы
+        loadPendingTracksForClient(client);
+    });
+});
+
+// Загрузка PENDING заказов конкретного клиента
+async function loadPendingTracksForClient(client) {
+    const tbody = document.getElementById('mass-track-table-body');
+    const emptyMsg = document.getElementById('mass-track-empty-msg');
+    const infoText = document.getElementById('mass-track-info-text');
+    
+    tbody.innerHTML = '<tr><td colspan="4" class="text-center p-4 animate-pulse">Загрузка заказов...</td></tr>';
+    emptyMsg.classList.add('hidden');
+
+    try {
+        // Запрашиваем заказы: Статус "Выкуплен" + ClientID
+        const params = new URLSearchParams({
+            statuses: "Выкуплен",
+            client_id: client.id,
+            company_id: currentCompany.id,
+            limit: 100
+        });
+        
+        const orders = await apiFetch(`/api/orders?${params.toString()}`);
+        
+        // Фильтруем только PENDING на клиенте (или можно было uncalculated_only=false, но тут другое)
+        const pendingOrders = orders.filter(o => o.track_code.startsWith("PENDING"));
+
+        tbody.innerHTML = '';
+        
+        if (pendingOrders.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center p-4 text-gray-500">Нет заказов PENDING со статусом "Выкуплен".</td></tr>';
+            document.getElementById('mass-track-save-btn').disabled = true;
+            return;
+        }
+
+        infoText.innerHTML = `Найдено <b>${pendingOrders.length}</b> временных треков для <b>${client.full_name}</b>`;
+        document.getElementById('mass-track-save-btn').disabled = false;
+
+        pendingOrders.forEach(o => {
+            const row = document.createElement('tr');
+            row.className = "border-b hover:bg-gray-50";
+            row.innerHTML = `
+                <td class="p-3 font-bold text-gray-700">${client.full_name}</td>
+                <td class="p-3 text-gray-600 text-xs">
+                    ${o.purchase_type === 'Выкуп' ? '<span class="bg-purple-100 text-purple-800 px-1 rounded">Выкуп</span>' : ''}
+                    ${o.comment || '-'}
+                </td>
+                <td class="p-3 text-gray-400 font-mono text-xs select-all">${o.track_code}</td>
+                <td class="p-2">
+                    <input type="text" class="new-track-input w-full border border-blue-300 rounded p-2 focus:ring-2 focus:ring-blue-500 bg-blue-50 font-mono" 
+                           data-order-id="${o.id}" placeholder="Сканируйте новый трек">
+                </td>
+            `;
+            tbody.appendChild(row);
+        });
+        
+        // Авто-фокус на первое поле ввода
+        const firstInput = document.querySelector('.new-track-input');
+        if(firstInput) firstInput.focus();
+
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="4" class="text-red-500 text-center p-4">Ошибка: ${e.message}</td></tr>`;
+    }
+}
+
+// Сохранение
+document.getElementById('mass-track-save-btn')?.addEventListener('click', async () => {
+    const inputs = document.querySelectorAll('.new-track-input');
+    const updates = [];
+
+    inputs.forEach(input => {
+        const val = input.value.trim();
+        // Если поле не пустое и отличается от "PENDING" (защита от дурака)
+        if (val.length > 5 && !val.startsWith("PENDING")) {
+            updates.push({
+                order_id: parseInt(input.dataset.orderId),
+                new_track_code: val
+            });
+        }
+    });
+
+    if (updates.length === 0) {
+        alert("Вы не ввели ни одного нового трек-кода.");
+        return;
+    }
+
+    if (!confirm(`Обновить ${updates.length} треков и отправить уведомление клиенту?`)) return;
+
+    showLoader();
+    try {
+        const res = await apiFetch('/api/orders/mass_update_tracks', {
+            method: 'POST',
+            body: JSON.stringify({ updates: updates })
+        });
+        alert(res.message);
+        
+        closeModal('mass-track-update-modal');
+        if (typeof fetchAndRenderOrders === 'function') fetchAndRenderOrders();
+        
+    } catch (e) {
+        alert("Ошибка: " + e.message);
+    } finally {
+        hideLoader();
+    }
+});
 
 </script>
 </body>
