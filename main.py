@@ -543,6 +543,12 @@ class ShiftReport(BaseModel):
     starting_cash: float
     cash_income: float = 0
     card_income: float = 0
+    # --- ДОБАВЛЯЕМ ЭТИ СТРОКИ (Детализация) ---
+    cash_from_orders: float = 0  # Нал за выдачу
+    cash_from_debts: float = 0   # Нал за долги
+    card_from_orders: float = 0  # Карта за выдачу
+    card_from_debts: float = 0   # Карта за долги
+    # ------------------------------------------
     total_expenses: float = 0 # Расходы БЕЗ зарплат/авансов
     total_returns: float = 0
     calculated_cash: float # Расчетный остаток на конец
@@ -1716,6 +1722,7 @@ class TransactionOut(TransactionBase):
     client_id: int
     created_at: datetime
     order_id: Optional[int] = None
+    details: Optional[list] = None
     class Config:
         from_attributes = True
 
@@ -1728,6 +1735,9 @@ class RepayDebtPayload(BaseModel):
     client_id: int
     amount: float
     description: Optional[str] = "Погашение долга"
+    # --- НОВЫЕ ПОЛЯ ---
+    payment_method: str = "cash" # 'cash' или 'card'
+    link_to_shift: bool = True   # Положить деньги в кассу смены?
 
 class BulkClientItem(BaseModel):
     full_name: str
@@ -2358,6 +2368,23 @@ class BulkActionPayload(BaseModel):
     total_weight: Optional[float] = None
     price_per_kg: Optional[float] = None
     exchange_rate: Optional[float] = None
+
+# --- МОДЕЛИ ДЛЯ КОРЗИНЫ ВЫКУПА И ТРЕКОВ ---
+class BuyoutCartItem(BaseModel):
+    client_id: int
+    paid_amount: float = 0.0 # Сколько клиент скинул денег
+    order_ids: List[int] # Какие заказы выкупаем
+
+class BuyoutCartPayload(BaseModel):
+    exchange_rate: float
+    items: List[BuyoutCartItem] # Список клиентов и их оплат
+
+class TrackUpdateItem(BaseModel):
+    order_id: int
+    new_track_code: str
+
+class MassTrackUpdatePayload(BaseModel):
+    updates: List[TrackUpdateItem]
 
 # Используется для расчета стоимости
 class CalculateOrderItem(BaseModel):
@@ -3266,7 +3293,240 @@ def bulk_order_action(
 
     else:
         raise HTTPException(status_code=400, detail="Неизвестное действие.")
+    
+# --- НОВЫЕ ЭНДПОИНТЫ: ВЫКУП-КОРЗИНА И ТРЕКИ ---
 
+@app.post("/api/orders/buyout_cart", tags=["Заказы (Владелец)"])
+def process_buyout_cart(
+    payload: BuyoutCartPayload,
+    employee: Employee = Depends(get_company_owner), # Только Владелец
+    db: Session = Depends(get_db)
+):
+    """
+    Обрабатывает 'Корзину Выкупа':
+    1. Меняет статус заказов на 'Выкуплен'.
+    2. Записывает курс.
+    3. Создает транзакции: ДОЛГ (минус стоимость) и ОПЛАТА (плюс, если внесено).
+    """
+    processed_clients = 0
+    total_orders = 0
+    
+    for item in payload.items:
+        # 1. Находим заказы клиента (проверка безопасности)
+        orders = db.query(Order).filter(
+            Order.id.in_(item.order_ids),
+            Order.company_id == employee.company_id,
+            Order.client_id == item.client_id
+        ).all()
+        
+        if not orders: continue
+        
+        # 2. Считаем общую стоимость товаров (Юани * Курс)
+        client_total_cost_som = 0
+        for order in orders:
+            # Меняем статус и курс
+            order.status = "Выкуплен"
+            order.buyout_actual_rate = payload.exchange_rate
+            # Логика стоимости: ЦенаCNY + Комиссия
+            # (Если комиссии нет, берем просто цену. Если цены нет, считаем 0)
+            if order.buyout_item_cost_cny:
+                commission = order.buyout_commission_percent or 0
+                # Цена = (CNY + (CNY * Comm / 100)) * Курс
+                cost_cny_with_comm = order.buyout_item_cost_cny * (1 + commission / 100)
+                order_cost_som = cost_cny_with_comm * payload.exchange_rate
+                client_total_cost_som += order_cost_som
+            
+            # История
+            db.add(OrderHistory(order_id=order.id, status="Выкуплен", employee_id=employee.id))
+            total_orders += 1
+
+        # 3. Создаем Транзакцию ДОЛГА (Списание стоимости) + ДЕТАЛИ
+        if client_total_cost_som > 0:
+            # Собираем детали для истории
+            trx_details = []
+            for o in orders:
+                trx_details.append({
+                    "track": o.track_code,
+                    "comm": o.comment or "",
+                    "cny": o.buyout_item_cost_cny,
+                    "rate": payload.exchange_rate
+                })
+
+            debt_trx = Transaction(
+                client_id=item.client_id,
+                amount=-client_total_cost_som, 
+                transaction_type="buyout",
+                description=f"Выкуп {len(orders)} заказов (Курс {payload.exchange_rate})",
+                created_by=employee.id,
+                details=trx_details # <-- ЗАПИСЫВАЕМ ДЕТАЛИ
+            )
+            db.add(debt_trx)
+
+        # 4. Создаем Транзакцию ОПЛАТЫ (Если внесено)
+        # Сумма положительная = Долг уменьшается
+        if item.paid_amount > 0:
+            payment_trx = Transaction(
+                client_id=item.client_id,
+                amount=item.paid_amount,
+                transaction_type="payment",
+                description="Оплата при выкупе",
+                created_by=employee.id
+            )
+            db.add(payment_trx)
+        
+        processed_clients += 1
+
+    try:
+        db.commit()
+        return {"status": "ok", "message": f"Выкуплено {total_orders} заказов для {processed_clients} клиентов."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка БД: {e}")
+
+@app.post("/api/orders/mass_update_tracks", tags=["Заказы (Владелец)"])
+def mass_update_tracks(
+    payload: MassTrackUpdatePayload,
+    background_tasks: BackgroundTasks, # <-- Добавляем для рассылки
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """
+    Массовое обновление трек-кодов с умной группировкой и уведомлением.
+    """
+    updated_count = 0
+    # Словарь для сбора данных по клиентам: {client_id: [order, order, ...]}
+    clients_orders_map = {}
+
+    # 1. Обновляем треки и собираем заказы
+    for update in payload.updates:
+        order = db.query(Order).options(joinedload(Order.client)).filter(
+            Order.id == update.order_id,
+            Order.company_id == employee.company_id
+        ).first()
+        
+        if order and update.new_track_code:
+            # Проверка на дубликат (кроме самого себя)
+            exists = db.query(Order).filter(
+                Order.track_code == update.new_track_code,
+                Order.company_id == employee.company_id,
+                Order.id != order.id
+            ).first()
+            
+            if not exists:
+                order.track_code = update.new_track_code
+                updated_count += 1
+                
+                # Добавляем в список для уведомления
+                if order.client_id:
+                    if order.client_id not in clients_orders_map:
+                        clients_orders_map[order.client_id] = []
+                    clients_orders_map[order.client_id].append(order)
+    
+    try:
+        db.commit() # Сохраняем изменения в БД
+        
+        # 2. Генерируем и отправляем уведомления (Фоновая задача)
+        for client_id, orders in clients_orders_map.items():
+            # Получаем клиента (он уже подгружен в order.client, берем из первого заказа)
+            client = orders[0].client
+            if client and client.telegram_chat_id:
+                # Формируем текст сообщения
+                message_text = generate_track_update_message(orders, db, client_id)
+                # Отправляем
+                background_tasks.add_task(
+                    send_telegram_message,
+                    token=employee.company.telegram_bot_token, # Токен компании
+                    chat_id=client.telegram_chat_id,
+                    text=message_text
+                )
+
+        return {"status": "ok", "message": f"Обновлено {updated_count} трек-кодов. Уведомления отправляются."}
+        
+    except Exception as e:
+        db.rollback()
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Ошибка: {e}")
+
+def generate_track_update_message(orders: List[Order], db: Session, client_id: int) -> str:
+    """Генератор красивого сообщения с группировкой по комиссиям."""
+    
+    # Группируем заказы по проценту комиссии
+    # Format: { 5.0: [order1, order2], 10.0: [order3] }
+    groups = {}
+    grand_total_som = 0
+    
+    for order in orders:
+        comm = order.buyout_commission_percent if order.buyout_commission_percent is not None else 10.0
+        if comm not in groups:
+            groups[comm] = []
+        groups[comm].append(order)
+
+    # Начало сообщения
+    msg = "🎉 <b>Ура! Ваши товары выкуплены!</b>\n"
+    msg += "Статусы обновлены, трек-коды получены.\n\n"
+
+    # Проходим по каждой группе комиссий
+    for comm, group_orders in groups.items():
+        group_sum_cny = 0
+        group_sum_som = 0
+        
+        msg += f"📉 <b>Категория: Комиссия {comm}%</b>\n"
+        msg += "📦 Список треков:\n"
+        
+        rate_display = 0
+        
+        for o in group_orders:
+            # Информация о треке
+            comment = f" ({o.comment})" if o.comment else ""
+            msg += f"<code>{o.track_code}</code>{comment}\n"
+            
+            # Расчет денег
+            cost_cny = o.buyout_item_cost_cny or 0
+            rate = o.buyout_rate_for_client or 0
+            rate_display = rate # Запоминаем курс (обычно он один для партии)
+            
+            # Цена с комиссией в юанях
+            cost_with_comm_cny = cost_cny * (1 + comm / 100.0)
+            
+            # Цена в сомах
+            cost_som = cost_with_comm_cny * rate
+            
+            group_sum_cny += cost_cny
+            group_sum_som += cost_som
+        
+        # Блок расчета для группы
+        msg += f"🧾 <b>Расчет (Комиссия {comm}%):</b>\n"
+        msg += f"💴 Сумма товаров: <b>{group_sum_cny:.2f} ¥</b>\n"
+        msg += f"🔄 Курс пересчета: <b>{rate_display} с.</b>\n"
+        msg += f"Сумма товаров: <b>{group_sum_som:,.0f} с.</b>\n\n"
+        
+        grand_total_som += group_sum_som
+
+    # Финальный блок
+    # Получаем текущий баланс клиента для отображения остатка
+    balance = 0
+    try:
+        balance = db.query(func.sum(Transaction.amount)).filter(Transaction.client_id == client_id).scalar() or 0
+    except:
+        pass
+        
+    debt = abs(balance) if balance < 0 else 0
+    # "Было оплачено" - это сложно вычислить точно для конкретных товаров, 
+    # поэтому покажем "Внесено на баланс" как разницу (Итог - Долг), если это логично,
+    # или просто покажем текущий долг, как самое важное.
+    
+    msg += "════════════════\n"
+    msg += f"🏁 <b>общий ИТОГ: {grand_total_som:,.0f} с.</b>\n"
+    # msg += f"Было оплачено: ...\n" # Сложно посчитать точно без привязки транзакции к заказу
+    if debt > 0:
+        msg += f"🔴 <b>Ваш текущий долг: -{debt:,.0f} с.</b>\n"
+    else:
+        msg += f"🟢 <b>Долгов нет (Оплачено).</b>\n"
+        
+    msg += "ℹ️ <i>Вес и стоимость доставки будут посчитаны по прибытию.</i>"
+    
+    return msg
 
 @app.post("/api/orders/bulk_import", tags=["Заказы (Владелец)"], response_model=BulkImportResponse)
 def bulk_import_orders(
@@ -4100,11 +4360,13 @@ def issue_orders(
         if not weight or weight <= 0:
              raise HTTPException(status_code=400, detail=f"Не указан вес для {order.track_code}.")
         
-        # --- ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЕТ ---
-        # Мы игнорируем старый calculated_final_cost_som, потому что при выдаче 
-        # менеджер мог изменить курс или цену в модальном окне.
-        # Считаем строго по данным, пришедшим с фронтенда (payload).
-        cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
+        # --- ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЕТ + ОКРУГЛЕНИЕ ---
+        # Считаем точную сумму с копейками
+        raw_cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
+        
+        # ОКРУГЛЯЕМ КАЖДЫЙ ТОВАР ДО ЦЕЛОГО СОМА СРАЗУ
+        # Это уберет разницу в 3 сома на больших объемах
+        cost = round(raw_cost)
         
         total_cost_to_pay += cost
 
@@ -4132,7 +4394,8 @@ def issue_orders(
                 order.weight_kg = item_data.weight_kg
                 order.price_per_kg_usd = payload.price_per_kg_usd
                 order.exchange_rate_usd = payload.exchange_rate_usd
-                order.final_cost_som = (item_data.weight_kg * payload.price_per_kg_usd * payload.exchange_rate_usd)
+                # Тоже округляем при записи в базу, чтобы цифры везде совпадали
+                order.final_cost_som = round(item_data.weight_kg * payload.price_per_kg_usd * payload.exchange_rate_usd)
                 
                 # Распределяем оплату пропорционально (для аналитики)
                 order.paid_cash_som = payload.paid_cash / len(orders_to_issue)
@@ -4146,16 +4409,30 @@ def issue_orders(
         
         # 2. Записываем ДОЛГ (если есть)
         if debt_amount > 0:
-            # Берем клиента из первого заказа (предполагаем, что выдаем одному клиенту за раз, 
-            # так как чекбоксы в UI сгруппированы)
             client_id = orders_to_issue[0].client_id
             if client_id:
+                # Собираем детали
+                trx_details = []
+                for o in orders_to_issue:
+                    # Ищем вес для этого заказа
+                    w_item = next((i for i in payload.orders if i.order_id == o.id), None)
+                    w = w_item.weight_kg if w_item else 0
+                    
+                    trx_details.append({
+                        "track": o.track_code,
+                        "comm": o.comment or "",
+                        "weight": w,
+                        # Округляем и здесь для красоты в истории
+                        "cost": round(w * payload.price_per_kg_usd * payload.exchange_rate_usd)
+                    })
+
                 debt_trx = Transaction(
                     client_id=client_id,
                     amount=-debt_amount, # Отрицательная сумма = Долг
                     transaction_type="delivery",
                     description=f"Долг за выдачу {len(orders_to_issue)} заказов",
-                    created_by=employee.id
+                    created_by=employee.id,
+                    details=trx_details # <-- ЗАПИСЫВАЕМ ДЕТАЛИ
                 )
                 db.add(debt_trx)
 
@@ -4500,49 +4777,63 @@ def revert_order_status(
 def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
     """
     Вспомогательная функция для расчета данных по одной смене.
-    (ИСПРАВЛЕНО: Более мягкий поиск возвратов - 'in' вместо '==')
+    (ОБНОВЛЕНО: Считает и выдачу заказов, и погашение долгов из транзакций)
     """
     
-    # 1. Доходы (только заказы, выданные в ЭТУ смену)
+    # 1. Доходы от ВЫДАЧИ ЗАКАЗОВ (прямая продажа)
     issued_orders_in_shift = db.query(Order).filter(
         Order.shift_id == shift.id, 
         Order.status == "Выдан"
     ).all()
-    total_cash_income = sum(o.paid_cash_som for o in issued_orders_in_shift if o.paid_cash_som)
-    total_card_income = sum(o.paid_card_som for o in issued_orders_in_shift if o.paid_card_som)
+    
+    # Суммируем оплаты за выдачу
+    orders_cash = sum(o.paid_cash_som for o in issued_orders_in_shift if o.paid_cash_som)
+    orders_card = sum(o.paid_card_som for o in issued_orders_in_shift if o.paid_card_som)
 
-    # 2. Получаем ВСЕ расходы смены с подгрузкой типа
+    # 2. Доходы от ПОГАШЕНИЯ ДОЛГОВ (Транзакции)
+    # Ищем транзакции типа 'payment', привязанные к этой смене
+    debt_payments = db.query(Transaction).filter(
+        Transaction.shift_id == shift.id,
+        Transaction.transaction_type == "payment"
+    ).all()
+    
+    debts_cash = sum(t.amount for t in debt_payments if t.payment_method == 'cash')
+    debts_card = sum(t.amount for t in debt_payments if t.payment_method == 'card')
+
+    # 3. ИТОГОВЫЙ ПРИХОД (Продажи + Долги)
+    total_cash_income = orders_cash + debts_cash
+    total_card_income = orders_card + debts_card
+
+    # 4. РАСХОДЫ (без изменений)
     all_shift_expenses = db.query(Expense).options(joinedload(Expense.expense_type)).filter(
         Expense.shift_id == shift.id
     ).all()
 
-    # 3. Разделяем расходы на "Возвраты" и "Операционные"
     returns_expenses = []
     operational_expenses = []
     
     for e in all_shift_expenses:
         type_name = e.expense_type.name.strip().lower() if e.expense_type else ""
-        
-        # ИСПРАВЛЕНИЕ ЗДЕСЬ: Ищем вхождение слова "возврат", а не точное совпадение
         if "возврат" in type_name:
             returns_expenses.append(e)
-        # Исключаем из операционных: зарплата, аванс и то, что мы уже определили как возврат
         elif type_name not in ['зарплата', 'аванс']: 
             operational_expenses.append(e)
 
     total_returns = sum(e.amount for e in returns_expenses)
     total_expenses = sum(e.amount for e in operational_expenses)
 
-    # 4. Расчет (Касса = Начало + ПриходНал - Расходы - Возвраты)
+    # 5. РАСЧЕТ КАССЫ (Наличные)
+    # Касса = Начало + (Продажи Нал + Долги Нал) - Расходы - Возвраты
     calculated_cash = shift.starting_cash + total_cash_income - total_expenses - total_returns
     
     discrepancy = None
     if shift.end_time and shift.closing_cash is not None:
         discrepancy = shift.closing_cash - calculated_cash
 
-    # Загружаем связанные данные
     location_name = db.query(Location.name).filter(Location.id == shift.location_id).scalar() or "Неизвестный филиал"
     employee_name = db.query(Employee.full_name).filter(Employee.id == shift.employee_id).scalar() or "Неизвестный сотрудник"
+
+    # ... (весь код расчета остается тем же) ...
 
     return ShiftReport(
         shift_id=shift.id,
@@ -4551,8 +4842,18 @@ def calculate_shift_report_data(db: Session, shift: Shift) -> ShiftReport:
         employee_name=employee_name,
         location_name=location_name,
         starting_cash=shift.starting_cash,
+        
+        # Общие суммы
         cash_income=total_cash_income,
         card_income=total_card_income,
+        
+        # --- ДЕТАЛИЗАЦИЯ (Новые поля) ---
+        cash_from_orders=orders_cash,
+        cash_from_debts=debts_cash,
+        card_from_orders=orders_card,
+        card_from_debts=debts_card,
+        # -------------------------------
+
         total_expenses=total_expenses,
         total_returns=total_returns, 
         calculated_cash=calculated_cash,
@@ -6402,6 +6703,32 @@ def search_audit_logs(
 # def get_order_statuses():  
 #     return {"status": "ok", "statuses": ORDER_STATUSES}
 
+# --- ВРЕМЕННЫЙ ЭНДПОИНТ ДЛЯ ОБНОВЛЕНИЯ БАЗЫ ---
+from sqlalchemy import text
+
+@app.get("/api/debug/add_details_column", tags=["Утилиты"])
+def add_details_column_to_transactions(db: Session = Depends(get_db)):
+    try:
+        # Команда для PostgreSQL
+        db.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS details JSONB;"))
+        db.commit()
+        return {"status": "ok", "message": "Колонка 'details' успешно добавлена в таблицу transactions."}
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": f"Ошибка: {e}"}
+
+@app.get("/api/debug/add_payment_columns", tags=["Утилиты"])
+def add_payment_columns_to_transactions(db: Session = Depends(get_db)):
+    try:
+        # Добавляем колонки, если их нет
+        db.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method VARCHAR;"))
+        db.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS shift_id INTEGER REFERENCES shifts(id);"))
+        db.commit()
+        return {"status": "ok", "message": "Колонки 'payment_method' и 'shift_id' успешно добавлены."}
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": f"Ошибка: {e}"}
+
 # === КОНЕЦ УНИВЕРСАЛЬНОЙ ФУНКЦИИ ===
 
 async def notify_owner_of_complaint(company_id: int, client_id: int, message_text: str):
@@ -6614,50 +6941,75 @@ def get_client_transactions(
 @app.post("/api/debtors/repay", tags=["Финансы (Долги)"])
 def repay_debt(
     payload: RepayDebtPayload,
+    background_tasks: BackgroundTasks, # <-- Добавляем для уведомлений
     employee: Employee = Depends(get_current_active_employee),
     db: Session = Depends(get_db)
 ):
     """
-    Внесение оплаты (Погашение долга).
-    Создает транзакцию 'payment' и запись в Кассе (Приход).
+    Внесение оплаты (Погашение долга) с выбором кассы.
     """
     if employee.company_id is None: raise HTTPException(403, detail="Недоступно")
-
-    # 1. Проверка смены (деньги идут в кассу)
-    active_shift = db.query(Shift).filter(
-        Shift.company_id == employee.company_id,
-        Shift.location_id == employee.location_id,
-        Shift.end_time == None
-    ).first()
-    
-    if not active_shift:
-        raise HTTPException(status_code=400, detail="Нет активной смены. Нельзя принять оплату.")
 
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Сумма должна быть больше 0.")
 
-    # 2. Создаем транзакцию оплаты (+ сумма)
+    # 1. Определяем смену (если нужно привязать)
+    target_shift_id = None
+    
+    if payload.link_to_shift:
+        # Ищем активную смену сотрудника
+        active_shift = db.query(Shift).filter(
+            Shift.company_id == employee.company_id,
+            Shift.location_id == employee.location_id,
+            Shift.end_time == None
+        ).first()
+        
+        if not active_shift:
+            # Если галочка стоит, а смены нет - ошибка (или можно молча сохранять "мимо кассы", но лучше предупредить)
+            raise HTTPException(status_code=400, detail="Нет активной смены, чтобы принять деньги в кассу. Снимите галочку 'В кассу смены', если это утренний перевод.")
+        
+        target_shift_id = active_shift.id
+
+    # 2. Создаем транзакцию
     payment_trx = Transaction(
         client_id=payload.client_id,
         amount=payload.amount, # ПЛЮС
         transaction_type="payment",
         description=payload.description,
-        created_by=employee.id
+        created_by=employee.id,
+        payment_method=payload.payment_method, # <-- Сохраняем метод
+        shift_id=target_shift_id               # <-- Привязка к смене (или NULL)
     )
     db.add(payment_trx)
-    
-    # 3. (Опционально) Можно создать запись в OrderHistory или Expense, 
-    # но для Кассы это просто увеличение "Наличных" (или Карты, надо бы уточнить метод)
-    # Пока считаем, что это НАЛИЧНЫЕ. 
-    # В Shift нет отдельного поля "Income from Debts", но мы можем просто не создавать Expense,
-    # а деньги физически положить в кассу. 
-    # В отчете по смене (get_current_shift_report) мы сейчас считаем cash_income только по Orders.
-    # НАМ НУЖНО БУДЕТ ОБНОВИТЬ ОТЧЕТ, ЧТОБЫ ОН ВИДЕЛ ОПЛАТЫ ДОЛГОВ.
-    
-    # ВРЕМЕННОЕ РЕШЕНИЕ: Создадим фиктивный "Заказ" или просто учтем это в будущем.
-    # Сейчас главное - записать, что долг погашен.
-    
     db.commit()
+    
+    # 3. Уведомление Владельцу
+    try:
+        # Считаем остаток долга
+        current_balance = db.query(func.sum(Transaction.amount)).filter(Transaction.client_id == payload.client_id).scalar() or 0
+        client = db.query(Client).filter(Client.id == payload.client_id).first()
+        
+        client_name = client.full_name if client else "Неизвестный"
+        code = f"{client.client_code_prefix}{client.client_code_num}" if client else ""
+        method_icon = "💳" if payload.payment_method == 'card' else "💵"
+        method_text = "Карта/MBank" if payload.payment_method == 'card' else "Наличные"
+        
+        shift_status = "✅ В кассе смены" if target_shift_id else "⚠️ <b>МИМО КАССЫ</b> (На руки/Счет)"
+
+        msg = (
+            f"💰 <b>ОПЛАТА ДОЛГА</b>\n\n"
+            f"👤 <b>Клиент:</b> {client_name} ({code})\n"
+            f"{method_icon} <b>Внесено:</b> +{payload.amount:,.0f} с. ({method_text})\n"
+            f"📉 <b>Баланс:</b> {current_balance:,.0f} с.\n\n"
+            f"👮‍♂️ <b>Принял:</b> {employee.full_name}\n"
+            f"{shift_status}"
+        )
+        
+        background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=msg)
+        
+    except Exception as e:
+        print(f"[Repay Debt] Ошибка уведомления: {e}")
+
     return {"status": "ok", "message": f"Оплата {payload.amount} сом принята."}
 
 @app.get("/", tags=["Утилиты"])
