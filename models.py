@@ -450,5 +450,10 @@ class Transaction(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     created_by = Column(Integer, ForeignKey('employees.id'), nullable=True) # Кто оформил
+    # --- ДОБАВИТЬ ЭТИ СТРОКИ: ---
+    payment_method = Column(String, nullable=True) # 'cash', 'card'
+    shift_id = Column(Integer, ForeignKey('shifts.id'), nullable=True) # Привязка к смене
+    # ---------------------------
+    details = Column(JSON, nullable=True) # Хранит список треков и цен
 
     client = relationship("Client", back_populates="transactions")
