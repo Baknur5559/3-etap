@@ -1215,23 +1215,33 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         clean_ans = ai_answer.strip()
         
         # ЛОГИКА "СКОБКИ": Ищем первую { и последнюю } во всем тексте.
-        # Это работает лучше регулярок для вложенных структур.
+        # --- УМНЫЙ ПАРСЕР JSON (FIX 6.0) ---
         json_start = clean_ans.find('{')
-        json_end = clean_ans.rfind('}') + 1
+        command = None
         
-        if json_start != -1 and json_end > json_start:
-            json_str = clean_ans[json_start:json_end]
-            try: 
-                command = json.loads(json_str)
-                logger.info(f"[JSON Parser] Successfully parsed JSON via loads: {command}")
-            except: 
-                try: 
-                    # Если json.loads не справился (например, одинарные кавычки), пробуем ast
-                    command = ast.literal_eval(json_str)
-                    logger.info(f"[JSON Parser] Successfully parsed JSON via ast: {command}")
-                except Exception as e: 
-                    logger.warning(f"[JSON Parser] Failed to parse string: {json_str[:50]}... Error: {e}")
-                    pass
+        if json_start != -1:
+            # Пытаемся найти валидный JSON, начиная с первой скобки
+            # Простой метод: идем от конца, пока не распарсится
+            # Это спасет, если ИИ написал: '{...} какой-то текст' или '{...} {второй json}'
+            
+            for i in range(len(clean_ans), json_start, -1):
+                try:
+                    potential_json = clean_ans[json_start:i]
+                    command = json.loads(potential_json)
+                    logger.info(f"[JSON Parser] Smart match found: {potential_json[:50]}...")
+                    break # Нашли первый валидный JSON - выходим
+                except:
+                    continue
+            
+            # Если json.loads не сработал, пробуем ast (для одинарных кавычек)
+            if not command:
+                 try:
+                     # Тут берем просто по последней скобке, как раньше, как фоллбэк
+                     json_end = clean_ans.rfind('}') + 1
+                     if json_end > json_start:
+                        command = ast.literal_eval(clean_ans[json_start:json_end])
+                 except: 
+                     pass
 
         # ЛОГИКА "АДАПТЕР": Нормализуем любые форматы (Action, Function, Params)
         if command and isinstance(command, dict):
@@ -1591,16 +1601,33 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    (ВЕРСИЯ 2.0) Показывает активные заказы КЛИЕНТА, сгруппированные по статусу и с историей.
+    (ВЕРСИЯ 2.1 Fixed) Показывает активные заказы КЛИЕНТА.
     """
-    # --- ИЗМЕНЕНИЕ: Добавлена проверка перезапуска ---
-    client_id = await check_restart_or_get_client_id(update, context)
+    # 1. Проверка сессии (если бот перезапускался)
+    client_id = context.user_data.get('client_id')
     if client_id is None:
-        return
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        # Если сессии нет, пробуем восстановить её тихо через API
+        user = update.effective_user
+        chat_id = str(user.id)
+        try:
+            api_response = await api_request("POST", "/api/bot/identify_user", 
+                                             json={"telegram_chat_id": chat_id, "company_id": COMPANY_ID_FOR_BOT})
+            if api_response and "client" in api_response:
+                client_data = api_response["client"]
+                context.user_data['client_id'] = client_data.get("id")
+                context.user_data['is_owner'] = api_response.get("is_owner", False)
+                context.user_data['full_name'] = client_data.get("full_name")
+                context.user_data['employee_id'] = api_response.get("employee_id")
+                client_id = client_data.get("id")
+            else:
+                await update.message.reply_text("⚠️ Ваша сессия истекла. Нажмите /start, чтобы обновить меню.")
+                return
+        except Exception as e:
+            logger.error(f"Ошибка восстановления сессии в my_orders: {e}")
+            await update.message.reply_text("⚠️ Ошибка доступа. Нажмите /start.")
+            return
 
-    markup = client_main_menu_markup # Эта функция только для клиентов
-
+    markup = client_main_menu_markup 
     logger.info(f"Запрос 'Мои заказы' для клиента {client_id}")
     
     # Статусы, которые считаются "активными"
@@ -1610,100 +1637,96 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         'client_id': client_id,
         'statuses': active_statuses,
         'company_id': COMPANY_ID_FOR_BOT,
-        'limit': 50 # (Увеличим лимит для группировки)
+        'limit': 50
     }
-    api_response = await api_request("GET", "/api/orders", params=params)
+    
+    try:
+        api_response = await api_request("GET", "/api/orders", params=params)
 
-    if not api_response or "error" in api_response or not isinstance(api_response, list):
-        error_msg = api_response.get("error", "Не удалось загрузить заказы.") if api_response else "Нет ответа."
-        await update.message.reply_text(f"Ошибка: {error_msg}")
-        return
+        if not api_response or "error" in api_response or not isinstance(api_response, list):
+            error_msg = api_response.get("error", "Сбой загрузки") if isinstance(api_response, dict) else "Нет ответа"
+            await update.message.reply_text(f"❌ Не удалось загрузить заказы: {error_msg}")
+            return
 
-    active_orders = api_response 
-    if not active_orders:
-        await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=markup)
-        return
+        active_orders = api_response 
+        if not active_orders:
+            await update.message.reply_text("📭 У вас пока нет активных заказов.", reply_markup=markup)
+            return
 
-    # --- НОВАЯ ЛОГИКА: Группировка по статусу ---
-    grouped_orders = {}
-    for status in active_statuses:
-        grouped_orders[status] = []
+        # Группировка по статусу
+        grouped_orders = {}
+        for status in active_statuses:
+            grouped_orders[status] = []
 
-    for order in active_orders:
-        status = order.get('status', 'В обработке')
-        if status in grouped_orders:
-            grouped_orders[status].append(order)
-    # --- КОНЕЦ ГРУППИРОВКИ ---
+        for order in active_orders:
+            status = order.get('status', 'В обработке')
+            if status in grouped_orders:
+                grouped_orders[status].append(order)
+            else: # Если статус нестандартный, добавляем его в словарь
+                if status not in grouped_orders: grouped_orders[status] = []
+                grouped_orders[status].append(order)
 
-    message = "📦 <b>Ваши текущие заказы:</b>\n"
-    has_orders_in_message = False
+        message = "📦 <b>Ваши текущие заказы:</b>\n"
+        has_orders = False
+        bishkek_tz = timezone(timedelta(hours=6)) 
 
-    # Часовой пояс Бишкека (UTC+6)
-    bishkek_tz = timezone(timedelta(hours=6)) 
-
-    for status, orders in grouped_orders.items():
-        if not orders:
-            continue
-        
-        has_orders_in_message = True
-        # Добавляем заголовок группы
-        message += f"\n\n═════ <b>{status.upper()}</b> ({len(orders)} шт) ═════\n\n"
-        
-        for order in sorted(orders, key=lambda o: o.get('id', 0), reverse=True):
-            message += f"<b>Трек:</b> <code>{order.get('track_code', '?')}</code>\n"
-            # message += f"<b>Статус:</b> {order.get('status', '?')}\n"
+        for status, orders in grouped_orders.items():
+            if not orders: continue
+            has_orders = True
             
-            comment = order.get('comment')
-            if comment:
-                message += f"<b>Примечание:</b> {html.escape(comment)}\n"
+            message += f"\n═════ <b>{status.upper()}</b> ({len(orders)}) ═════\n"
             
-            # Показ расчета, если он есть
-            calc_weight = order.get('calculated_weight_kg')
-            calc_cost = order.get('calculated_final_cost_som')
-            if calc_weight is not None and calc_cost is not None:
-                message += f"<b>Расчет:</b> {calc_weight:.3f} кг / {calc_cost:.0f} сом\n"
-
-            # --- НОВАЯ ЛОГИКА: Показ истории (v3.0 - Дедупликация) ---
-            history = order.get('history_entries', [])
-            if history:
-                message += "<b>История:</b>\n"
-                try:
-                    # --- (НОВЫЙ БЛОК) ---
-                    # 1. Создаем словарь, чтобы хранить ПОСЛЕДНЮЮ запись для каждого статуса
-                    latest_status_map = {}
-                    for entry in history:
-                        # (datetime.fromisoformat нужен для сортировки)
-                        entry_status = entry.get('status')
-                        entry['parsed_date'] = datetime.fromisoformat(entry.get('created_at').replace('Z', '+00:00')) # Сохраняем дату
-                        latest_status_map[entry_status] = entry # Перезаписываем старые
-
-                    # 2. Получаем отфильтрованный список (значения словаря)
-                    filtered_history = latest_status_map.values()
-                    
-                    # 3. Сортируем по дате, так как словарь мог нарушить порядок
-                    sorted_filtered_history = sorted(filtered_history, key=lambda e: e['parsed_date'])
-                    # --- (КОНЕЦ НОВОГО БЛОКА) ---
-
-                    for entry in sorted_filtered_history: # <-- Используем отфильтрованный список
-                        # Конвертируем UTC в Бишкек
-                        bishkek_date = entry['parsed_date'].astimezone(bishkek_tz)
-                        hist_date = bishkek_date.strftime('%d.%m %H:%M')
-                        message += f"  <i>- {hist_date}: {entry.get('status')}</i>\n"
-                except Exception as e_hist:
-                    logger.warning(f"Ошибка парсинга даты истории (my_orders): {e_hist}")
-                    message += "  <i>- (ошибка отображения истории)</i>\n"
-            # --- КОНЕЦ ИСТОРИИ ---
+            for order in sorted(orders, key=lambda o: o.get('id', 0), reverse=True):
+                track = order.get('track_code', '???')
+                comment = order.get('comment')
                 
-            message += "──────────────\n"
+                message += f"🔹 <code>{track}</code>"
+                if comment:
+                    message += f" — <i>{html.escape(comment)}</i>"
+                message += "\n"
+                
+                # Расчет
+                w = order.get('calculated_weight_kg')
+                c = order.get('calculated_final_cost_som')
+                if w and c:
+                    message += f"   💰 <b>{w} кг / {c:.0f} с.</b>\n"
 
-    if not has_orders_in_message:
-        await update.message.reply_text("У вас пока нет активных заказов. 🚚", reply_markup=markup)
-        return
+                # История (Полная хронология без дублей)
+                history = order.get('history_entries', [])
+                if history:
+                    try:
+                        # 1. Фильтруем дубликаты (оставляем последнюю дату для статуса)
+                        status_map = {}
+                        # Сортируем исходные данные
+                        history.sort(key=lambda x: x.get('created_at', ''))
+                        
+                        for entry in history:
+                            status_map[entry.get('status')] = entry
+                        
+                        # Получаем уникальные записи и сортируем их по времени
+                        unique_entries = sorted(status_map.values(), key=lambda x: x.get('created_at', ''))
+                        
+                        # 2. Выводим последние 3 записи (чтобы не спамить, если история длинная)
+                        # Если нужно ВСЕ - убери [-3:]
+                        for entry in unique_entries[-3:]:
+                            date_str = entry.get('created_at', '').replace('Z', '+00:00')
+                            dt = datetime.fromisoformat(date_str).astimezone(bishkek_tz)
+                            message += f"   🕒 <i>{dt.strftime('%d.%m %H:%M')}: {entry.get('status')}</i>\n"
+                    except Exception as e: 
+                        pass
 
-    if len(message) > 4000:
-         message = message[:4000] + "\n... (список слишком длинный, показаны не все заказы)"
+        if not has_orders:
+            await update.message.reply_text("📭 Активных заказов нет.", reply_markup=markup)
+            return
 
-    await update.message.reply_html(message, reply_markup=markup)
+        if len(message) > 4000:
+             message = message[:4000] + "\n...(список очень длинный)..."
+
+        await update.message.reply_html(message, reply_markup=markup)
+
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in my_orders: {e}", exc_info=True)
+        await update.message.reply_text("❌ Произошла ошибка при обработке списка.")
 
 
 async def china_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2279,6 +2302,52 @@ async def handle_ai_confirmation(update: Update, context: ContextTypes.DEFAULT_T
             await api_request("PATCH", f"/api/clients/{client_id}", employee_id=employee_id, json=api_payload)
             
             await query.edit_message_text(f"✅ Данные клиента успешно обновлены!", parse_mode=ParseMode.HTML)
+
+        # --- 8. ОПЛАТА ДОЛГА ---
+        elif data == "ai_confirm_repay_debt":
+            payload = {
+                "client_id": action_data['client_id'],
+                "amount": action_data['amount'],
+                "description": "Погашение через ИИ-бота",
+                "payment_method": "cash", 
+                "link_to_shift": action_data['link_to_shift']
+            }
+            await api_request("POST", "/api/debtors/repay", employee_id=employee_id, json=payload)
+            dest_str = "в кассу смены" if action_data['link_to_shift'] else "на баланс (мимо кассы)"
+            await query.edit_message_text(f"✅ Оплата {action_data['amount']} с. принята {dest_str}!")
+
+        # --- 9. МАССОВОЕ ПРИСВОЕНИЕ ПО ТРЕКАМ (КОМБАЙН) ---
+        elif data == "ai_confirm_bulk_assign_manual":
+            payload = {
+                "action": "assign_client",
+                "order_ids": action_data['order_ids'],
+                "client_id": action_data['client_id'],
+                "new_status": action_data.get('new_status', "В пути"),
+                "total_weight": action_data.get('total_weight', 0),
+                
+                # --- ВАЖНО: Передаем зафиксированные цены ---
+                "price_per_kg": action_data.get('price'), 
+                "exchange_rate": action_data.get('rate')
+                # --------------------------------------------
+            }
+            
+            await api_request("POST", "/api/orders/bulk_action", employee_id=employee_id, json=payload)
+            
+            status_text = payload['new_status']
+            calc_text = ""
+            if payload['total_weight'] > 0:
+                # Показываем в отчете, по какой цене посчитали
+                p = payload.get('price_per_kg', 0)
+                r = payload.get('exchange_rate', 0)
+                sum_val = payload['total_weight'] * p * r
+                calc_text = f"\n💰 Расчет: <b>{sum_val:.0f} с.</b> ({p}$ / {r} с.)"
+            
+            await query.edit_message_text(
+                f"✅ <b>Успешно!</b>\n"
+                f"Заказы ({action_data['count']} шт) присвоены клиенту.\n"
+                f"Статус: {status_text}{calc_text}",
+                parse_mode=ParseMode.HTML
+            )
 
     except Exception as e:
         logger.error(f"Action Error: {e}")
