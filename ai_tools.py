@@ -61,11 +61,32 @@ async def get_user_orders_json(api_request_func, client_id: int, company_id: int
         for o in orders:
             history_entries = []
             if o.get('history_entries'):
-                for entry in o['history_entries']:
-                    history_entries.append({
-                        "status": entry.get('status'),
-                        "date": entry.get('created_at')
-                    })
+                # --- НОВАЯ ЛОГИКА: Оставляем только ПОСЛЕДНЮЮ дату для каждого статуса ---
+                # Используем словарь, где ключ = статус. Новые записи перезапишут старые.
+                # Важно: предполагаем, что history_entries приходят отсортированными по дате (от старых к новым)
+                # Если нет, можно отсортировать: sorted(o['history_entries'], key=lambda x: x['created_at'])
+                
+                status_map = {}
+                raw_history = o['history_entries']
+                # Сортируем по дате (на всякий случай)
+                raw_history.sort(key=lambda x: x.get('created_at', '')) 
+                
+                for entry in raw_history:
+                    st = entry.get('status')
+                    # Записываем/Перезаписываем, чтобы осталась самая свежая дата для этого статуса
+                    status_map[st] = entry.get('created_at')
+                
+                # Превращаем обратно в список, сортируя по дате
+                # (чтобы хронология была правильной: Обработка -> Китай -> Путь -> КР)
+                unique_history = []
+                for st, dt in status_map.items():
+                    unique_history.append({"status": st, "date": dt})
+                
+                # Сортируем итоговый список по дате
+                unique_history.sort(key=lambda x: x['date'])
+                
+                history_entries = unique_history
+                # --- КОНЕЦ ФИЛЬТРАЦИИ ---
             
             order_data = {
                 "трек": o.get('track_code'),
@@ -457,6 +478,70 @@ async def update_orders_by_tracks(api_request_func, employee_id, company_id, tra
 
     except Exception as e:
         return f"❌ Ошибка поиска: {e}"
+    
+async def get_client_debt_report(api_request_func, employee_id: int, company_id: int, client_search: str) -> str:
+    """
+    Инструмент: Детальный отчет по долгу КОНКРЕТНОГО клиента.
+    """
+    try:
+        if not client_search: return "⚠️ Укажите имя клиента."
+
+        # 1. Ищем клиента
+        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+        
+        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        
+        # Ловушка дубликатов
+        if len(clients) > 1:
+             options = [f"{c['full_name']} ({c['phone']})" for c in clients]
+             return json.dumps({
+                 "status": "multiple_results",
+                 "message": f"⚠️ Найдено {len(clients)} клиентов. Уточните, кто именно?",
+                 "options": options
+             }, ensure_ascii=False)
+
+        client = clients[0]
+        client_id = client['id']
+
+        # 2. Получаем транзакции для расчета баланса и поиска последнего платежа
+        trx = await api_request_func("GET", f"/api/clients/{client_id}/transactions", employee_id=employee_id, params={"company_id": company_id})
+        
+        if not trx or not isinstance(trx, list):
+            return f"✅ У клиента <b>{client['full_name']}</b> нет истории операций (Баланс: 0 с.)"
+
+        # Считаем баланс вручную (сумма всех amount)
+        balance = sum(t.get('amount', 0) for t in trx)
+        
+        # Ищем последний платеж
+        payment = next((t for t in trx if t.get('transaction_type') == 'payment'), None)
+        last_payment_info = "Нет платежей"
+        
+        if payment:
+            raw_date = payment.get('created_at')
+            amt = payment.get('amount', 0)
+            if raw_date:
+                dt = datetime.fromisoformat(raw_date.replace('Z', '+00:00'))
+                bishkek_tz = timezone(timedelta(hours=6))
+                date_str = dt.astimezone(bishkek_tz).strftime('%d.%m.%Y')
+                last_payment_info = f"{amt:.0f} с. ({date_str})"
+
+        # Формируем ответ
+        icon = "🔴" if balance < -1 else "🟢"
+        status = "Должен нам" if balance < -1 else "В расчете / Переплата" if balance >= 0 else "Баланс ок"
+        
+        text = (
+            f"👤 <b>Отчет по клиенту: {client['full_name']}</b>\n"
+            f"📞 {client['phone']}\n"
+            f"──────────────────\n"
+            f"{icon} <b>Баланс: {balance:.0f} с.</b> ({status})\n\n"
+            f"🗓 Последний платеж: <b>{last_payment_info}</b>\n"
+            f"📊 Всего операций: {len(trx)}"
+        )
+        
+        return text
+
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
 
 async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int, employee_id: Optional[int], client_id: Optional[int] = None) -> str:
     """
@@ -574,6 +659,35 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
              return "❌ Ошибка логики: Инструмент вызван с недостаточным количеством трек-кодов."
         return await alert_order_submission(tracks)
     
+    elif tool == "bulk_assign_by_tracks":
+            tracks = tool_command.get("track_codes")
+            client_search = tool_command.get("client_search")
+            status = tool_command.get("status", "В пути") 
+            
+            # Вес
+            raw_weight = tool_command.get("weight", 0)
+            if isinstance(raw_weight, str): raw_weight = raw_weight.replace(',', '.')
+            try: weight = float(raw_weight)
+            except: weight = 0.0
+            
+            # --- НОВОЕ: Читаем цену и курс от ИИ ---
+            raw_price = tool_command.get("price", 0)
+            if isinstance(raw_price, str): raw_price = raw_price.replace(',', '.')
+            try: custom_price = float(raw_price)
+            except: custom_price = 0.0
+            
+            raw_rate = tool_command.get("rate", 0)
+            if isinstance(raw_rate, str): raw_rate = raw_rate.replace(',', '.')
+            try: custom_rate = float(raw_rate)
+            except: custom_rate = 0.0
+            # ---------------------------------------
+
+            if isinstance(tracks, str): tracks = [t.strip() for t in tracks.split(',')]
+            
+            return await bulk_assign_by_tracks(
+                api_request_func, employee_id, company_id, tracks, client_search, 
+                status, weight, custom_price, custom_rate
+            )
     # === НОВЫЕ ИНСТРУМЕНТЫ (ШАГ 1) ===
         
     elif tool == "get_orders_by_date":
@@ -902,6 +1016,29 @@ async def execute_ai_tool(tool_command: dict, api_request_func, company_id: int,
             settings_text += f"\n🤖 **AI Ассистент (Рубильник)**: {ai_status_text}"
             
             return settings_text
+        
+        # === БЛОК 6: ДОЛГИ ===
+        elif tool == "get_debtors_list":
+            return await get_debtors_list(api_request_func, employee_id, company_id)
+        
+        # --- ДОБАВИТЬ ЭТОТ БЛОК ---
+        elif tool == "get_client_debt_report":
+            search = tool_command.get("client_search")
+            return await get_client_debt_report(api_request_func, employee_id, company_id, search)
+        # --------------------------
+
+        elif tool == "prepare_repay_debt":
+            client_search = tool_command.get("client_search")
+            amount = tool_command.get("amount")
+            link_to_shift = tool_command.get("link_to_shift", True) # По умолчанию True
+            
+            if not amount: return "❌ Ошибка: Не указана сумма."
+            
+            # Защита от строк в сумме
+            try: amount = float(amount)
+            except: return "❌ Ошибка: Сумма должна быть числом."
+
+            return await prepare_repay_debt(api_request_func, employee_id, company_id, client_search, amount, link_to_shift)
             
         else:
             return f"⚠️ Инструмент '{tool}' не поддерживается."
@@ -1413,27 +1550,22 @@ async def prepare_add_expense(api_request_func, employee_id: int, company_id: in
 
 async def get_shift_summary(api_request_func, employee_id: int, company_id: int, location_id: int = None) -> str:
     """
-    Инструмент: Получает сводку по текущей смене (Касса, Приход, Расход).
+    Инструмент: Получает ДЕТАЛЬНУЮ сводку по текущей смене.
     """
     try:
-        # Если Владелец не указал филиал, используем его основной или текущий контекст
-        # Но лучше пусть API само разберется. Если location_id передан — отлично.
-        
         url = "/api/reports/shift/current"
-        # Если Владелец запрашивает конкретный филиал
         if location_id:
              url = f"/api/reports/shift/location/{location_id}"
              
         report = await api_request_func("GET", url, employee_id=employee_id, params={"company_id": company_id})
         
         if not report or "error" in report:
-            # Пробуем понять ошибку (часто 404 если смены нет)
             err = report.get('error', '') if isinstance(report, dict) else ''
             if "не найдена" in str(err) or "not found" in str(err):
-                return "📴 **Смена сейчас закрыта.**\nВ кассе 0.00 сом. Для начала работы нужно открыть смену."
+                return "📴 **Смена сейчас закрыта.**\nВ кассе 0.00 сом."
             return f"❌ Ошибка получения отчета: {err}"
 
-        # Формируем красивый текст
+        # Формируем детализированный текст
         text = (
             f"📊 **СВОДКА ПО СМЕНЕ**\n"
             f"📍 Филиал: {report.get('location_name')}\n"
@@ -1442,10 +1574,17 @@ async def get_shift_summary(api_request_func, employee_id: int, company_id: int,
             f"──────────────────\n"
             f"💰 **В КАССЕ: {report.get('calculated_cash', 0):.2f} сом**\n"
             f"──────────────────\n"
-            f"📥 Наличные (+): {report.get('cash_income', 0):.2f}\n"
-            f"💳 Карта (+): {report.get('card_income', 0):.2f}\n"
-            f"📤 Расходы (-): {report.get('total_expenses', 0):.2f}\n"
-            f"↩️ Возвраты (-): {report.get('total_returns', 0):.2f}\n"
+            f"📥 **ОБЩИЙ ПРИХОД:**\n"
+            f"   💵 Нал: {report.get('cash_income', 0):.2f} с.\n"
+            f"      ├ 📦 Заказы: {report.get('cash_from_orders', 0):.2f}\n"
+            f"      └ 💸 Долги: {report.get('cash_from_debts', 0):.2f}\n"
+            f"   💳 Карта: {report.get('card_income', 0):.2f} с.\n"
+            f"      ├ 📦 Заказы: {report.get('card_from_orders', 0):.2f}\n"
+            f"      └ 💸 Долги: {report.get('card_from_debts', 0):.2f}\n"
+            f"──────────────────\n"
+            f"📤 **РАСХОДЫ:**\n"
+            f"   🔻 Операционные: -{report.get('total_expenses', 0):.2f}\n"
+            f"   ↩️ Возвраты: -{report.get('total_returns', 0):.2f}\n"
         )
         return text
 
@@ -1526,3 +1665,221 @@ async def request_broadcast_photo(api_request_func, text: str) -> str:
             f"✏️ **Если нужно исправить** — просто напишите, что поменять."
         )
     }, ensure_ascii=False)
+
+async def get_debtors_list(api_request_func, employee_id: int, company_id: int) -> str:
+    """
+    Инструмент: Получает список должников в новом формате.
+    """
+    try:
+        # 1. Запрашиваем список должников
+        debtors = await api_request_func("GET", "/api/debtors", employee_id=employee_id, params={"company_id": company_id})
+        
+        if not debtors or (isinstance(debtors, dict) and "error" in debtors):
+            return "✅ Должников нет! Все чисто."
+            
+        if not isinstance(debtors, list):
+            return "❌ Ошибка формата данных."
+
+        # 2. Сортировка (Старые даты сверху)
+        def get_sort_key(d):
+            date_str = d.get('last_transaction_date')
+            if not date_str: return "0000-00-00"
+            return date_str
+            
+        debtors.sort(key=get_sort_key)
+        
+        # Берем топ-10, чтобы не спамить (и не делать 100 запросов к API)
+        top_debtors = debtors[:10]
+
+        text = "📊 **Отчёт: задолженности клиентов**\n"
+        text += "(сортировка: по длительности отсутствия активности)\n\n"
+
+        for i, d in enumerate(top_debtors, 1):
+            client = d.get('client', {})
+            client_id = client.get('id')
+            name = client.get('full_name', 'Неизвестный')
+            phone = client.get('phone', 'Не указан')
+            current_debt = d.get('balance', 0)
+            
+            # 3. ДОПОЛНИТЕЛЬНЫЙ ЗАПРОС: Ищем последний ПЛАТЕЖ для каждого должника
+            last_payment_date = "Нет платежей"
+            last_payment_amount = "0"
+            
+            try:
+                # Получаем транзакции клиента
+                trx = await api_request_func("GET", f"/api/clients/{client_id}/transactions", employee_id=employee_id, params={"company_id": company_id})
+                if trx and isinstance(trx, list):
+                    # Ищем первую транзакцию типа 'payment' (они уже отсортированы по дате desc)
+                    payment = next((t for t in trx if t.get('transaction_type') == 'payment'), None)
+                    if payment:
+                        # Форматируем дату
+                        raw_date = payment.get('created_at')
+                        if raw_date:
+                            dt = datetime.fromisoformat(raw_date.replace('Z', '+00:00'))
+                            # Добавляем 6 часов для Бишкека
+                            bishkek_tz = timezone(timedelta(hours=6))
+                            last_payment_date = dt.astimezone(bishkek_tz).strftime('%d.%m.%Y')
+                        
+                        last_payment_amount = f"{payment.get('amount', 0):.0f}"
+            except:
+                pass # Если ошибка получения транзакций, оставляем "Нет платежей"
+
+            # 4. Формируем красивый блок
+            text += (
+                f"{i}️⃣ <b>{name}</b>\n\n"
+                f"• 💰 Текущий долг: <b>{current_debt:.0f} с.</b>\n"
+                f"• 📞 Контакт: <code>{phone}</code>\n"
+                f"• 🗓 Дата последнего платежа: {last_payment_date}\n"
+                f"• 💵 Сумма последнего платежа: {last_payment_amount} с.\n"
+                f"──────────────────\n"
+            )
+        
+        if len(debtors) > 10:
+            text += f"\n... и еще {len(debtors) - 10} в полном списке."
+
+        return text
+    except Exception as e:
+        return f"❌ Ошибка формирования отчета: {e}"
+
+async def prepare_repay_debt(api_request_func, employee_id: int, company_id: int, client_search: str, amount: float, link_to_shift: bool = True) -> str:
+    """
+    Инструмент: Подготовка погашения долга.
+    Ищет клиента и готовит кнопку подтверждения.
+    """
+    try:
+        if not client_search: return "⚠️ Укажите имя клиента или телефон."
+        
+        # 1. Ищем клиента
+        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+        
+        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        if len(clients) > 1:
+             options = [f"{c['full_name']} ({c['phone']})" for c in clients]
+             return json.dumps({
+                 "status": "multiple_results",
+                 "message": f"⚠️ Найдено несколько клиентов. Уточните:",
+                 "options": options
+             }, ensure_ascii=False)
+        
+        client = clients[0]
+        
+        # 2. Формируем текст источника
+        source_text = "✅ <b>В КАССУ СМЕНЫ</b>" if link_to_shift else "🤝 <b>ЛИЧНО / МИМО КАССЫ</b>"
+        
+        return json.dumps({
+            "confirm_action": "repay_debt",
+            "client_id": client['id'],
+            "amount": amount,
+            "link_to_shift": link_to_shift,
+            "message": (
+                f"💰 **ПРИЕМ ОПЛАТЫ ДОЛГА**\n"
+                f"👤 Клиент: <b>{client['full_name']}</b>\n"
+                f"💵 Сумма: <b>{amount} сом</b>\n"
+                f"📥 Куда: {source_text}\n\n"
+                f"❓ Всё верно? Записываем?"
+            )
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+    
+async def bulk_assign_by_tracks(
+    api_request_func, 
+    employee_id: int, 
+    company_id: int, 
+    track_codes: List[str], 
+    client_search: str, 
+    status: str = "В пути", 
+    weight: float = 0,
+    custom_price: float = 0,  # <-- НОВОЕ: Спец цена
+    custom_rate: float = 0    # <-- НОВОЕ: Спец курс
+) -> str:
+    """
+    Инструмент: Массовое присвоение + Статус + Расчет (с выбором цены).
+    """
+    try:
+        if not track_codes or not client_search:
+            return "❌ Ошибка: Не указаны трек-коды или клиент."
+
+        # 1. Ищем клиента
+        clients = await api_request_func("GET", "/api/clients/search", employee_id=employee_id, params={"q": client_search, "company_id": company_id})
+        if not clients: return f"❌ Клиент '{client_search}' не найден."
+        
+        if len(clients) > 1:
+             options = [f"ID {c['id']}: {c['full_name']} ({c.get('client_code_prefix')}{c.get('client_code_num')})" for c in clients]
+             return json.dumps({
+                 "status": "multiple_results",
+                 "message": f"⚠️ Найдено {len(clients)} клиентов. Уточните, кто именно?",
+                 "options": options
+             }, ensure_ascii=False)
+        
+        client = clients[0]
+
+        # 2. Ищем ID заказов
+        found_ids = []
+        not_found = []
+        for track in track_codes:
+            clean_track = track.strip()
+            if not clean_track: continue
+            orders = await api_request_func("GET", "/api/orders", employee_id=employee_id, params={"q": clean_track, "company_id": company_id, "limit": 1})
+            if orders: found_ids.append(orders[0]['id'])
+            else: not_found.append(clean_track)
+
+        if not found_ids: return f"❌ Ни один трек-код не найден."
+
+        # 3. ОПРЕДЕЛЯЕМ ЦЕНУ И КУРС
+        # Если ИИ не передал свои цифры, берем из Активной Смены (API)
+        final_price = custom_price
+        final_rate = custom_rate
+        
+        # Если хотя бы одного параметра нет, запрашиваем дефолтные
+        if final_price <= 0 or final_rate <= 0:
+            try:
+                p_data = await api_request_func("GET", "/api/bot/price", params={"company_id": company_id})
+                # Если ИИ не дал цену, берем из API. Если дал - оставляем ИИшную.
+                if final_price <= 0: final_price = p_data.get("price_usd", 0)
+                if final_rate <= 0: final_rate = p_data.get("exchange_rate", 0)
+            except: pass
+
+        # 4. Расчет для отображения
+        calc_info = ""
+        if weight > 0 and final_price > 0 and final_rate > 0:
+            total_sum = weight * final_price * final_rate
+            calc_info = (
+                f"\n💰 <b>РАСЧЕТ:</b>\n"
+                f"⚖️ Вес: {weight} кг\n"
+                f"💵 Тариф: <b>${final_price}</b> (курс {final_rate})\n"
+                f"🏷 Итог: <b>{total_sum:.0f} сом</b>"
+            )
+        elif weight > 0:
+            calc_info = "\n⚠️ Вес есть, но <b>нет цены/курса</b>. Расчет будет равен 0."
+
+        missing_msg = f"\n⚠️ Не найдены: {', '.join(not_found)}" if not_found else ""
+        
+        return json.dumps({
+            "confirm_action": "bulk_assign_manual",
+            "order_ids": found_ids,
+            "client_id": client['id'],
+            "client_name": client['full_name'],
+            "count": len(found_ids),
+            "new_status": status,
+            "total_weight": weight,
+            
+            # --- ВАЖНО: Передаем ФИНАЛЬНЫЕ цифры в кнопку ---
+            "price": final_price,
+            "rate": final_rate,
+            # ------------------------------------------------
+            
+            "message": (
+                f"👤 **ПРИСВОЕНИЕ ЗАКАЗОВ**\n"
+                f"Клиент: <b>{client['full_name']}</b>\n"
+                f"📦 Заказов: <b>{len(found_ids)}</b>\n"
+                f"{missing_msg}\n"
+                f"⚙️ Статус: <b>'{status}'</b>"
+                f"{calc_info}\n\n"
+                f"❓ Подтверждаете данные?"
+            )
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
