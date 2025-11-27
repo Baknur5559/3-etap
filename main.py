@@ -2437,9 +2437,11 @@ def get_orders(
     q: Optional[str] = Query(None, description="Поиск"),
     limit: Optional[int] = Query(None, description="Лимит"),
     
-    # --- ВОТ ЭТО ДОБАВИТЬ ---
     uncalculated_only: Optional[bool] = Query(None),
-    # ------------------------
+    
+    # --- ДОБАВЛЕНО: Параметр для поиска потеряшек ---
+    unclaimed_only: Optional[bool] = Query(None),
+    # -----------------------------------------------
 
     party_dates: Optional[List[date]] = Query(None),
     statuses: Optional[List[str]] = Query(default=None),
@@ -2449,29 +2451,22 @@ def get_orders(
 ):
     """
     Получает список заказов компании с фильтрацией.
-    (Версия с поддержкой поиска 'q' для Владельца)
     """
-    print(f"[Get Orders] Запрос для Company ID={company_id}. Employee Header: {x_employee_id}. Client ID: {client_id}. Поиск: '{q}'")
-
     # --- Проверка компании ---
     company = db.query(Company.id).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail=f"Компания с ID {company_id} не найдена.")
 
-    # --- ИЗМЕНЕНИЕ (Задача 3): Добавляем joinedload(Order.history_entries) ---
     query = db.query(Order).options(
         joinedload(Order.client),
-        joinedload(Order.history_entries) # <-- УБЕДИСЬ, ЧТО ЭТА СТРОКА ДОБАВЛЕНА
+        joinedload(Order.history_entries)
     ).filter(
         Order.company_id == company_id
     )
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-    # --- НОВОЕ: Логика поиска по 'q' ---
+    # --- Логика поиска по 'q' ---
     if q:
         search_term = f"%{q.lower()}%"
-        # Присоединяем Client, чтобы искать по имени/телефону
-        # Используем isouter=True на случай, если клиент был удален, а заказы остались
         query = query.join(Client, Client.id == Order.client_id, isouter=True).filter( 
             or_(
                 func.lower(Order.track_code).ilike(search_term),
@@ -2479,17 +2474,14 @@ def get_orders(
                 Client.phone.ilike(search_term)
             )
         )
-        print(f"[Get Orders] Применен текстовый поиск: '{q}'")
-    # --- КОНЕЦ НОВОГО ---
 
     employee: Optional[Employee] = None
     target_location_id: Optional[int] = None
 
-    # --- Попытка определить сотрудника из админки ---
+    # --- Определение сотрудника ---
     if x_employee_id:
         try:
             employee_id_int = int(x_employee_id)
-            # Загружаем сотрудника, его роль и права
             employee = db.query(Employee).options(
                 joinedload(Employee.role).joinedload(Role.permissions)
             ).filter(
@@ -2501,90 +2493,62 @@ def get_orders(
             employee = None
 
         if employee:
-            # --- ИСПРАВЛЕНИЕ: Добавлена проверка, что 'employee.role' существует ---
             if not employee.role:
-                # Если у сотрудника нет роли (ошибка данных), считаем его обычным сотрудником без прав
-                logger.error(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} найден, но у него нет роли (role is None).")
                 target_location_id = employee.location_id
-                if target_location_id is None:
-                    logger.error(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
-                    return [] # Возвращаем пустой список, а не ошибку 500
-                print(f"[Get Orders] Сотрудник (без роли) видит свой филиал ID={target_location_id}")
+                if target_location_id is None: return [] 
             else:
-                # Роль существует, продолжаем
-                print(f"[Get Orders] Запрос идентифицирован как от сотрудника ID={employee.id} (Роль: {employee.role.name})")
-                # Владелец может фильтровать по филиалу, сотрудник видит только свой
                 if employee.role.name == 'Владелец':
                     if location_id is not None:
-                        # Владелец выбрал филиал
                         loc_check = db.query(Location.id).filter(Location.id == location_id, Location.company_id == company_id).first()
                         if not loc_check: raise HTTPException(status_code=404, detail="Указанный филиал не найден.")
                         target_location_id = location_id
-                        print(f"[Get Orders] Владелец фильтрует по филиалу ID={target_location_id}")
                     else:
-                        # Владелец видит все филиалы
-                        print(f"[Get Orders] Владелец видит все филиалы.")
                         target_location_id = None
                 else: 
-                    # Обычный сотрудник видит только свой филиал
                     target_location_id = employee.location_id
-                    if target_location_id is None:
-                        print(f"[Get Orders][ОШИБКА] Сотрудник ID={employee.id} не привязан к филиалу!")
-                        return []
-                    print(f"[Get Orders] Сотрудник видит свой филиал ID={target_location_id}")
-        else:
-            print("[Get Orders] Заголовок X-Employee-ID передан, но сотрудник не найден/не активен.")
-            # (Если заголовок был, но невалидный, можно вернуть 401,
-            # но для бота/ЛК мы продолжаем без сотрудника)
+                    if target_location_id is None: return []
 
-    # --- Фильтрация по client_id (применяется всегда, если передан) ---
-    # (Это используется ботом для "Мои Заказы")
+    # --- Фильтрация по client_id ---
     if client_id is not None:
         client_check = db.query(Client.id).filter(Client.id == client_id, Client.company_id == company_id).first()
         if not client_check:
-            raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден в компании ID {company_id}.")
+            raise HTTPException(status_code=404, detail=f"Клиент ID {client_id} не найден.")
         query = query.filter(Order.client_id == client_id)
-        print(f"[Get Orders] Применен фильтр по Client ID={client_id}")
 
-    # --- Применяем остальные фильтры ---
-
-    # Фильтр по филиалу (если он был определен для сотрудника/Владельца)
+    # --- Фильтрация по филиалу ---
     if target_location_id is not None:
         query = query.filter(Order.location_id == target_location_id)
 
-    # Фильтр по датам партий
+    # --- Фильтрация по датам ---
     if party_dates:
         query = query.filter(Order.party_date.in_(party_dates))
 
-    # Фильтр по статусам
+    # --- Фильтрация по статусам ---
     statuses_to_filter = statuses
-    # Если статусы не переданы И это запрос из админки (employee определен),
-    # то по умолчанию скрываем "Выданные"
-    if not statuses_to_filter and employee:
+    if not statuses_to_filter and employee and not unclaimed_only:
+        # Если ищем "потеряшки", нам нужны статусы по умолчанию, но без "Выдан"
         statuses_to_filter = [s for s in ORDER_STATUSES if s != "Выдан"]
 
-    # Применяем фильтр по статусам, если он есть
     if statuses_to_filter:
         query = query.filter(Order.status.in_(statuses_to_filter))
 
-    # --- ИСПРАВЛЕННЫЙ ФИЛЬТР НЕПОСЧИТАННЫХ ---
+    # --- Фильтр НЕПОСЧИТАННЫХ ---
     if uncalculated_only:
-        # Ищем заказы, где сумма NULL ИЛИ 0
         query = query.filter(or_(
             Order.calculated_final_cost_som == None,
             Order.calculated_final_cost_som == 0
         ))
-        print("[Get Orders] Применен фильтр: Не посчитанные (NULL или 0).")
-    # -----------------------------------------
 
-    # --- НОВОЕ: Добавляем limit к запросу ---
+    # --- ВАЖНОЕ ИСПРАВЛЕНИЕ: ФИЛЬТР НЕВОСТРЕБОВАННЫХ ---
+    if unclaimed_only:
+        query = query.filter(Order.client_id == None)
+    # ---------------------------------------------------
+
     query = query.order_by(Order.party_date.desc().nullslast(), Order.id.desc())
     if limit:
         query = query.limit(limit)
 
     orders = query.all()
-
-    print(f"[Get Orders] Найдено заказов: {len(orders)}")
     return orders
 
 @app.post("/api/orders", tags=["Заказы (Владелец)", "Telegram Bot"], response_model=OrderOut)
@@ -3188,17 +3152,17 @@ def bulk_order_action(
         if not client:
             raise HTTPException(status_code=404, detail="Клиент не найден.")
 
-        # ИСПРАВЛЕНИЕ: Берем ВСЕ ID из запроса, которые принадлежат компании
-        # (Не фильтруем по o.client_id != new_client_id, потому что мы можем хотеть ПЕРЕСЧИТАТЬ уже свои заказы)
+        # Берем ВСЕ ID из запроса
         ids_to_process = [o.id for o in orders_to_action] 
         
         if not ids_to_process:
              return {"status": "ok", "message": "Нет доступных заказов для обработки."}
 
-        # --- ЛОГИКА РАСЧЕТА (Если передан вес и статус Готов к выдаче) ---
+        # --- ИСПРАВЛЕНИЕ: Разрешаем расчет для обоих статусов ---
         calc_updates = {}
-        if new_status == "Готов к выдаче" and payload.total_weight and payload.total_weight > 0:
-            # Делим вес поровну на ВСЕ выбранные заказы
+        # Если статус "Готов к выдаче" ИЛИ "На складе в КР" И есть вес -> Считаем!
+        if (new_status == "Готов к выдаче" or new_status == "На складе в КР") and payload.total_weight and payload.total_weight > 0:
+            # Делим вес поровну
             weight_per_item = payload.total_weight / len(ids_to_process)
             price = payload.price_per_kg or 0
             rate = payload.exchange_rate or 0
@@ -3210,11 +3174,10 @@ def bulk_order_action(
                 "calculated_exchange_rate_usd": rate,
                 "calculated_final_cost_som": cost_som
             }
-            print(f"[Assign Client] Расчет: {len(ids_to_process)} заказов, общий вес {payload.total_weight}, на каждый: {weight_per_item:.3f} кг")
-        # ----------------------------------------------------------------
+            print(f"[Assign Client] Расчет ({new_status}): {len(ids_to_process)} заказов, общий вес {payload.total_weight}")
+        # --------------------------------------------------------
 
-        # Массовое обновление в БД
-        # Обновляем И клиента, И статус, И расчетные данные (если есть)
+        # Массовое обновление
         db.query(Order).filter(Order.id.in_(ids_to_process)).update(
             {
                 "client_id": new_client_id, 
@@ -3224,19 +3187,14 @@ def bulk_order_action(
             synchronize_session=False
         )
         
-        # Запись в историю
+        # История
         history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in ids_to_process]
         db.bulk_save_objects(history_entries)
         
         db.commit()
 
-        # --- СБОР ДАННЫХ ДЛЯ УВЕДОМЛЕНИЯ (ИСПРАВЛЕНО) ---
-        # Мы берем трек-коды из `orders_to_action`, так как они уже загружены в начале функции
-        # и соответствуют `payload.order_ids`
+        # Уведомление
         track_codes_to_notify = [o.track_code for o in orders_to_action]
-        
-        print(f"[Assign Client] Отправка уведомления для треков: {track_codes_to_notify}")
-
         if track_codes_to_notify:
             background_tasks.add_task(generate_and_send_notification, client=client, new_status=new_status, track_codes=track_codes_to_notify)
 
@@ -4261,10 +4219,8 @@ def get_orders_ready_for_issue(
     location_id: Optional[int] = Query(None) 
 ):
     """
-    Получает список заказов со статусом 'Готов к выдаче'.
-    - Владелец: Может фильтровать по location_id или видеть все.
-    - Сотрудник: Всегда видит только заказы своего филиала.
-    Требует права 'issue_orders'.
+    Получает список заказов для выдачи.
+    Включает статусы: 'Готов к выдаче' И 'На складе в КР'.
     """
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
@@ -4273,14 +4229,15 @@ def get_orders_ready_for_issue(
     if 'issue_orders' not in perms:
         raise HTTPException(status_code=403, detail="У вас нет прав на просмотр заказов для выдачи.")
 
+    # --- ИСПРАВЛЕНИЕ: Показываем и 'Готов к выдаче', и 'На складе в КР' ---
     query = db.query(Order).options(
         joinedload(Order.client) 
     ).filter(
         Order.company_id == employee.company_id,
-        Order.status == "Готов к выдаче" # Основной фильтр для выдачи
+        Order.status.in_(["Готов к выдаче", "На складе в КР"]) # <-- ТЕПЕРЬ 2 СТАТУСА
     )
 
-    # --- НОВАЯ ЛОГИКА ФИЛЬТРАЦИИ ПО ФИЛИАЛУ ---
+    # --- ЛОГИКА ФИЛЬТРАЦИИ ПО ФИЛИАЛУ ---
     if employee.role.name == 'Владелец':
         if location_id is not None:
             loc_check = db.query(Location).filter(Location.id == location_id, Location.company_id == employee.company_id).first()
@@ -4290,7 +4247,7 @@ def get_orders_ready_for_issue(
             print(f"[Выдача] Владелец ID={employee.id} фильтрует по филиалу ID={location_id}")
         else:
              print(f"[Выдача] Владелец ID={employee.id} видит готовые заказы ВСЕХ филиалов.")
-             pass # Владелец видит все, если location_id не указан
+             pass 
     else:
         # ОБЫЧНЫЙ СОТРУДНИК: Всегда фильтруем по его location_id
         if employee.location_id is None:
@@ -4298,7 +4255,7 @@ def get_orders_ready_for_issue(
              return [] 
         query = query.filter(Order.location_id == employee.location_id)
         print(f"[Выдача] Сотрудник ID={employee.id} видит готовые заказы своего филиала ID={employee.location_id}")
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+    # --- КОНЕЦ ЛОГИКИ ---
 
     # Сортировка
     orders = query.order_by(Order.client_id, Order.id).all() 
@@ -4353,19 +4310,16 @@ def issue_orders(
     order_weights = {item.order_id: item.weight_kg for item in payload.orders}
     
     for order in orders_to_issue:
-        if order.status != "Готов к выдаче":
-            raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} не готов к выдаче.")
+        # --- ИСПРАВЛЕНИЕ: Разрешаем выдавать и со склада ---
+        if order.status not in ["Готов к выдаче", "На складе в КР"]:
+            raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} имеет статус '{order.status}' и не может быть выдан.")
             
         weight = order_weights.get(order.id)
         if not weight or weight <= 0:
              raise HTTPException(status_code=400, detail=f"Не указан вес для {order.track_code}.")
         
-        # --- ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЕТ + ОКРУГЛЕНИЕ ---
-        # Считаем точную сумму с копейками
+        # --- РАСЧЕТ И ОКРУГЛЕНИЕ ---
         raw_cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
-        
-        # ОКРУГЛЯЕМ КАЖДЫЙ ТОВАР ДО ЦЕЛОГО СОМА СРАЗУ
-        # Это уберет разницу в 3 сома на больших объемах
         cost = round(raw_cost)
         
         total_cost_to_pay += cost
