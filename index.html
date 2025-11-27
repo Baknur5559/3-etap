@@ -509,6 +509,7 @@ let companyRoles = []; // Список объектов Role для текуще
 let companyPermissions = []; // Список ВСЕХ объектов Permission (глобальные)
 let companyClients = []; // Список объектов Client для текущей компании
 let companyOrders = []; // Список объектов Order для текущей компании (по последнему фильтру)
+let readyToIssueCache = []; // Кэш для заказов, готовых к выдаче
 let orderStatuses = ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути", "На складе в КР", "Готов к выдаче", "Выдан"]; // Список строк-статусов
 let availablePartyDates = []; // Список строк-дат (YYYY-MM-DD)
 let companyExpenseTypes = []; // Список объектов ExpenseType для текущей компании
@@ -6008,6 +6009,7 @@ async function fetchAndRenderIssueList() {
     try {
         // Запрашиваем заказы со статусом "Готов к выдаче"
         const ordersReady = await apiFetch(url); // Используем URL с параметрами
+        readyToIssueCache = ordersReady; // <--- ДОБАВЬ ЭТУ СТРОКУ (Сохраняем свежие данные)
 
         // Группируем по клиенту (код остается)
         const ordersByClient = ordersReady.reduce((acc, order) => {
@@ -6218,18 +6220,21 @@ async function renderIssueModal(ordersToIssue) {
 
     try {
         // --- Получаем полные данные заказов из кэша ---
-        // Создаем Map для быстрого доступа к полным данным по ID заказа
+        // --- Получаем полные данные заказов из кэша (ИСПРАВЛЕНО) ---
         const fullOrderDataMap = new Map();
-        // Проходим по списку ID заказов для выдачи
         ordersToIssue.forEach(o => {
-            // Ищем полные данные заказа в глобальном кэше companyOrders
-            const fullData = companyOrders.find(co => co.id === o.id);
-            // Если данные найдены, добавляем их в Map
+            // 1. Сначала ищем в кэше ВЫДАЧИ (он самый свежий для этого окна)
+            let fullData = readyToIssueCache.find(r => r.id === o.id);
+            
+            // 2. Если нет, ищем в общем кэше заказов
+            if (!fullData) {
+                fullData = companyOrders.find(co => co.id === o.id);
+            }
+            
             if (fullData) {
                 fullOrderDataMap.set(o.id, fullData);
             } else {
-                // Предупреждаем, если данные заказа не найдены в кэше
-                console.warn(`[Render Issue Modal] Full data for Order ID ${o.id} not found in cache.`);
+                console.warn(`[Render Issue Modal] Данные для заказа ID ${o.id} не найдены ни в одном кэше.`);
             }
         });
 
@@ -6265,13 +6270,25 @@ async function renderIssueModal(ordersToIssue) {
         // --- Получаем курсы и цену по умолчанию ---
         let defaultPrice = 5.5; // Значение по умолчанию
         let defaultRate = 87.5; // Значение по умолчанию
-        // Пытаемся взять значения из ТЕКУЩЕЙ АКТИВНОЙ смены (если она есть)
-        if (activeShift) {
+        
+        // 1. Пытаемся найти сохраненный ИНДИВИДУАЛЬНЫЙ расчет в ПЕРВОМ заказе из списка
+        // (Мы предполагаем, что если выдаем группу, у них одинаковый тариф)
+        const firstOrderId = ordersToIssue[0].id;
+        const firstOrderData = fullOrderDataMap.get(firstOrderId);
+
+        if (firstOrderData && firstOrderData.calculated_price_per_kg_usd && firstOrderData.calculated_price_per_kg_usd > 0) {
+             defaultPrice = firstOrderData.calculated_price_per_kg_usd;
+             // Если курс был сохранен - берем его, иначе пробуем из смены
+             defaultRate = firstOrderData.calculated_exchange_rate_usd || (activeShift?.exchange_rate_usd || defaultRate);
+             console.log("[Render Issue Modal] Found SAVED calculation for order:", defaultPrice, defaultRate);
+        } 
+        // 2. Если индивидуального расчета нет, берем из АКТИВНОЙ смены
+        else if (activeShift) {
              defaultPrice = activeShift.price_per_kg_usd || defaultPrice;
              defaultRate = activeShift.exchange_rate_usd || defaultRate;
-             console.log("[Render Issue Modal] Using values from active shift:", defaultPrice, defaultRate);
+             console.log("[Render Issue Modal] Using values from ACTIVE SHIFT:", defaultPrice, defaultRate);
         } else {
-             console.log("[Render Issue Modal] Active shift not found, using default values.");
+             console.log("[Render Issue Modal] No saved calc and no active shift, using DEFAULTS.");
         }
 
         // --- Собираем HTML всего модального окна ---
@@ -8943,7 +8960,7 @@ function resetClaimClient() {
     updateClaimButtonState();
 }
 
-// 5. Загрузка невостребованных заказов
+// 5. Загрузка невостребованных заказов (С защитой от кэша)
 async function loadUnclaimedOrders() {
     const listDiv = document.getElementById('claim-orders-list');
     const loadingOverlay = document.getElementById('claim-loading-overlay');
@@ -8954,7 +8971,8 @@ async function loadUnclaimedOrders() {
         const params = new URLSearchParams({
             company_id: currentCompany.id,
             unclaimed_only: 'true',
-            limit: 1000
+            limit: 1000,
+            _t: Date.now() // <--- ВАЖНО: Добавляем время, чтобы браузер не брал старые данные из кэша
         });
 
         const orders = await apiFetch(`/api/orders?${params.toString()}`);
@@ -9058,10 +9076,13 @@ function handleClaimStatusChange(e) {
     const panel = document.getElementById('claim-calculation-panel');
     const btnText = document.getElementById('claim-btn-text');
 
-    if (status === 'Готов к выдаче') {
+    // --- ИСПРАВЛЕНИЕ: Показываем панель для ДВУХ статусов ---
+    if (status === 'Готов к выдаче' || status === 'На складе в КР') {
         panel.classList.remove('hidden');
-        btnText.textContent = 'РАССЧИТАТЬ И ПРИСВОИТЬ';
-        // Фокус на вес
+        // Меняем текст кнопки в зависимости от статуса, чтобы было понятнее
+        btnText.textContent = status === 'Готов к выдаче' ? 'РАССЧИТАТЬ И ВЫДАТЬ' : 'СОХРАНИТЬ РАСЧЕТ';
+        
+        // Фокус на поле веса
         setTimeout(() => document.getElementById('claim-total-weight').focus(), 100);
     } else {
         panel.classList.add('hidden');
@@ -9083,8 +9104,8 @@ function updateClaimCalculation() {
 // 11. Отправка формы (Присвоение + Опциональный расчет)
 async function submitManualClaim() {
     const clientId = document.getElementById('claim-selected-client-id').value;
-    const clientNameEl = document.getElementById('claim-client-name');
-    const clientName = clientNameEl ? clientNameEl.textContent : 'Клиенту';
+    // Получаем имя из блока инфо
+    const clientName = document.getElementById('claim-client-info-block')?.querySelector('h5')?.textContent || 'Клиенту';
     
     // Берем ID из Set
     const orderIds = Array.from(manualClaimSelectedIds);
@@ -9094,18 +9115,22 @@ async function submitManualClaim() {
 
     if (!clientId || orderIds.length === 0) return;
 
-    // Валидация расчета
-    if (status === 'Готов к выдаче') {
+    // Валидация расчета (для обоих статусов)
+    if (status === 'Готов к выдаче' || status === 'На складе в КР') {
         const weight = parseFloat(document.getElementById('claim-total-weight').value);
-        if (!weight || weight <= 0) {
+        
+        if (status === 'Готов к выдаче' && (!weight || weight <= 0)) {
             alert('⚠️ Для статуса "Готов к выдаче" укажите общий вес!');
             return;
         }
-        calcData = {
-            total_weight: weight,
-            price_per_kg: parseFloat(document.getElementById('claim-price').value),
-            exchange_rate: parseFloat(document.getElementById('claim-rate').value)
-        };
+        
+        if (weight > 0) {
+            calcData = {
+                total_weight: weight,
+                price_per_kg: parseFloat(document.getElementById('claim-price').value),
+                exchange_rate: parseFloat(document.getElementById('claim-rate').value)
+            };
+        }
     }
 
     if (!confirm(`👤 Присвоить ${orderIds.length} заказов клиенту ${clientName}?\nСтатус: ${status}`)) return;
@@ -9119,25 +9144,34 @@ async function submitManualClaim() {
                 order_ids: orderIds,
                 client_id: parseInt(clientId),
                 new_status: status,
-                ...calcData // Добавляем данные расчета, если есть
+                ...calcData 
             })
         });
 
         alert(`✅ Успешно!`);
         
-        // Мягкая очистка
-        manualClaimSelectedIds.clear();
-        document.getElementById('claim-order-search').value = '';
+        // --- МОМЕНТАЛЬНОЕ ОБНОВЛЕНИЕ (Визуальный фикс) ---
+        // 1. Удаляем присвоенные заказы из локального списка (кэша) ПРЯМО СЕЙЧАС
+        unclaimedOrdersCache = unclaimedOrdersCache.filter(o => !manualClaimSelectedIds.has(o.id));
         
-        // Сбрасываем расчетные поля
+        // 2. Сразу перерисовываем список (заказы исчезнут мгновенно)
+        renderClaimOrdersList(unclaimedOrdersCache);
+        
+        // 3. Очищаем память выбранных
+        manualClaimSelectedIds.clear();
+        
+        // Сброс полей
+        const orderSearch = document.getElementById('claim-order-search');
+        if (orderSearch) orderSearch.value = '';
         document.getElementById('claim-total-weight').value = '';
         document.getElementById('claim-total-sum').textContent = '0';
         
         updateClaimButtonState();
         
-        loadUnclaimedOrders(); // Обновляем список (убираем присвоенные)
+        // 4. Фоновая подгрузка (на всякий случай сверяемся с сервером)
+        loadUnclaimedOrders(); 
         
-        // Обновляем основной фон
+        // Обновляем основной список заказов
         if (typeof fetchAndRenderOrders === 'function') fetchAndRenderOrders();
 
     } catch (e) {
