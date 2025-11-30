@@ -2,232 +2,392 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Личный кабинет</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        .tab-btn.active {
-            border-color: #4f46e5;
-            color: #4f46e5;
-        }
-        /* Добавляем класс для карточек заказов */
-        .order-card.hidden {
-            display: none;
-        }
+        body { -webkit-tap-highlight-color: transparent; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .details-wrapper { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.3s ease-out; }
+        .details-content { overflow: hidden; }
+        .details-wrapper.open { grid-template-rows: 1fr; }
+        ::-webkit-scrollbar { width: 0px; background: transparent; }
+        .tab-active { background-color: #4f46e5; color: white; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.3); }
+        .tab-inactive { background-color: #f3f4f6; color: #6b7280; }
+        /* Пульсация только для кнопки */
+        .pulse-btn { animation: pulse-green 2s infinite; }
+        @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(74, 222, 128, 0); } 100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); } }
     </style>
 </head>
-<body class="bg-gray-100">
-    <div class="max-w-4xl mx-auto p-4 sm:p-6">
-        <div id="loading-state">
-            <p class="text-center text-gray-500">Загрузка данных вашего личного кабинета...</p>
+<body class="bg-gray-100 min-h-screen text-gray-800 pb-10">
+
+    <div class="max-w-md mx-auto min-h-screen flex flex-col bg-white shadow-2xl relative">
+        
+        <div id="loading-screen" class="absolute inset-0 bg-white z-50 flex flex-col items-center justify-center">
+            <div class="animate-spin rounded-full h-14 w-14 border-b-4 border-indigo-600"></div>
+            <p class="mt-4 text-gray-600 font-medium">Загружаем ваши посылки...</p>
         </div>
 
-        <div id="error-state" class="hidden text-center p-8 bg-red-100 rounded-lg">
-            <h1 class="text-2xl font-bold text-red-700">Ошибка доступа</h1>
-            <p class="mt-2 text-red-600">Ссылка недействительна или устарела. Пожалуйста, запросите новую ссылку у администратора.</p>
+        <div id="error-screen" class="hidden absolute inset-0 bg-red-50 z-40 flex flex-col items-center justify-center p-6 text-center">
+            <i class="fas fa-link text-5xl text-red-400 mb-4"></i>
+            <h1 class="text-2xl font-bold text-gray-800">Ссылка устарела</h1>
+            <p class="mt-2 text-gray-600">Запросите новую ссылку у бота или менеджера.</p>
         </div>
 
-        <div id="main-content" class="hidden">
-            <h1 class="text-3xl font-bold text-gray-800">Здравствуйте, <span id="client-name"></span>!</h1>
-            <p class="text-gray-600 mt-1">Здесь вы можете отслеживать статусы ваших заказов и добавлять новые.</p>
+        <div id="main-content" class="hidden flex-grow flex flex-col">
+            
+            <div class="px-6 pt-8 pb-4 bg-white">
+                <div class="flex justify-between items-end">
+                    <div>
+                        <p class="text-sm text-gray-400 font-bold uppercase tracking-wider mb-1">Личный кабинет</p>
+                        <h1 class="text-2xl font-extrabold text-gray-900 leading-tight" id="client-name">Клиент</h1>
+                    </div>
+                    <button onclick="location.reload()" class="p-3 bg-gray-50 rounded-full text-indigo-600 hover:bg-indigo-50 active:scale-95 transition shadow-sm">
+                        <i class="fas fa-sync-alt text-lg"></i>
+                    </button>
+                </div>
+            </div>
 
-            <div class="bg-white p-6 rounded-lg shadow-md my-6">
-                <h2 class="text-xl font-semibold mb-4">Добавить новый заказ на доставку</h2>
-                <form id="add-order-form" class="space-y-4">
+            <div class="px-4 mb-4">
+                <div id="finance-card" class="bg-gradient-to-br from-indigo-600 to-purple-700 rounded-3xl p-6 text-white shadow-lg shadow-indigo-200 transform transition-all relative overflow-hidden">
+                    <div class="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-white opacity-10 rounded-full blur-xl"></div>
+                    
+                    <div class="flex justify-between items-start relative z-10">
+                        <div>
+                            <p class="text-indigo-100 text-sm font-medium mb-1" id="finance-title">К оплате (готово к выдаче)</p>
+                            <div class="text-4xl font-extrabold tracking-tight">
+                                <span id="total-to-pay">0</span> <span class="text-2xl opacity-80">c.</span>
+                            </div>
+                        </div>
+                        <div class="bg-white/20 p-3 rounded-xl backdrop-blur-md shadow-inner">
+                            <i class="fas fa-wallet text-2xl text-white"></i>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-6 flex justify-between items-end relative z-10">
+                        <div class="text-sm text-indigo-50 font-medium space-y-1">
+                            <p id="total-weight-display"><i class="fas fa-weight-hanging mr-2 opacity-70"></i>0.00 кг</p>
+                            <p id="ready-count-display"><i class="fas fa-boxes mr-2 opacity-70"></i>0 заказов</p>
+                        </div>
+                        <button onclick="document.getElementById('add-order-modal').classList.remove('hidden')" 
+                                class="bg-white text-indigo-700 text-sm font-bold py-3 px-6 rounded-xl shadow-md active:scale-95 transition flex items-center gap-2">
+                            <i class="fas fa-plus"></i> Добавить
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="px-4 py-2 sticky top-0 bg-white z-20 pb-4 shadow-sm">
+                <div class="relative">
+                    <i class="fas fa-search absolute left-4 top-3.5 text-gray-400 text-lg"></i>
+                    <input type="search" id="search-input" placeholder="Поиск трек-кода..." 
+                           class="w-full bg-gray-100 text-gray-900 text-base rounded-2xl pl-12 pr-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white transition shadow-inner">
+                </div>
+            </div>
+
+            <div class="px-4 mb-4">
+                <div class="flex p-1.5 bg-gray-100 rounded-2xl">
+                    <button onclick="switchTab('ready')" id="tab-btn-ready" class="tab-active flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-200 text-center relative">
+                        Готовые
+                        <span id="badge-ready" class="hidden absolute top-1 right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full shadow-sm border border-white">0</span>
+                    </button>
+                    <button onclick="switchTab('transit')" id="tab-btn-transit" class="tab-inactive flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-200 text-center">
+                        В пути
+                    </button>
+                    <button onclick="switchTab('archive')" id="tab-btn-archive" class="tab-inactive flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-200 text-center">
+                        Архив
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex-grow px-4 pb-24 overflow-y-auto custom-scrollbar space-y-4">
+                <div id="tab-content-ready" class="space-y-4"></div>
+                <div id="tab-content-transit" class="hidden space-y-4"></div>
+                <div id="tab-content-archive" class="hidden space-y-4"></div>
+
+                <div id="empty-state" class="hidden flex-col items-center justify-center py-16 text-center opacity-60">
+                    <i class="fas fa-box-open text-6xl text-gray-300 mb-4"></i>
+                    <h3 class="text-xl font-bold text-gray-400">Пусто</h3>
+                </div>
+            </div>
+        </div>
+
+        <div id="add-order-modal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center">
+            <div class="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity" onclick="document.getElementById('add-order-modal').classList.add('hidden')"></div>
+            <div class="bg-white w-full max-w-md rounded-t-3xl sm:rounded-3xl p-6 transform transition-all relative z-10 shadow-2xl">
+                <div class="w-12 h-1.5 bg-gray-200 rounded-full mx-auto mb-6 sm:hidden"></div>
+                <h2 class="text-2xl font-bold mb-6 text-gray-800">Новый заказ</h2>
+                <form id="add-order-form" class="space-y-5">
                     <div>
-                        <label for="track_code" class="block text-sm font-medium text-gray-700">Трек-код</label>
-                        <input type="text" id="track_code" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                        <label class="block text-sm font-bold text-gray-600 mb-2">Трек-код</label>
+                        <input type="text" id="track_code" required class="w-full bg-gray-50 rounded-xl border-gray-200 border-2 p-4 text-lg focus:ring-indigo-500 focus:border-indigo-500 transition font-mono tracking-wide uppercase" placeholder="Вставьте трек">
                     </div>
                     <div>
-                        <label for="comment" class="block text-sm font-medium text-gray-700">Примечание (например, "красные кроссовки")</label>
-                        <input type="text" id="comment" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                        <label class="block text-sm font-bold text-gray-600 mb-2">Описание (для себя)</label>
+                        <input type="text" id="comment" class="w-full bg-gray-50 rounded-xl border-gray-200 border-2 p-4 text-base focus:ring-indigo-500 focus:border-indigo-500 transition" placeholder="Например: Кроссовки">
                     </div>
-                    <button type="submit" class="w-full flex justify-center py-2 px-4 border rounded-md shadow-sm font-medium text-white bg-green-600 hover:bg-green-700">Добавить заказ</button>
+                    <button type="submit" class="w-full bg-indigo-600 text-white font-bold text-lg py-4 rounded-xl shadow-lg shadow-indigo-200 active:scale-95 transition mt-2">
+                        Сохранить
+                    </button>
                 </form>
             </div>
-
-            <div class="my-4">
-                <input type="search" id="client-order-search" placeholder="🔍 Поиск по трек-коду..." class="w-full p-3 border rounded-lg shadow-sm">
-            </div>
-
-            <div class="border-b border-gray-200">
-                <nav class="-mb-px flex space-x-8" id="client-tabs">
-                    <button data-tab="current" class="tab-btn active whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">Текущие заказы</button>
-                    <button data-tab="history" class="tab-btn whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm border-transparent text-gray-500 hover:text-gray-700">История</button>
-                </nav>
-            </div>
-
-            <div class="mt-6">
-                <div id="current-pane" class="space-y-4"></div>
-                <div id="history-pane" class="hidden space-y-4"></div>
-            </div>
         </div>
+
     </div>
 
     <script>
-        const CLIENT_API_URL = 'http://127.0.0.1:8001'; 
+        const API_BASE = window.location.origin; 
+        let allOrders = [];
+        const STATUSES = {
+            READY: ["На складе в КР", "Готов к выдаче"],
+            TRANSIT: ["В обработке", "Ожидает выкупа", "Выкуплен", "На складе в Китае", "В пути"],
+            ARCHIVE: ["Выдан"]
+        };
 
-        // Функция для отображения ТЕКУЩИХ заказов (С ИСТОРИЕЙ)
-        function renderOrders(orders) {
-            const ordersList = document.getElementById('current-pane');
-            if (orders.length === 0) {
-                ordersList.innerHTML = '<p class="text-gray-500 p-4 text-center">Активных заказов нет.</p>';
+        window.addEventListener('DOMContentLoaded', async () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const token = urlParams.get('token');
+            if (!token) { showError(); return; }
+
+            try {
+                const response = await fetch(`${API_BASE}/api/client/data?token=${token}`);
+                if (!response.ok) throw new Error("Ошибка");
+                const data = await response.json();
+                document.getElementById('client-name').textContent = data.full_name || 'Клиент';
+                allOrders = (data.orders || []).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                updateUI();
+                document.getElementById('loading-screen').classList.add('hidden');
+                document.getElementById('main-content').classList.remove('hidden');
+            } catch (e) { console.error(e); showError(); }
+        });
+
+        function updateUI() { renderFinanceCard(); renderLists(); }
+
+        function renderFinanceCard() {
+            const readyOrders = allOrders.filter(o => STATUSES.READY.includes(o.status));
+            let totalSum = 0;
+            let totalWeight = 0;
+            readyOrders.forEach(o => {
+                if (o.status === "Готов к выдаче" && o.calculated_final_cost_som) totalSum += o.calculated_final_cost_som;
+                if (o.calculated_weight_kg) totalWeight += o.calculated_weight_kg;
+            });
+            
+            document.getElementById('total-to-pay').textContent = totalSum.toLocaleString();
+            document.getElementById('total-weight-display').innerHTML = `<i class="fas fa-weight-hanging mr-2 opacity-70"></i>${totalWeight.toFixed(2)} кг`;
+            document.getElementById('ready-count-display').innerHTML = `<i class="fas fa-boxes mr-2 opacity-70"></i>${readyOrders.length} заказов`;
+
+            const card = document.getElementById('finance-card');
+            const title = document.getElementById('finance-title');
+            if (totalSum === 0 && readyOrders.length === 0) {
+                card.className = "bg-gradient-to-br from-emerald-500 to-teal-600 rounded-3xl p-6 text-white shadow-lg transform transition-all relative overflow-hidden";
+                title.textContent = "Всё чисто (нет посылок)";
             } else {
-                ordersList.innerHTML = orders.map(order => {
+                card.className = "bg-gradient-to-br from-indigo-600 to-purple-700 rounded-3xl p-6 text-white shadow-lg shadow-indigo-200 transform transition-all relative overflow-hidden";
+                title.textContent = "К оплате (готово к выдаче)";
+            }
+        }
+
+        function renderLists(searchTerm = "") {
+            const term = searchTerm.toLowerCase();
+            const filtered = allOrders.filter(o => o.track_code.toLowerCase().includes(term) || (o.comment && o.comment.toLowerCase().includes(term)));
+            
+            fillContainer('tab-content-ready', filtered.filter(o => STATUSES.READY.includes(o.status)));
+            fillContainer('tab-content-transit', filtered.filter(o => STATUSES.TRANSIT.includes(o.status)));
+            fillContainer('tab-content-archive', filtered.filter(o => STATUSES.ARCHIVE.includes(o.status)));
+
+            const readyCount = filtered.filter(o => STATUSES.READY.includes(o.status)).length;
+            const badge = document.getElementById('badge-ready');
+            const readyTab = document.getElementById('tab-btn-ready');
+            
+            if (readyCount > 0) {
+                badge.textContent = readyCount;
+                badge.classList.remove('hidden');
+                if(readyTab.classList.contains('tab-active')) readyTab.classList.add('pulse-btn');
+            } else {
+                badge.classList.add('hidden');
+                readyTab.classList.remove('pulse-btn');
+            }
+        }
+
+        function fillContainer(id, orders) {
+            const container = document.getElementById(id);
+            container.innerHTML = '';
+            if (orders.length === 0) return;
+            orders.forEach(order => container.appendChild(createOrderCard(order)));
+        }
+
+        function createOrderCard(order) {
+            let statusBg = "bg-gray-100 text-gray-600";
+            let icon = "fa-box";
+            
+            if (order.status === "Готов к выдаче") { statusBg = "bg-green-100 text-green-800"; icon = "fa-check-circle"; }
+            else if (order.status === "На складе в КР") { statusBg = "bg-teal-100 text-teal-800"; icon = "fa-warehouse"; }
+            else if (order.status === "В пути") { statusBg = "bg-blue-100 text-blue-800"; icon = "fa-plane"; }
+            else if (order.status === "Выдан") { statusBg = "bg-gray-200 text-gray-500"; icon = "fa-history"; }
+
+            const priceHtml = order.calculated_final_cost_som ? `<div class="text-right"><p class="text-lg font-bold text-indigo-600">${order.calculated_final_cost_som.toFixed(0)} c.</p></div>` : '';
+
+            // --- ЛОГИКА ДАТ (ГЛАВНОЕ) ---
+            let footerHtml = '';
+            let historyTimeline = '';
+
+            const history = order.history_entries ? [...order.history_entries].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)) : [];
+            
+            // 1. Формируем "видимую" строку
+            if (["Готов к выдаче", "На складе в КР", "Выдан"].includes(order.status) && history.length > 0) {
+                const createdDate = new Date(order.created_at);
+                const arrivalEntry = history.find(h => ["На складе в КР", "Готов к выдаче"].includes(h.status));
+                
+                if (arrivalEntry) {
+                    const arrivalDate = new Date(arrivalEntry.created_at);
+                    const diffTime = Math.abs(arrivalDate - createdDate);
+                    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
                     
-                    // --- НОВАЯ ЛОГИКА: Форматирование истории ---
-                    let historyHtml = '';
-                    if (order.history_entries && order.history_entries.length > 0) {
-                        historyHtml = '<ul class="mt-2 pl-4 list-disc text-xs text-gray-500 space-y-0.5">';
-                        try {
-                            // --- (НОВЫЙ БЛОК JS) ---
-                            // 1. Создаем Map, чтобы хранить ПОСЛЕДНЮЮ запись для каждого статуса
-                            const latestStatusMap = new Map();
-                            
-                            // Сначала сортируем, чтобы гарантировать правильный порядок (старые -> новые)
-                            order.history_entries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-
-                            order.history_entries.forEach(entry => {
-                                // Ключ = статус, Значение = сам объект entry
-                                // Новые записи перезатрут старые с тем же статусом
-                                latestStatusMap.set(entry.status, entry);
-                            });
-
-                            // 2. Получаем отфильтрованный список (Map сохраняет порядок вставки)
-                            const filteredHistory = Array.from(latestStatusMap.values());
-                            // --- (КОНЕЦ НОВОГО БЛОКА JS) ---
-                            
-                            historyHtml += filteredHistory.map(entry => { // <-- Используем filteredHistory
-                                // Форматируем дату в локальный формат
-                                const entryDate = new Date(entry.created_at).toLocaleString('ru-RU', {
-                                    day: '2-digit', 
-                                    month: '2-digit', 
-                                    hour: '2-digit', 
-                                    minute: '2-digit'
-                                });
-                                return `<li><i>${entryDate}: ${entry.status}</i></li>`;
-                            }).join('');
-                        } catch(e) {
-                            console.warn("Ошибка форматирования истории заказа", e, order.history_entries);
-                            historyHtml += '<li>(Ошибка загрузки истории)</li>';
-                        }
-                        historyHtml += '</ul>';
+                    // Если "Выдан" - показываем когда забрали
+                    if (order.status === "Выдан") {
+                        const issuedEntry = history.find(h => h.status === "Выдан");
+                        const issuedDateStr = issuedEntry ? new Date(issuedEntry.created_at).toLocaleDateString() : new Date(order.issued_at).toLocaleDateString();
+                        footerHtml = `<div class="mt-3 flex items-center gap-2 text-sm font-bold text-gray-500"><i class="fas fa-check-double"></i> Выдан: ${issuedDateStr}</div>`;
+                    } else {
+                        // Если Готов - показываем срок
+                        footerHtml = `
+                            <div class="mt-3 flex items-center gap-2">
+                                <span class="bg-green-50 text-green-700 border border-green-200 px-2 py-1 rounded-lg text-xs font-bold flex items-center">
+                                    <i class="fas fa-stopwatch mr-1.5"></i> Приехал за ${diffDays} дн.
+                                </span>
+                                <span class="text-xs text-gray-400">(${new Date(order.created_at).toLocaleDateString()} - ${arrivalDate.toLocaleDateString()})</span>
+                            </div>`;
                     }
-                    // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-                    // Рендеринг карточки
-                    return `
-                    <div class="bg-white p-4 rounded-lg shadow-sm order-card">
-                        <div class="flex justify-between items-center">
-                            <p class="font-bold text-gray-800 break-all">${order.track_code}</p>
-                            <span class="text-xs text-center sm:text-sm font-semibold text-white bg-blue-500 px-3 py-1 rounded-full whitespace-nowrap ml-2">${order.status}</span>
-                        </div>
-                        ${order.comment ? `<p class="text-sm text-gray-600 mt-2"><b>Примечание:</b> ${order.comment}</p>` : ''}
-                        
-                        ${historyHtml} 
-                        
-                    </div>
-                `}).join('');
+                }
+            } 
+            
+            if (!footerHtml) {
+                footerHtml = `<div class="mt-3 flex items-center text-xs text-gray-400 font-medium"><i class="far fa-calendar-plus mr-1.5"></i> Добавлен: ${new Date(order.created_at).toLocaleDateString()}</div>`;
             }
-        }
 
-        // Функция для отображения ИСТОРИИ заказов
-        function renderHistory(orders) {
-            const historyList = document.getElementById('history-pane');
-            if (orders.length === 0) {
-                historyList.innerHTML = '<p class="text-gray-500 p-4 text-center">У вас еще нет полученных заказов.</p>';
-            } else {
-                historyList.innerHTML = orders.map(order => `
-                    <div class="bg-white p-4 rounded-lg shadow-sm opacity-80 order-card">
-                        <div class="flex justify-between items-center">
-                            <div>
-                                <p class="font-bold text-gray-600 break-all">${order.track_code}</p>
-                                <p class="text-xs text-gray-500">Выдан: ${new Date(order.issued_at).toLocaleDateString()}</p>
+            // 2. Формируем Timeline (внутри)
+            if (history.length > 0) {
+                historyTimeline = `
+                    <div class="mt-4 pt-4 border-t border-gray-100">
+                        <p class="text-xs font-bold text-gray-400 uppercase mb-3 tracking-wider">История перемещений</p>
+                        <div class="relative border-l-2 border-gray-200 ml-1.5 space-y-5 pb-1">
+                            ${history.map(h => {
+                                const date = new Date(h.created_at);
+                                return `
+                                <div class="ml-5 relative">
+                                    <div class="absolute -left-[27px] top-1 h-3.5 w-3.5 rounded-full bg-white border-4 border-indigo-200"></div>
+                                    <p class="text-sm font-bold text-gray-800">${h.status}</p>
+                                    <p class="text-xs text-gray-500 mt-0.5 font-medium">${date.toLocaleDateString()} <span class="opacity-60">${date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span></p>
+                                </div>`;
+                            }).join('')}
+                        </div>
+                    </div>`;
+            }
+
+            const div = document.createElement('div');
+            div.className = "bg-white rounded-2xl p-5 shadow-[0_2px_8px_rgba(0,0,0,0.04)] border border-gray-100 transition active:scale-[0.99]";
+            
+            // Расчет (если есть)
+            let calcHtml = '';
+            if (order.calculated_weight_kg) {
+                calcHtml = `
+                    <div class="mt-3 bg-indigo-50 rounded-xl p-3 flex justify-between items-center text-sm text-indigo-900 font-medium">
+                        <span class="flex items-center"><i class="fas fa-weight-hanging mr-2 text-indigo-400"></i> ${order.calculated_weight_kg} кг</span>
+                        <span class="flex items-center"><i class="fas fa-dollar-sign mr-1 text-indigo-400"></i> ${order.calculated_price_per_kg_usd}</span>
+                    </div>`;
+            }
+
+            div.innerHTML = `
+                <div class="cursor-pointer group" onclick="toggleDetails(this)">
+                    <div class="flex justify-between items-start mb-2">
+                        <div class="flex items-start gap-3 overflow-hidden">
+                            <div class="mt-0.5 text-2xl text-indigo-500"><i class="fas ${icon}"></i></div>
+                            <div class="flex-1 min-w-0">
+                                <h4 class="text-lg font-extrabold text-gray-800 truncate tracking-tight font-mono">${order.track_code}</h4>
+                                <p class="text-sm text-gray-500 truncate font-medium">${order.comment || 'Без описания'}</p>
                             </div>
-                            <span class="text-sm font-semibold text-gray-700 whitespace-nowrap ml-2">${order.final_cost_som ? order.final_cost_som.toFixed(2) + ' сом' : ''}</span>
                         </div>
-                        ${order.comment ? `<p class="text-sm text-gray-500 mt-2"><b>Примечание:</b> ${order.comment}</p>` : ''}
+                        ${priceHtml}
                     </div>
-                `).join('');
-            }
+                    
+                    <div class="flex flex-wrap gap-2 mt-2">
+                        <span class="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wide ${statusBg}">
+                            ${order.status}
+                        </span>
+                    </div>
+
+                    ${footerHtml} </div>
+                
+                <div class="details-wrapper">
+                    <div class="details-content">
+                        ${calcHtml}
+                        ${historyTimeline}
+                    </div>
+                </div>
+            `;
+            return div;
         }
-        
-        // НОВАЯ ФУНКЦИЯ ДЛЯ ПОИСКА
-        function handleClientOrderSearch(e) {
-            const searchTerm = e.target.value.toLowerCase();
-            // Ищем по всем карточкам заказов на странице
-            document.querySelectorAll('.order-card').forEach(orderCard => {
-                const trackCode = orderCard.querySelector('.font-bold').textContent.toLowerCase();
-                if (trackCode.includes(searchTerm)) {
-                    orderCard.classList.remove('hidden');
+
+        function switchTab(tabName) {
+            ['ready', 'transit', 'archive'].forEach(t => {
+                const btn = document.getElementById(`tab-btn-${t}`);
+                const content = document.getElementById(`tab-content-${t}`);
+                const badge = document.getElementById('badge-ready');
+                
+                if (t === tabName) {
+                    btn.className = "tab-active flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-200 text-center relative transform scale-105 z-10";
+                    content.classList.remove('hidden');
+                    if(t === 'ready' && !badge.classList.contains('hidden')) btn.classList.add('pulse-btn');
+                    
+                    if (content.children.length === 0) {
+                        document.getElementById('empty-state').classList.remove('hidden'); document.getElementById('empty-state').classList.add('flex');
+                    } else {
+                        document.getElementById('empty-state').classList.add('hidden'); document.getElementById('empty-state').classList.remove('flex');
+                    }
                 } else {
-                    orderCard.classList.add('hidden');
+                    btn.className = "tab-inactive flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-200 text-center relative";
+                    content.classList.add('hidden');
+                    btn.classList.remove('pulse-btn');
                 }
             });
         }
 
-        // Логика переключения вкладок
-        document.getElementById('client-tabs').addEventListener('click', (e) => {
-            if (!e.target.classList.contains('tab-btn')) return;
-            const tabName = e.target.dataset.tab;
-            document.getElementById('client-tabs').querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active', 'border-indigo-600', 'text-indigo-600'));
-            e.target.classList.add('active', 'border-indigo-600', 'text-indigo-600');
-            document.getElementById('current-pane').classList.add('hidden');
-            document.getElementById('history-pane').classList.add('hidden');
-            document.getElementById(`${tabName}-pane`).classList.remove('hidden');
+        function toggleDetails(header) { header.nextElementSibling.classList.toggle('open'); }
+        function showError() { document.getElementById('loading-screen').classList.add('hidden'); document.getElementById('error-screen').classList.remove('hidden'); }
+        function animateValue(id, start, end, duration) {
+            if (start === end) return;
+            const range = end - start; let current = start; const increment = end > start ? 1 : -1; const stepTime = Math.abs(Math.floor(duration / (range / 10)));
+            const obj = document.getElementById(id);
+            const timer = setInterval(function() {
+                current += Math.ceil(range / 20);
+                if ((increment > 0 && current >= end) || (increment < 0 && current <= end)) { current = end; clearInterval(timer); }
+                obj.innerHTML = current.toLocaleString();
+            }, Math.max(stepTime, 20));
+        }
+
+        document.getElementById('search-input').addEventListener('input', (e) => {
+            renderLists(e.target.value);
+            const activeBtn = document.querySelector('.tab-active');
+            if (activeBtn) {
+                const tabName = activeBtn.id.replace('tab-btn-', '');
+                const content = document.getElementById(`tab-content-${tabName}`);
+                if (content.children.length === 0) { document.getElementById('empty-state').classList.remove('hidden'); document.getElementById('empty-state').classList.add('flex'); } 
+                else { document.getElementById('empty-state').classList.add('hidden'); document.getElementById('empty-state').classList.remove('flex'); }
+            }
         });
 
-        // Отправка формы добавления заказа
         document.getElementById('add-order-form').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const token = new URLSearchParams(window.location.search).get('token');
-            const trackCode = document.getElementById('track_code').value;
-            const comment = document.getElementById('comment').value;
-            if (!trackCode) { alert('Пожалуйста, введите трек-код.'); return; }
+            const btn = e.target.querySelector('button'); const originalText = btn.innerText; btn.innerText = "Сохранение..."; btn.disabled = true;
+            const track = document.getElementById('track_code').value; const comment = document.getElementById('comment').value;
+            const urlParams = new URLSearchParams(window.location.search); const token = urlParams.get('token');
             try {
-                const response = await fetch(`${CLIENT_API_URL}/api/client/orders?token=${token}`, {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ track_code: trackCode, comment: comment })
+                const res = await fetch(`${API_BASE}/api/client/orders?token=${token}`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ track_code: track, comment: comment })
                 });
-                if (!response.ok) { const errData = await response.json(); throw new Error(errData.detail || "Не удалось добавить заказ."); }
-                alert("Заказ успешно добавлен!");
-                location.reload();
-            } catch (error) { alert(`Ошибка: ${error.message}`); }
-        });
-
-        // Основная логика загрузки страницы
-        window.addEventListener('DOMContentLoaded', async () => {
-            const loadingDiv = document.getElementById('loading-state');
-            const errorDiv = document.getElementById('error-state');
-            const mainDiv = document.getElementById('main-content');
-
-            try {
-                const token = new URLSearchParams(window.location.search).get('token');
-                if (!token) throw new Error("Токен доступа не найден.");
-
-                const response = await fetch(`${CLIENT_API_URL}/api/client/data?token=${token}`);
-                if (!response.ok) throw new Error("Не удалось загрузить данные.");
-                
-                const data = await response.json();
-                document.getElementById('client-name').textContent = data.full_name;
-                
-                const allOrders = data.orders.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)) || [];
-                const currentOrders = allOrders.filter(order => order.status !== 'Выдан');
-                const issuedOrders = allOrders.filter(order => order.status === 'Выдан');
-                
-                renderOrders(currentOrders);
-                renderHistory(issuedOrders);
-
-                // "Оживляем" поисковую строку
-                document.getElementById('client-order-search').addEventListener('input', handleClientOrderSearch);
-
-                loadingDiv.classList.add('hidden');
-                mainDiv.classList.remove('hidden');
-            } catch (error) {
-                console.error(error);
-                loadingDiv.classList.add('hidden');
-                errorDiv.classList.remove('hidden');
-            }
+                if (!res.ok) throw new Error("Ошибка сервера");
+                document.getElementById('add-order-modal').classList.add('hidden'); document.getElementById('add-order-form').reset(); alert("Заказ добавлен! 🚀"); location.reload();
+            } catch (err) { alert("Ошибка добавления."); btn.innerText = originalText; btn.disabled = false; }
         });
     </script>
 </body>
