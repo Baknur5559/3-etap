@@ -496,7 +496,7 @@
 // =================================================================
 // МОДУЛЬ: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И НАСТРОЙКИ (v4.1 - Rebuild)
 // =================================================================
-const API_URL = 'http://213.148.7.107:8000'; // URL вашего бэкенда
+const API_URL = 'https://crm.kbexpress.ru'; // URL вашего бэкенда
 let currentUser = {}; // Данные вошедшего сотрудника { id, full_name, role, permissions, is_super_admin }
 let currentCompany = {}; // Данные текущей компании { id, name } (null для SuperAdmin)
 let activeShift = null; // Данные активной смены { id, start_time, employee_id, location_id, ... } (null если нет)
@@ -3653,8 +3653,11 @@ async function handleGenerateLkLink(clientId) {
      console.log(`[Action] handleGenerateLkLink: Start for Client ID ${clientId}`);
      showLoader();
      try {
-         // Отправляем POST запрос (как указано в main.py)
-         const response = await apiFetch(`/api/clients/${clientId}/generate_lk_link`, { method: 'POST' });
+         // ИСПРАВЛЕНИЕ: Передаем ID текущей компании
+         if (!currentCompany || !currentCompany.id) {
+             throw new Error("Не удалось определить ID компании. Попробуйте обновить страницу.");
+         }
+         const response = await apiFetch(`/api/clients/${clientId}/generate_lk_link?company_id=${currentCompany.id}`, { method: 'POST' });
          console.log(`[Action] handleGenerateLkLink: Received link: ${response.link}`);
          // Показываем ссылку в prompt для удобного копирования
          // prompt() может блокировать интерфейс, можно заменить на показ в модальном окне или просто копирование в буфер
