@@ -87,7 +87,8 @@ async def generate_and_send_notification(client: Client, new_status: str, track_
         # --- Конец блока получения токена ---
         
         secret_token = f"CLIENT-{client.id}-COMPANY-{client.company_id}-SECRET"
-        client_portal_base_url = os.getenv("CLIENT_PORTAL_URL", "http://ВАШ_ДОМЕН_ИЛИ_IP/lk.html") 
+        # ЖЕСТКАЯ ПРИВЯЗКА ДОМЕНА
+        client_portal_base_url = "https://crm.kbexpress.ru/lk.html"
         lk_link = f"{client_portal_base_url}?token={secret_token}"
         # --- Конец блока контактов и ЛК ---
 
@@ -2053,7 +2054,7 @@ def generate_lk_link_for_client(
     secret_token = f"CLIENT-{client.id}-COMPANY-{company_id}-SECRET"  
 
     # Получаем базовый URL (остается как было)
-    client_portal_base_url = os.getenv("CLIENT_PORTAL_URL", "http://ВАШ_ДОМЕН_ИЛИ_IP/lk.html")  
+    client_portal_base_url = "https://crm.kbexpress.ru/lk.html"  
 
     link = f"{client_portal_base_url}?token={secret_token}"
     return {"link": link}
@@ -2636,12 +2637,11 @@ def create_order(
 
         db.refresh(new_order, attribute_names=['client'])
 
-        # --- Уведомление Владельцу ---
-        comment_str = f"\n<i>Комментарий: {new_order.comment}</i>" if new_order.comment else ""
         message = (
-            f"🔔 <b>Добавлен новый заказ (1 шт)</b>\n\n"
-            f"Клиент: <b>{client.full_name}</b>\n"
-            f"Трек-код: <code>{new_order.track_code}</code>{comment_str}"
+            f"🔔 <b>Новый заказ (через Бот)</b>\n\n"
+            f"👤 Клиент: <b>{client.full_name}</b>\n"
+            f"📦 Трек: <code>{new_order.track_code}</code>{comment_str}\n\n"
+            f"🤖 <b>Источник: Telegram Бот</b>"
         )
         background_tasks.add_task(
             notify_owners,
@@ -2784,6 +2784,33 @@ async def update_order(
              ).first()
              if existing_order:
                   raise HTTPException(status_code=400, detail="Такой трек-код уже существует.")
+
+    # --- ЖУЧОК: ЗАНИЖЕНИЕ ВЕСА ---
+    if 'calculated_weight_kg' in update_data:
+        old_w = order.calculated_weight_kg or 0
+        new_w = update_data['calculated_weight_kg']
+        
+        # Если вес был, а стал меньше на 10% и более
+        if old_w > 0 and new_w < (old_w * 0.9):
+            diff = old_w - new_w
+            alert_msg = (
+                f"⚖️ <b>ВНИМАНИЕ! ЗАНИЖЕНИЕ ВЕСА!</b>\n\n"
+                f"👤 <b>Сотрудник:</b> {employee.full_name}\n"
+                f"📦 <b>Трек:</b> {order.track_code}\n"
+                f"🔻 <b>Было:</b> {old_w} кг ➡️ <b>Стало:</b> {new_w} кг\n"
+                f"📉 <b>Разница:</b> -{diff:.2f} кг\n\n"
+                f"⚠️ Проверьте заказ! Возможно, это 'скидка' для знакомого."
+            )
+            background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=alert_msg)
+            
+            db.add(AuditLog(
+                company_id=employee.company_id,
+                event_type="suspicious_weight_drop",
+                entity_id=order.track_code,
+                description=f"Вес снижен с {old_w} до {new_w} кг.",
+                who_did_it=f"{employee.full_name}"
+            ))
+    # -----------------------------
 
     # 5. Применяем обновления
     try:
@@ -3190,6 +3217,28 @@ def bulk_order_action(
         # История
         history_entries = [OrderHistory(order_id=oid, status=new_status, employee_id=employee.id) for oid in ids_to_process]
         db.bulk_save_objects(history_entries)
+
+        # --- ЛОВУШКА: МАССОВОЕ ПРИСВОЕНИЕ ---
+        if len(ids_to_process) > 10: # Если присваивают больше 10 заказов разом
+            client_target = db.query(Client).filter(Client.id == new_client_id).first()
+            client_name = client_target.full_name if client_target else "Unknown"
+            
+            suspicious_msg = (
+                f"🚨 <b>МАССОВОЕ ПРИСВОЕНИЕ!</b> 🚨\n\n"
+                f"👤 <b>Кто делает:</b> {employee.full_name}\n"
+                f"📦 <b>Сколько:</b> {len(ids_to_process)} заказов\n"
+                f"👉 <b>Кому присвоил:</b> {client_name}\n\n"
+                f"⚠️ Проверьте, реально ли это заказы этого клиента!"
+            )
+            background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=suspicious_msg)
+            
+            db.add(AuditLog(
+                company_id=employee.company_id,
+                event_type="mass_assignment",
+                entity_id=f"Client: {client_name}",
+                description=f"Присвоил {len(ids_to_process)} заказов клиенту {client_name}.",
+                who_did_it=f"{employee.full_name}"
+            ))
         
         db.commit()
 
@@ -4271,7 +4320,8 @@ def issue_orders(
     db: Session = Depends(get_db)
 ):
     """
-    Оформляет выдачу. Если оплата меньше суммы -> записывает ДОЛГ в транзакции.
+    Оформляет выдачу. Если оплата меньше суммы -> записывает ДОЛГ.
+    Ловит занижение веса и отправляет СВОДНЫЙ отчет владельцу.
     """
     if employee.company_id is None:
         raise HTTPException(status_code=403, detail="Действие недоступно для SuperAdmin.")
@@ -4282,7 +4332,7 @@ def issue_orders(
 
     order_ids = [item.order_id for item in payload.orders]
     
-    # Загружаем заказы и клиентов
+    # Загружаем заказы
     orders_to_issue = db.query(Order).options(joinedload(Order.client)).filter(
         Order.id.in_(order_ids),
         Order.company_id == employee.company_id
@@ -4310,7 +4360,6 @@ def issue_orders(
     order_weights = {item.order_id: item.weight_kg for item in payload.orders}
     
     for order in orders_to_issue:
-        # --- ИСПРАВЛЕНИЕ: Разрешаем выдавать и со склада ---
         if order.status not in ["Готов к выдаче", "На складе в КР"]:
             raise HTTPException(status_code=400, detail=f"Заказ {order.track_code} имеет статус '{order.status}' и не может быть выдан.")
             
@@ -4318,40 +4367,65 @@ def issue_orders(
         if not weight or weight <= 0:
              raise HTTPException(status_code=400, detail=f"Не указан вес для {order.track_code}.")
         
-        # --- РАСЧЕТ И ОКРУГЛЕНИЕ ---
+        # Расчет
         raw_cost = weight * payload.price_per_kg_usd * payload.exchange_rate_usd
         cost = round(raw_cost)
-        
         total_cost_to_pay += cost
 
-    # --- ЛОГИКА ДОЛГА ---
+    # Логика долга
     total_paid = payload.paid_cash + payload.paid_card
     debt_amount = 0
-    
-    # Разрешаем погрешность в 1 сом
     if total_paid < (total_cost_to_pay - 1):
         debt_amount = total_cost_to_pay - total_paid
-        # Мы разрешаем долг, не выбрасываем ошибку
     
     # Оформляем выдачу
     now = datetime.now()
     issued_count = 0
+    
+    # --- СПИСОК ДЛЯ СБОРА ПОДОЗРИТЕЛЬНЫХ ЗАКАЗОВ ---
+    suspicious_weight_items = [] 
     
     try:
         # 1. Обновляем заказы
         for order in orders_to_issue:
             item_data = next((item for item in payload.orders if item.order_id == order.id), None)
             if item_data:
+                
+                # --- ЖУЧОК НА ВЕС (СБОР ДАННЫХ) ---
+                old_w = order.calculated_weight_kg or 0
+                new_w = item_data.weight_kg
+                
+                # Если вес занижен на 10% и более
+                if old_w > 0 and new_w < (old_w * 0.9):
+                    diff = old_w - new_w
+                    # Добавляем в список (не отправляем сразу!)
+                    suspicious_weight_items.append({
+                        "track": order.track_code,
+                        "old": old_w,
+                        "new": new_w,
+                        "diff": diff
+                    })
+                    
+                    # В Детектив пишем СРАЗУ (каждый случай отдельно)
+                    try:
+                        db.add(AuditLog(
+                            company_id=employee.company_id,
+                            event_type="suspicious_weight_drop_issue",
+                            entity_id=order.track_code,
+                            description=f"При выдаче вес снижен с {old_w} до {new_w} кг.",
+                            who_did_it=f"{employee.full_name}"
+                        ))
+                    except: pass
+                # ----------------------------------
+
                 order.status = "Выдан"
                 db.add(OrderHistory(order_id=order.id, status="Выдан", employee_id=employee.id))
                 
                 order.weight_kg = item_data.weight_kg
                 order.price_per_kg_usd = payload.price_per_kg_usd
                 order.exchange_rate_usd = payload.exchange_rate_usd
-                # Тоже округляем при записи в базу, чтобы цифры везде совпадали
                 order.final_cost_som = round(item_data.weight_kg * payload.price_per_kg_usd * payload.exchange_rate_usd)
                 
-                # Распределяем оплату пропорционально (для аналитики)
                 order.paid_cash_som = payload.paid_cash / len(orders_to_issue)
                 order.paid_card_som = payload.paid_card / len(orders_to_issue)
                 order.card_payment_type = payload.card_payment_type if payload.paid_card > 0 else None
@@ -4365,34 +4439,47 @@ def issue_orders(
         if debt_amount > 0:
             client_id = orders_to_issue[0].client_id
             if client_id:
-                # Собираем детали
                 trx_details = []
                 for o in orders_to_issue:
-                    # Ищем вес для этого заказа
                     w_item = next((i for i in payload.orders if i.order_id == o.id), None)
                     w = w_item.weight_kg if w_item else 0
-                    
                     trx_details.append({
                         "track": o.track_code,
                         "comm": o.comment or "",
                         "weight": w,
-                        # Округляем и здесь для красоты в истории
                         "cost": round(w * payload.price_per_kg_usd * payload.exchange_rate_usd)
                     })
 
                 debt_trx = Transaction(
                     client_id=client_id,
-                    amount=-debt_amount, # Отрицательная сумма = Долг
+                    amount=-debt_amount,
                     transaction_type="delivery",
                     description=f"Долг за выдачу {len(orders_to_issue)} заказов",
                     created_by=employee.id,
-                    details=trx_details # <-- ЗАПИСЫВАЕМ ДЕТАЛИ
+                    details=trx_details
                 )
                 db.add(debt_trx)
 
+        # 3. ЖУЧОК НА КУРС (Остается как был)
+        official_rate = active_shift.exchange_rate_usd
+        input_rate = payload.exchange_rate_usd
+        if input_rate < (official_rate - 0.5):
+            diff = official_rate - input_rate
+            total_w = sum(item.weight_kg for item in payload.orders)
+            lost_money = total_w * payload.price_per_kg_usd * diff
+            alert_msg = (
+                f"💸 <b>МАХИНАЦИЯ С КУРСОМ!</b>\n\n"
+                f"👤 <b>Сотрудник:</b> {employee.full_name}\n"
+                f"📉 <b>Курс смены:</b> {official_rate}\n"
+                f"🔻 <b>Курс продажи:</b> {input_rate} (Занижен на {diff:.2f})\n"
+                f"⚠️ <b>Потеря:</b> ~{lost_money:.0f} сом\n\n"
+                f"Выдача {len(payload.orders)} заказов."
+            )
+            background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=alert_msg)
+
         db.commit()
 
-        # 3. Рассылка
+        # 4. Рассылка клиентам
         notifications_map = {}
         for order in orders_to_issue:
             if order.client and order.client.telegram_chat_id:
@@ -4402,6 +4489,29 @@ def issue_orders(
         
         for cid, data in notifications_map.items():
             background_tasks.add_task(generate_and_send_notification, client=data["client"], new_status="Выдан", track_codes=data["tracks"])
+
+        # --- 5. ОТПРАВКА СВОДНОГО ОТЧЕТА О ВЕСЕ (НОВОЕ!) ---
+        if suspicious_weight_items:
+            alert_header = (
+                f"⚖️ <b>ВНИМАНИЕ! ЗАНИЖЕНИЕ ВЕСА!</b>\n"
+                f"👤 <b>Сотрудник:</b> {employee.full_name}\n"
+                f"📦 <b>Подозрительных заказов:</b> {len(suspicious_weight_items)} шт.\n\n"
+                f"📝 <b>Детализация:</b>\n"
+            )
+            
+            alert_body = ""
+            for item in suspicious_weight_items:
+                alert_body += (
+                    f"🔻 <code>{item['track']}</code>: "
+                    f"{item['old']} ➡️ <b>{item['new']} кг</b> "
+                    f"(Разница: -{item['diff']:.2f})\n"
+                )
+            
+            alert_footer = "\n⚠️ <b>Проверьте эти заказы!</b> Возможно, это 'скидка' для знакомого."
+            
+            full_alert = alert_header + alert_body + alert_footer
+            background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=full_alert)
+        # ----------------------------------------------------
 
         msg = f"Выдано заказов: {issued_count}."
         if debt_amount > 0:
@@ -7161,3 +7271,45 @@ def undo_bulk_action(
 
     else:
         raise HTTPException(status_code=400, detail="Отмена для этого типа операций пока не реализована.")
+    
+# Добавьте в конец main.py
+
+@app.delete("/api/transactions/{transaction_id}", tags=["Финансы (Долги)"])
+def delete_transaction(
+    transaction_id: int,
+    background_tasks: BackgroundTasks,
+    employee: Employee = Depends(get_company_owner), # Только Владелец может удалять (пока что)
+    db: Session = Depends(get_db)
+):
+    """
+    Удаляет транзакцию. Если это делает не Владелец (в будущем), сработает жучок.
+    """
+    trx = db.query(Transaction).filter(Transaction.id == transaction_id, Transaction.client.has(company_id=employee.company_id)).first()
+    
+    if not trx:
+        raise HTTPException(status_code=404, detail="Транзакция не найдена.")
+
+    # --- ЖУЧОК НА УДАЛЕНИЕ ДЕНЕГ ---
+    # Логируем любое удаление денег
+    alert_msg = (
+        f"💸 <b>УДАЛЕНИЕ ФИНАНСОВОЙ ЗАПИСИ!</b>\n\n"
+        f"👤 <b>Кто удалил:</b> {employee.full_name}\n"
+        f"💰 <b>Сумма:</b> {trx.amount} сом\n"
+        f"📝 <b>Описание:</b> {trx.description}\n"
+        f"📅 <b>Дата записи:</b> {trx.created_at}"
+    )
+    background_tasks.add_task(notify_owners, company_id=employee.company_id, message_text=alert_msg)
+    
+    # Пишем в Детектив
+    db.add(AuditLog(
+        company_id=employee.company_id,
+        event_type="delete_transaction",
+        entity_id=str(transaction_id),
+        description=f"Удалена транзакция: {trx.amount} с. ({trx.description})",
+        who_did_it=f"{employee.full_name}"
+    ))
+    # -------------------------------
+
+    db.delete(trx)
+    db.commit()
+    return {"status": "ok", "message": "Транзакция удалена."}
