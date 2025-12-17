@@ -2637,6 +2637,10 @@ def create_order(
 
         db.refresh(new_order, attribute_names=['client'])
 
+        # --- ИСПРАВЛЕНИЕ: Определяем переменную comment_str ---
+        comment_str = f"\n<i>Комментарий: {new_order.comment}</i>" if new_order.comment else ""
+        # -----------------------------------------------------
+
         message = (
             f"🔔 <b>Новый заказ (через Бот)</b>\n\n"
             f"👤 Клиент: <b>{client.full_name}</b>\n"
