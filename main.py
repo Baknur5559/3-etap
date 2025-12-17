@@ -6267,28 +6267,19 @@ class BotBroadcastResponse(BaseModel):
 
 # --- ДОБАВЬ ЭТОТ НОВЫЙ ЭНДПОИНТ ---
 @app.post("/api/bot/broadcast", tags=["Telegram Bot"], response_model=BotBroadcastResponse)
-async def bot_broadcast( # <--- Убедись, что 'async' здесь есть
+async def bot_broadcast(
     payload: BotBroadcastPayload,
-    # Требуем, чтобы запрос делал Владелец
     employee: Employee = Depends(get_company_owner), 
     db: Session = Depends(get_db)
 ):
-    """
-    Выполняет рассылку сообщения всем клиентам компании, привязавшим бота.
-    Вызывается ботом, аутентифицируется по X-Employee-ID Владельца.
-    """
     company_id = employee.company_id
-    print(f"[Broadcast] Владелец {employee.full_name} (ID: {employee.id}) запускает рассылку для компании ID: {company_id}")
+    logger.info(f"[Broadcast] Запуск рассылки Owner: {employee.full_name}, Company: {company_id}")
 
-    # 1. Находим токен бота компании (берем из модели Company)
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company or not company.telegram_bot_token:
-        print(f"!!! [Broadcast] Ошибка: Не найден токен бота для компании ID: {company_id}")
-        raise HTTPException(status_code=400, detail="Токен Telegram-бота не настроен для этой компании в админ-панели.")
+        raise HTTPException(status_code=400, detail="Токен бота не найден.")
 
-    bot_token = company.telegram_bot_token
-
-    # 2. СОХРАНЯЕМ РАССЫЛКУ В БД (ШАГ 2)
+    # 1. Сохраняем в историю
     try:
         new_broadcast = Broadcast(
             text=payload.text,
@@ -6298,49 +6289,52 @@ async def bot_broadcast( # <--- Убедись, что 'async' здесь ест
         db.add(new_broadcast)
         db.commit()
         db.refresh(new_broadcast)
-        broadcast_id = new_broadcast.id # Получаем ID новой рассылки
-        print(f"[Broadcast] Рассылка сохранена в БД, ID: {broadcast_id}")
     except Exception as e:
         db.rollback()
-        logger.error(f"!!! [Broadcast] Ошибка сохранения рассылки в БД: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Ошибка базы данных при сохранении рассылки.")
+        logger.error(f"Broadcast DB Error: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка БД при создании рассылки.")
 
-
-    # 3. Находим всех клиентов (ШАГ 3)
-    clients_to_notify = db.query(Client).filter(
+    # 2. Получаем клиентов
+    clients = db.query(Client).filter(
         Client.company_id == company_id,
         Client.telegram_chat_id != None
     ).all()
 
-    if not clients_to_notify:
-        return BotBroadcastResponse(status="ok", message="Рассылка сохранена, но нет клиентов для отправки.", sent_to_clients=0)
+    if not clients:
+        return BotBroadcastResponse(status="ok", message="Нет подписчиков.", sent_to_clients=0)
 
-    # 4. Запускаем асинхронную рассылку (ШАГ 4)
-    tasks = []
-    bot = telegram.Bot(token=bot_token)
+    # 3. БЕЗОПАСНАЯ РАССЫЛКА (Semaphore)
+    # Ограничиваем: не более 25 одновременных запросов к Telegram
+    sem = asyncio.Semaphore(25)
     
-    for client in clients_to_notify:
-        # Создаем задачу на отправку
-        tasks.append(
-            send_telegram_message(
-                token=bot_token, 
-                chat_id=client.telegram_chat_id,
-                text=payload.text, 
-                photo_id=payload.photo_file_id,
-                broadcast_id=broadcast_id # <-- ДОБАВЛЕНО (ID для кнопок)
-            )
-        )
-    
-    # Ожидаем завершения всех отправок
-    await asyncio.gather(*tasks)
+    async def safe_send(client):
+        async with sem:
+            try:
+                # Маленькая задержка, чтобы размазать нагрузку
+                await asyncio.sleep(0.05) 
+                await send_telegram_message(
+                    token=company.telegram_bot_token,
+                    chat_id=client.telegram_chat_id,
+                    text=payload.text,
+                    photo_id=payload.photo_file_id,
+                    broadcast_id=new_broadcast.id
+                )
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to send to {client.id}: {e}")
+                return False
 
-    sent_count = len(clients_to_notify)
-    print(f"[Broadcast] Рассылка для компании ID: {company_id} завершена. Отправлено: {sent_count} сообщений.")
+    # Запускаем задачи
+    tasks = [safe_send(c) for c in clients]
+    results = await asyncio.gather(*tasks)
     
+    success_count = sum(1 for r in results if r)
+    logger.info(f"[Broadcast] Рассылка завершена. Успешно: {success_count}/{len(clients)}")
+
     return BotBroadcastResponse(
         status="ok",
-        message=f"Рассылка успешно отправлена.",
-        sent_to_clients=sent_count
+        message="Рассылка отправлена.",
+        sent_to_clients=success_count
     )
 # --- КОНЕЦ НОВОГО ЭНДПОИНТА ---
 
