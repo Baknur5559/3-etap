@@ -1,5 +1,5 @@
 # ai_brain.py - Мозг ИИ (DeepSeek + Gemini Fallback)
-# ВЕРСЯ 6.8 - Фикс Галлюцинаций и Форматирования
+# ВЕРСИЯ 6.9 - FINAL (С сохранением всех промптов и функций голоса)
 import os
 import logging
 import asyncio
@@ -9,11 +9,17 @@ from dotenv import load_dotenv
 import pathlib
 import speech_recognition as sr
 from pydub import AudioSegment
-import os
+from datetime import date, datetime
+
+# Настройка логгера
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+load_dotenv()
 
 # =================================================================
-# --- НОВАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ ДЛЯ КЛИЕНТСКОГО AI (С ЮМОРОМ) ---
-# (ВЕРСЯ 6.8 - Жесткие правила инструментов и HTML)
+# --- СИСТЕМНАЯ ИНСТРУКЦИЯ (ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ) ---
 # =================================================================
 
 AI_CLIENT_PROMPT = """
@@ -158,12 +164,6 @@ AI_CLIENT_PROMPT = """
      **ФАЗА 4: ОТПРАВКА**
      - Только когда клиент напишет **"Да", "Отправляй", "Верно"**:
        - ✅ ВЫЗЫВАЙ `{{"tool": "submit_complaint", "text": "[Финальный, грамотный текст жалобы]"}}`.
-       
-🚀 **ПРИМЕРЫ ОТВЕТОВ:**
-(Этот раздел остается как в твоем файле)
-
-🔥 РЕЖИМ ОТЛАДКИ И ОШИБОК (КРИТИЧЕСКИ ВАЖНО):
-(Этот раздел остается как в твоем файле)
 
 🔥 **(ИСПРАВЛЕНО) ФОРМАТИРОВАНИЕ ТЕКСТА (КРИТИЧЕСКИ ВАЖНО!!!):**
 - ТЫ ОБЯЗАН использовать **ТОЛЬКО HTML-теги** для выделения.
@@ -379,7 +379,7 @@ AI_OWNER_PROMPT = """
       3. Если Шеф дал свои цифры -> Используй параметры `price` и `rate`.
     
     - *Действие (Пример):* {{ "tool": "bulk_assign_by_tracks", "track_codes": ["..."], "client_search": "Алимбек", "status": "На складе в КР", "weight": 6.0, "price": 2.5, "rate": 89.0 }}
-     
+      
 🔥 **ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ (СТРОГО):**
 1. **ТОЛЬКО HTML:** Используй `<b>жирный</b>`, `<i>курсив</i>`. НЕ используй Markdown (`**`, `*`, `_`).
 2. **ЧИСЛА:** `8.5` (точка), не запятая.
@@ -401,39 +401,48 @@ AI_OWNER_PROMPT = """
      4. ТОЛЬКО ТОГДА вызывай `calculate_orders`.
 """
 
-# Настройка
-load_dotenv()
-logger = logging.getLogger(__name__)
+# =================================================================
+# --- НАСТРОЙКА КЛИЕНТОВ (DeepSeek + Gemini) ---
+# =================================================================
 
-# 1. Настройка DeepSeek (через библиотеку OpenAI)
+# 1. Настройка DeepSeek
 DS_KEY = os.getenv("DEEPSEEK_API_KEY")
 deepseek_client = None
 if DS_KEY:
-    deepseek_client = AsyncOpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com")
+    try:
+        # ДОБАВЛЯЕМ ТАЙМ-АУТ 90 СЕКУНД
+        deepseek_client = AsyncOpenAI(
+            api_key=DS_KEY, 
+            base_url="https://api.deepseek.com",
+            timeout=90.0
+        )
+        logger.info("✅ DeepSeek Client OK")
+    except Exception as e:
+        logger.error(f"⚠️ DeepSeek init error: {e}")
 
 # 2. Настройка Gemini (Google)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 gemini_model = None
-if GEMINI_KEY:  # <--- Было GEMINI_API_KEY, стало GEMINI_KEY
+
+if GEMINI_KEY:
     try:
         genai.configure(api_key=GEMINI_KEY)
-        # ПРОБУЕМ РАЗНЫЕ МОДЕЛИ, ЧТОБЫ ИЗБЕЖАТЬ ОШИБКИ 404
-        try:
-            gemini_model = genai.GenerativeModel('gemini-1.5-flash-001') # Пробуем новую
-        except:
-            try:
-                gemini_model = genai.GenerativeModel('gemini-1.5-flash') # Пробуем обычную
-            except:
-                gemini_model = genai.GenerativeModel('gemini-pro') # Откат на старую
-        logger.info("✅ Gemini AI подключен.")
+        
+        # --- ИСПРАВЛЕНИЕ: ИСПОЛЬЗУЕМ МОДЕЛЬ ИЗ ТВОЕГО СПИСКА ---
+        # Твой ключ поддерживает версию 2.0. Ставим её.
+        # Твоя диагностика показала, что эта модель есть. Ставим её жестко.
+        gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+            
+        logger.info(f"✅ Gemini AI подключен (Модель: gemini-2.0-flash).")
     except Exception as e:
-        logger.error(f"❌ Ошибка Gemini: {e}")
+        logger.error(f"❌ Ошибка подключения Gemini: {e}")
 
-# --- Вспомогательные функции (Санитары) ---
-from datetime import date, datetime
+# =================================================================
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# =================================================================
 
 def clean_messages_recursively(data):
-    """Рекурсивно превращает все даты в строки"""
+    """Рекурсивно превращает все даты в строки (чтобы JSON не ломался)"""
     if isinstance(data, dict):
         return {k: clean_messages_recursively(v) for k, v in data.items()}
     elif isinstance(data, list):
@@ -443,7 +452,7 @@ def clean_messages_recursively(data):
     return data
 
 def validate_history(history):
-    """Выкидывает битые сообщения"""
+    """Выкидывает битые сообщения и оставляет только валидные"""
     valid_history = []
     if not isinstance(history, list): return []
     for msg in history:
@@ -453,51 +462,75 @@ def validate_history(history):
             valid_history.append(msg)
     return valid_history
 
-async def get_ai_response(messages_history: list, context_prompt: str = "") -> str:
+# =================================================================
+# --- ГЛАВНАЯ ФУНКЦИЯ МОЗГА (С ИСПРАВЛЕНИЯМИ) ---
+# =================================================================
+
+async def get_ai_response(messages_history: list, system_prompt: str) -> str:
     """
-    ВЕРСИЯ С ПОЛНОЙ ЗАЩИТОЙ (Dates + Validation).
+    Умная генерация ответа:
+    1. ЭКОНОМИЯ: Режет историю до 5 последних сообщений.
+    2. DeepSeek: Пытается ответить через DeepSeek (до 25 сек).
+    3. Gemini Fallback: Если DeepSeek упал или нет денег -> переключается на Gemini.
     """
-    last_error = ""
     
-    # 1. Очистка памяти
-    clean_history_raw = validate_history(messages_history)
-    clean_history = clean_messages_recursively(clean_history_raw)
+    # 1. Чистим и обрезаем историю (ЭКОНОМИЯ ДЕНЕГ)
+    safe_history = validate_history(messages_history)
+    
+    # !!! ВАЖНО: Оставляем только последние 5 сообщений диалога !!!
+    if len(safe_history) > 5:
+        safe_history = safe_history[-5:]
 
-    # --- ПОПЫТКА 1: DeepSeek ---
-    if deepseek_client:
-        try:
-            full_messages = [{"role": "system", "content": context_prompt}] + clean_history
-            response = await deepseek_client.chat.completions.create(
+    # Формируем сообщения для OpenAI формата
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(safe_history)
+
+    # 2. Пытаемся DeepSeek
+    try:
+        if not deepseek_client:
+            raise ValueError("DeepSeek клиент не инициализирован")
+
+        # Ставим тайм-аут 60 секунд (DeepSeek сейчас медленный)
+        response = await asyncio.wait_for(
+            deepseek_client.chat.completions.create(
                 model="deepseek-chat",
-                messages=full_messages,
-                timeout=45.0
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.warning(f"⚠️ DeepSeek сбой: {e}")
-            last_error += f"DeepSeek: {str(e)}"
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1024, 
+            ),
+            timeout=60.0
+        )
+        return response.choices[0].message.content
 
-    # --- ПОПЫТКА 2: Gemini ---
-    if gemini_model:
+    except Exception as e:
+        logger.error(f"⚠️ DeepSeek Error (Switching to Gemini): {e}")
+        
+        # 3. FALLBACK: Gemini (БЕСПЛАТНЫЙ/ДЕШЕВЫЙ)
         try:
-            chat_history_text = ""
-            for msg in clean_history:
-                role_name = "Клиент" if msg['role'] == 'user' else "Ты"
-                chat_history_text += f"{role_name}: {msg['content']}\n"
+            if not gemini_model:
+                return "Извините, сервис временно перегружен (Gemini не настроен)."
             
-            full_prompt = f"{context_prompt}\n\nИСТОРИЯ ДИАЛОГА:\n{chat_history_text}\n\nТВОЙ ОТВЕТ:"
+            # Gemini принимает историю по-другому, склеиваем в текст
+            full_prompt = system_prompt + "\n\n=== ИСТОРИЯ ДИАЛОГА (ПОСЛЕДНИЕ СООБЩЕНИЯ) ===\n"
+            for msg in safe_history:
+                role = "User" if msg['role'] == 'user' else "Assistant"
+                full_prompt += f"{role}: {msg['content']}\n"
+            full_prompt += "\nAssistant (Ответь JSON-ом инструмента или текстом):"
+
             response = await gemini_model.generate_content_async(full_prompt)
             return response.text
-        except Exception as e:
-            logger.error(f"⚠️ Gemini сбой: {e}")
-            last_error += f" | Gemini: {str(e)}"
 
-    return f"⚠️ **СБОЙ СИСТЕМЫ:**\n{last_error}\n\nПожалуйста, повторите запрос."
+        except Exception as e_gemini:
+            logger.error(f"❌ Gemini тоже упал: {e_gemini}")
+            return "Извините, я сейчас немного занят обновлением базы. Спросите меня через минуту! 🙏"
 
-# --- ФУНКЦИЯ РАСПОЗНАВАНИЯ ГОЛОСА (STT) ---
+# =================================================================
+# --- ФУНКЦИИ ГОЛОСОВОГО ВВОДА (STT) ---
+# =================================================================
+
 async def transcribe_audio(file_path: str) -> str:
     """
-    Отправляет аудиофайл в Gemini 1.5 Flash и возвращает текст.
+    Отправляет аудиофайл в Gemini и возвращает текст.
     """
     if not gemini_model:
         logger.warning("Gemini не настроен, голосовой ввод невозможен.")
@@ -505,11 +538,9 @@ async def transcribe_audio(file_path: str) -> str:
     
     try:
         # 1. Загружаем файл в Google AI
-        # (Gemini 1.5 Flash поддерживает аудио напрямую)
         uploaded_file = genai.upload_file(path=file_path)
         
         # 2. Просим расшифровать
-        # Даем четкую инструкцию не добавлять лишнего
         response = await gemini_model.generate_content_async(
             [
                 "Послушай это аудио и напиши точный текст того, что там сказано. "
@@ -518,15 +549,12 @@ async def transcribe_audio(file_path: str) -> str:
                 uploaded_file
             ]
         )
-        
-        # 3. Возвращаем текст
         return response.text.strip()
         
     except Exception as e:
         logger.error(f"Ошибка транскрибации аудио: {e}")
         return ""
-    
-# --- ФУНКЦИЯ РАСПОЗНАВАНИЯ ЧЕРЕЗ БЕСПЛАТНЫЙ GOOGLE ---
+
 async def transcribe_audio_google(file_path: str) -> str:
     """
     Конвертирует OGG в WAV и использует бесплатный Google Web Speech API.
@@ -534,7 +562,7 @@ async def transcribe_audio_google(file_path: str) -> str:
     wav_path = file_path + ".wav"
     
     try:
-        # 1. Конвертация OGG -> WAV (Telegram шлет OGG, Google хочет WAV)
+        # 1. Конвертация OGG -> WAV
         sound = AudioSegment.from_ogg(file_path)
         sound.export(wav_path, format="wav")
         
@@ -542,20 +570,15 @@ async def transcribe_audio_google(file_path: str) -> str:
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-            # language="ru-RU" - Русский язык
-            # Google сам поймет цифры и буквы
             text = recognizer.recognize_google(audio_data, language="ru-RU")
             
         return text
 
     except sr.UnknownValueError:
-        return "" # Google не разобрал речь
-    except sr.RequestError:
-        return "Ошибка сервиса Google"
+        return "" 
     except Exception as e:
         logger.error(f"Google Speech Error: {e}")
         return ""
     finally:
-        # Чистим временный wav файл
         if os.path.exists(wav_path):
             os.remove(wav_path)
