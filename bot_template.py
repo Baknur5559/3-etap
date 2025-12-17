@@ -346,19 +346,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = str(user.id)
     logger.info(f"Команда /start от {user.full_name} (ID: {chat_id})")
 
-    # Ставим тайм-аут 120 секунд, чтобы успеть отправить всем 200+ клиентам
+    # --- ИСПРАВЛЕНИЕ: Правильный запрос идентификации ---
+    # Мы спрашиваем у API: "Кто этот пользователь с таким Telegram ID?"
     api_response = await api_request(
         "POST", 
-        "/api/bot/broadcast",
-        employee_id=employee_id,
-        json=payload,
-        timeout=120.0 
+        "/api/bot/identify_user",
+        json={"telegram_chat_id": chat_id, "company_id": COMPANY_ID_FOR_BOT}
     )
 
     if api_response and "error" not in api_response:
         # --- КЛИЕНТ НАЙДЕН ---
         client_data = api_response.get("client")
         is_owner = api_response.get("is_owner", False)
+        
+        # Сохраняем данные в сессию бота
         context.user_data['client_id'] = client_data.get("id")
         context.user_data['is_owner'] = is_owner
         context.user_data['full_name'] = client_data.get("full_name")
@@ -366,14 +367,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
         markup = owner_main_menu_markup if is_owner else client_main_menu_markup
         role_text = " (Владелец)" if is_owner else ""
+        
         await update.message.reply_html(
-            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\nРад вас видеть! Используйте меню или напишите что вы хотите наш ИИ менеджер ответит на все ваши вопросы.",
+            f"👋 Здравствуйте, <b>{client_data.get('full_name')}</b>{role_text}!\n\n"
+            f"Рад вас видеть! Используйте меню или напишите свой вопрос — наш ИИ менеджер поможет.",
             reply_markup=markup
         )
     else:
         # --- ГОСТЬ (НЕ НАЙДЕН) ---
-        # ВАЖНО: Мы НЕ требуем телефон, а просто здороваемся и разрешаем общаться с ИИ
         context.user_data['client_id'] = None
+        # Очищаем старые данные на всякий случай
+        context.user_data.pop('is_owner', None)
+        context.user_data.pop('employee_id', None)
+        
         await update.message.reply_html(
             "👋 Здравствуйте! Я — ИИ-помощник Карго.\n\n"
             "Вы пока не зарегистрированы, но можете задавать мне вопросы!\n"
@@ -381,7 +387,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=ReplyKeyboardRemove()
         )
 
-    return ConversationHandler.END # <-- САМОЕ ГЛАВНОЕ: Не захватываем пользователя!
+    return ConversationHandler.END
 
 async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -1103,7 +1109,7 @@ async def process_text_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # 5. ПОДГОТОВКА КОНТЕКСТА ДЛЯ ИИ
     history = context.user_data.get('dialog_history', [])
     history.append({"role": "user", "content": text})
-    if len(history) > 10: history = history[-10:] # Храним последние 10 сообщений
+    if len(history) > 6: history = history[-6:] # Храним последние 6 сообщений (Экономия токенов)
 
     # --- СЫВОРОТКА ПРАВДЫ (Сбор данных о компании) ---
     company_info_text = ""
