@@ -6749,6 +6749,79 @@ def search_audit_logs(
     logs = query.order_by(AuditLog.created_at.desc()).limit(50).all()
     return logs
 
+# --- ДОБАВИТЬ ЭТУ МОДЕЛЬ В НАЧАЛО main.py (где все class BaseModel) ---
+class BroadcastRequest(BaseModel):
+    text: str
+    photo_file_id: Optional[str] = None
+    company_id: int # Обязательно, чтобы знать, кого спамить
+
+# --- ДОБАВИТЬ ЭТОТ ЭНДПОИНТ В main.py (раздел "Telegram Bot" или "Отчеты") ---
+
+@app.post("/api/admin/broadcast/safe_send", tags=["Рассылка"])
+async def send_broadcast_safe(
+    payload: BroadcastRequest,
+    background_tasks: BackgroundTasks,
+    employee: Employee = Depends(get_company_owner),
+    db: Session = Depends(get_db)
+):
+    """
+    Безопасная рассылка с защитой от бана (Rate Limit).
+    Отправляет 20 сообщений в секунду макс.
+    """
+    # 1. Получаем клиентов с Telegram ID
+    clients = db.query(Client).filter(
+        Client.company_id == payload.company_id,
+        Client.telegram_chat_id.isnot(None)
+    ).all()
+
+    if not clients:
+        return {"status": "error", "message": "Нет клиентов с привязанным Telegram."}
+
+    # 2. Получаем токен бота
+    company = db.query(Company).filter(Company.id == payload.company_id).first()
+    if not company or not company.telegram_bot_token:
+        raise HTTPException(status_code=400, detail="У компании нет токена бота.")
+
+    token = company.telegram_bot_token
+
+    # 3. Запускаем фоновую задачу (чтобы админка не зависла)
+    background_tasks.add_task(
+        _perform_safe_broadcast, 
+        token, 
+        [c.telegram_chat_id for c in clients], 
+        payload.text, 
+        payload.photo_file_id
+    )
+
+    return {"status": "ok", "message": f"Рассылка запущена на {len(clients)} контактов. Это займет время."}
+
+async def _perform_safe_broadcast(token: str, chat_ids: List[str], text: str, photo_id: str = None):
+    """Внутренняя функция отправки с задержками"""
+    bot = telegram.Bot(token=token)
+    sent_count = 0
+    
+    for chat_id in chat_ids:
+        try:
+            if photo_id:
+                await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, parse_mode='HTML')
+            else:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
+            
+            sent_count += 1
+            
+            # --- КРИТИЧЕСКИ ВАЖНО: ПАУЗА ---
+            # Telegram разрешает ~30 сообщ/сек. Делаем паузу 0.05 сек (20 сообщ/сек).
+            await asyncio.sleep(0.05) 
+            
+        except Exception as e:
+            print(f"[Broadcast Error] Не удалось отправить {chat_id}: {e}")
+            # Если словили FloodLimit (бан за спам), спим дольше
+            if "Flood" in str(e) or "429" in str(e):
+                await asyncio.sleep(5)
+    
+    print(f"[Broadcast] Рассылка завершена. Успешно: {sent_count}/{len(chat_ids)}")
+
+
 # --- 7. УТИЛИТЫ ---
 
 # Этот эндпоинт больше не нужен, т.к. таблицы создаются при запуске
