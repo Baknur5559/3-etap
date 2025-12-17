@@ -153,7 +153,7 @@ async def api_request(
 ) -> Optional[Dict[str, Any]]:
     """
     Универсальная асинхронная функция для отправки запросов к API бэкенда.
-    (ВЕРСИЯ 6.0 - с поддержкой X-Employee-ID и COMPANY_ID_FOR_BOT)
+    (ВЕРСИЯ 6.1 - Добавлен динамический timeout)
     """
     global ADMIN_API_URL, COMPANY_ID_FOR_BOT
     if not ADMIN_API_URL:
@@ -164,6 +164,9 @@ async def api_request(
     
     params_dict = kwargs.pop('params', {}) 
     headers = kwargs.pop('headers', {'Content-Type': 'application/json'})
+
+    # Извлекаем timeout, если передан, иначе ставим 30 сек
+    timeout_val = kwargs.pop('timeout', 30.0)
 
     # Добавляем аутентификацию Владельца, если передан ID
     if employee_id:
@@ -178,14 +181,15 @@ async def api_request(
     elif method.upper() in ['POST', 'PATCH', 'PUT']:
         json_data = kwargs.get('json') 
         if json_data is not None: 
-            if 'company_id' not in json_data:
+            if isinstance(json_data, dict) and 'company_id' not in json_data:
                 json_data['company_id'] = COMPANY_ID_FOR_BOT
             kwargs['json'] = json_data
     # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client: 
-            logger.debug(f"API Request: {method} {url} | Headers: {headers} | Data/Params: {kwargs}")
+        # Используем переданный timeout
+        async with httpx.AsyncClient(timeout=60.0) as client: 
+            logger.debug(f"API Request: {method} {url} | Timeout: {timeout_val}")
             response = await client.request(method, url, headers=headers, **kwargs)
             logger.debug(f"API Response: {response.status_code} for {method} {url}")
             response.raise_for_status()
@@ -197,7 +201,7 @@ async def api_request(
                 try:
                     return response.json()
                 except Exception as json_err:
-                    logger.error(f"API Error: Failed to decode JSON from {url}. Status: {response.status_code}. Content: {response.text[:200]}...", exc_info=True)
+                    logger.error(f"API Error: Failed to decode JSON from {url}. Status: {response.status_code}.", exc_info=True)
                     return {"error": "Ошибка чтения ответа от сервера.", "status_code": 500}
             else:
                 return {"status": "ok"}
@@ -213,10 +217,10 @@ async def api_request(
         return {"error": error_detail, "status_code": e.response.status_code}
     except httpx.RequestError as e:
         logger.error(f"Network Error for {method} {url}: {e}")
-        return {"error": "Ошибка сети при обращении к серверу. Попробуйте позже.", "status_code": 503}
+        return {"error": "Ошибка сети. Сервер долго не отвечает или недоступен.", "status_code": 503}
     except Exception as e:
         logger.error(f"Unexpected Error during API request to {url}: {e}", exc_info=True) 
-        return {"error": "Внутренняя ошибка бота при запросе к серверу.", "status_code": 500}
+        return {"error": "Внутренняя ошибка бота.", "status_code": 500}
 # --- КОНЕЦ API REQUEST ---
 
 # --- НОВАЯ ФУНКЦИЯ: Проверка AI-Рубильника ---
@@ -342,11 +346,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = str(user.id)
     logger.info(f"Команда /start от {user.full_name} (ID: {chat_id})")
 
-    # Проверяем юзера (тихо)
+    # Ставим тайм-аут 120 секунд, чтобы успеть отправить всем 200+ клиентам
     api_response = await api_request(
-        "POST",
-        "/api/bot/identify_user", 
-        json={"telegram_chat_id": chat_id, "company_id": COMPANY_ID_FOR_BOT} 
+        "POST", 
+        "/api/bot/broadcast",
+        employee_id=employee_id,
+        json=payload,
+        timeout=120.0 
     )
 
     if api_response and "error" not in api_response:
