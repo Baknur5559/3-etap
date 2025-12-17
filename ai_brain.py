@@ -414,9 +414,20 @@ if DS_KEY:
 # 2. Настройка Gemini (Google)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 gemini_model = None
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+if GEMINI_KEY:  # <--- Было GEMINI_API_KEY, стало GEMINI_KEY
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        # ПРОБУЕМ РАЗНЫЕ МОДЕЛИ, ЧТОБЫ ИЗБЕЖАТЬ ОШИБКИ 404
+        try:
+            gemini_model = genai.GenerativeModel('gemini-1.5-flash-001') # Пробуем новую
+        except:
+            try:
+                gemini_model = genai.GenerativeModel('gemini-1.5-flash') # Пробуем обычную
+            except:
+                gemini_model = genai.GenerativeModel('gemini-pro') # Откат на старую
+        logger.info("✅ Gemini AI подключен.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка Gemini: {e}")
 
 # --- Вспомогательные функции (Санитары) ---
 from datetime import date, datetime
